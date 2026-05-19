@@ -56,7 +56,7 @@ export async function statusRoutes(app: FastifyInstance): Promise<void> {
 
     return {
       appName: "Drakkar",
-      version: "0.1.0",
+      version: "0.1.1",
       backend: "ok",
       postgresql: "ok",
       redis: "ok",

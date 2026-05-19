@@ -6,7 +6,7 @@ export async function sabRoutes(app: FastifyInstance): Promise<void> {
     const query = request.query as { mode?: string; name?: string; value?: string };
     switch (query.mode) {
       case "version":
-        return { version: "0.1.0" };
+        return { version: "0.1.1" };
       case "queue":
         return { queue: { slots: await getQueue() } };
       case "history":

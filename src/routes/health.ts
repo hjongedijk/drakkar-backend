@@ -57,7 +57,7 @@ export async function healthRoutes(app: FastifyInstance): Promise<void> {
       status: healthy ? "ok" : "degraded",
       database,
       redis: redisStatus,
-      version: "0.1.0",
+      version: "0.1.1",
       servicesUp,
       servicesTotal,
       healthPercent: Math.round((servicesUp / servicesTotal) * 100),
