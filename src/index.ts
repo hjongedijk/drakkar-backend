@@ -10,6 +10,7 @@ import { recoverInterruptedDownloads, startDownloadWorkers, stopDownloadWorkers 
 import { startFuseMount, stopFuseMount } from "./vfs/fuseMountService.js";
 import { startBackgroundRepairSchedule, stopBackgroundRepairSchedule } from "./repair/repairService.js";
 import { ensureDefaultAdminUser } from "./auth/service.js";
+import { bootstrapDevelopmentTestConnectionData } from "./dev/testConnectionData.js";
 
 const app = buildApp();
 
@@ -34,6 +35,7 @@ for (const signal of ["SIGINT", "SIGTERM"]) {
 try {
   await validateRequiredFolders(app.log);
   await ensureDefaultAdminUser();
+  await bootstrapDevelopmentTestConnectionData(app.log);
   const namingMigration = await migrateImportsToCurrentNaming();
   if (namingMigration.moved > 0 || namingMigration.relinked > 0) app.log.info({ namingMigration }, "library naming migration completed");
   if (env.REQUEST_SYNC_ENABLED) startRequestSyncSchedule(app.log);
