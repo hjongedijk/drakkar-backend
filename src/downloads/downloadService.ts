@@ -1,0 +1,373 @@
+import { createHash, randomUUID } from "node:crypto";
+import { access, mkdir, readFile, writeFile } from "node:fs/promises";
+import { extname, join } from "node:path";
+import { prisma } from "../db/prisma.js";
+import { env } from "../config/env.js";
+import { nzbDownloadQueue } from "../queues/downloadQueue.js";
+import { parseNzbXml, type ParsedNzb } from "../nzb/parser.js";
+import { storeNzbDocument } from "../nzb/store.js";
+import { createBlocklistItem, getPolicySettings } from "../policies/policyService.js";
+import { getSettings } from "../settings/settingsStore.js";
+import { fetchNzbUrl } from "../usenet/nzbUrlFetch.js";
+import { makeMountedDownloadAvailable } from "../import/importService.js";
+import { humanizeDownloadError, statusLabelForDownload } from "./presentation.js";
+
+function safeNzbName(name: string) {
+  const cleaned = name.replace(/[^a-z0-9._-]+/gi, "_") || randomUUID();
+  return extname(cleaned).toLowerCase() === ".nzb" ? cleaned : `${cleaned}.nzb`;
+}
+
+class NzbPolicyError extends Error {}
+
+async function existingDownloadForGuid(guid?: string | null) {
+  if (!guid) return null;
+  const document = await prisma.nzbDocument.findUnique({
+    where: { guid },
+    include: { download: true }
+  });
+  const download = document?.download ?? null;
+  if (!download) return null;
+  if (["failed", "cancelled"].includes(download.status)) return null;
+  return download;
+}
+
+async function attachExistingDownloadToRequest(requestId: string | undefined, downloadId: string, title?: string) {
+  if (!requestId) return;
+  const request = await prisma.mediaRequest.findUnique({ where: { id: requestId } });
+  if (!request) return;
+  await prisma.mediaRequest.update({
+    where: { id: requestId },
+    data: {
+      downloadId,
+      status: ["available", "completed"].includes(request.status) ? request.status : "grabbed",
+      ...(title ? { title: request.title || title } : {})
+    }
+  }).catch(() => undefined);
+}
+
+async function uniqueNzbName(name: string) {
+  const filename = safeNzbName(name);
+  const ext = extname(filename);
+  const base = filename.slice(0, filename.length - ext.length);
+  for (let index = 0; index < 100; index += 1) {
+    const candidate = index === 0 ? filename : `${base}-${index + 1}${ext}`;
+    try {
+      await access(join(env.VFS_NZB_DIR, candidate));
+    } catch {
+      return candidate;
+    }
+  }
+  return `${base}-${randomUUID()}${ext}`;
+}
+
+function contentHash(content: Buffer) {
+  return createHash("sha256").update(content).digest("hex");
+}
+
+async function writeNzbBackupIfEnabled(path: string, content: Buffer) {
+  const settings = await getSettings();
+  if (!settings.backupNzbFiles) return null;
+  await mkdir(env.NZB_BACKUPS_DIR, { recursive: true });
+  await writeFile(path, content);
+  return path;
+}
+
+function hasPotentialVideoPayload(parsed: ParsedNzb) {
+  if (parsed.files.length === 0 || parsed.segmentCount === 0) return false;
+  return parsed.files.some((file) => /\.(mkv|mp4|avi|mov|m4v|ts|zip|7z|rar|part\d+\.rar)(?:["_\s).]|$)/i.test(file.subject))
+    || parsed.fileCount > 0;
+}
+
+export async function storeNzbForDownload(input: {
+  downloadId: string;
+  filename?: string;
+  content: string | Buffer;
+  title?: string;
+  guid?: string;
+}) {
+  await mkdir(env.VFS_NZB_DIR, { recursive: true });
+  const policies = await getPolicySettings();
+  const content = Buffer.isBuffer(input.content) ? input.content : Buffer.from(input.content);
+  const parsed = parseNzbXml(content.toString("utf8"), input.title ?? input.filename ?? "NZB upload");
+  const duplicateKey = input.guid ?? contentHash(content);
+
+  if (policies.failNzbWithoutVideo && !hasPotentialVideoPayload(parsed)) {
+    const reason = "NZB appears empty or contains no usable file segments";
+    await prisma.download.update({ where: { id: input.downloadId }, data: { status: "failed", error: reason, size: parsed.totalSize } });
+    await createBlocklistItem({ guid: duplicateKey, title: input.title ?? parsed.title, reason: "no_video_content", source: "nzb-policy" });
+    throw new NzbPolicyError(reason);
+  }
+
+  const existing = await prisma.nzbDocument.findUnique({ where: { guid: duplicateKey }, include: { download: true } });
+  let documentGuid = duplicateKey;
+  if (existing) {
+    const reason = `duplicate NZB already exists as ${existing.title}`;
+    if (policies.duplicateNzbBehavior === "mark_failed" || policies.duplicateNzbBehavior === "ignore_existing") {
+      await prisma.download.update({
+        where: { id: input.downloadId },
+        data: {
+          status: policies.duplicateNzbBehavior === "ignore_existing" ? "cancelled" : "failed",
+          error: reason,
+          size: existing.totalSize
+        }
+      });
+      await createBlocklistItem({ guid: duplicateKey, title: input.title ?? existing.title, reason: "duplicate_nzb", source: "nzb-policy" });
+      throw new NzbPolicyError(reason);
+    }
+    if (policies.duplicateNzbBehavior === "replace_existing") {
+      await prisma.nzbDocument.delete({ where: { id: existing.id } });
+    } else {
+      documentGuid = `${duplicateKey}-${randomUUID()}`;
+    }
+  }
+
+  const filename = await uniqueNzbName(input.filename ?? input.title ?? input.downloadId);
+  const path = join(env.VFS_NZB_DIR, filename);
+  const backupPath = join(env.NZB_BACKUPS_DIR, filename);
+  await writeFile(path, content);
+  const storedBackupPath = await writeNzbBackupIfEnabled(backupPath, content);
+
+  const nzbDocument = await storeNzbDocument({ parsed, path, backupPath: storedBackupPath ?? undefined, guid: documentGuid });
+  await prisma.download.update({
+    where: { id: input.downloadId },
+    data: {
+      title: input.title ?? parsed.title,
+      size: parsed.totalSize,
+      nzbDocumentId: nzbDocument.id,
+      error: parsed.valid ? null : parsed.errors.join("; ")
+    }
+  });
+  return nzbDocument;
+}
+
+export async function addNzbUpload(input: { filename?: string; content: string | Buffer; title?: string; queueDownload?: boolean }) {
+  const queueDownload = input.queueDownload ?? true;
+  const download = await prisma.download.create({
+    data: {
+      title: input.title ?? input.filename ?? "NZB upload",
+      source: "nzb",
+      status: queueDownload ? "queued" : "mounted"
+    }
+  });
+  let nzbDocument;
+  try {
+    nzbDocument = await storeNzbForDownload({ downloadId: download.id, ...input });
+  } catch (error) {
+    if (error instanceof NzbPolicyError) return prisma.download.findUniqueOrThrow({ where: { id: download.id } });
+    return prisma.download.update({
+      where: { id: download.id },
+      data: { status: "failed", error: error instanceof Error ? error.message : "failed to import NZB" }
+    });
+  }
+  if (!queueDownload) {
+    await makeMountedDownloadAvailable({ downloadId: download.id });
+    return prisma.download.findUniqueOrThrow({ where: { id: download.id }, include: { nzbDocument: true } });
+  }
+
+  const job = await nzbDownloadQueue.add("parse-and-download", { downloadId: download.id, nzbDocumentId: nzbDocument.id, title: download.title });
+  return prisma.download.update({ where: { id: download.id }, data: { jobId: job.id } });
+}
+
+export async function addNzbFromPath(path: string, title?: string, options?: { queueDownload?: boolean; guid?: string; requestId?: string }) {
+  const policies = await getPolicySettings();
+  const existingByGuid = await existingDownloadForGuid(options?.guid);
+  if (existingByGuid && policies.duplicateNzbBehavior !== "replace_existing" && policies.duplicateNzbBehavior !== "download_again_with_suffix") {
+    await attachExistingDownloadToRequest(options?.requestId, existingByGuid.id, title);
+    return existingByGuid;
+  }
+
+  const content = await readFile(path);
+  const download = await prisma.download.create({
+    data: {
+      title: title ?? path.split("/").pop() ?? "NZB upload",
+      source: "nzb",
+      status: options?.queueDownload === false ? "mounted" : "queued"
+    }
+  });
+  let nzbDocument;
+  try {
+    nzbDocument = await storeNzbForDownload({
+      downloadId: download.id,
+      filename: path.split("/").pop(),
+      content,
+      title,
+      guid: options?.guid
+    });
+  } catch (error) {
+    if (options?.guid) {
+      const existing = await existingDownloadForGuid(options.guid);
+      if (existing && policies.duplicateNzbBehavior !== "replace_existing" && policies.duplicateNzbBehavior !== "download_again_with_suffix") {
+        await prisma.download.delete({ where: { id: download.id } }).catch(() => undefined);
+        await attachExistingDownloadToRequest(options?.requestId, existing.id, title);
+        return existing;
+      }
+    }
+    if (error instanceof NzbPolicyError) return prisma.download.findUniqueOrThrow({ where: { id: download.id } });
+    return prisma.download.update({
+      where: { id: download.id },
+      data: { status: "failed", error: error instanceof Error ? error.message : "failed to import NZB" }
+    });
+  }
+  if (options?.queueDownload === false) {
+    await makeMountedDownloadAvailable({ downloadId: download.id });
+    return prisma.download.findUniqueOrThrow({ where: { id: download.id }, include: { nzbDocument: true } });
+  }
+
+  const job = await nzbDownloadQueue.add("parse-and-download", {
+    downloadId: download.id,
+    nzbDocumentId: nzbDocument.id,
+    title: download.title,
+    requestId: options?.requestId
+  });
+  return prisma.download.update({ where: { id: download.id }, data: { jobId: job.id } });
+}
+
+export async function addUrl(url: string, title?: string) {
+  const download = await prisma.download.create({
+    data: { title: title ?? url, source: url, status: "fetching_nzb" }
+  });
+  try {
+    const fetched = await fetchNzbUrl(url);
+    const document = await storeNzbForDownload({
+      downloadId: download.id,
+      filename: fetched.filename,
+      content: fetched.buffer,
+      title: title ?? fetched.filename
+    });
+    const queued = await prisma.download.update({
+      where: { id: download.id },
+      data: { status: "queued", nzbDocumentId: document.id, error: fetched.looksLikeNzb ? null : "URL response did not look like an NZB but parsed successfully" },
+      include: { nzbDocument: true }
+    });
+    const job = await nzbDownloadQueue.add("prepare-url-nzb", { downloadId: download.id, nzbDocumentId: document.id, title: queued.title });
+    return prisma.download.update({ where: { id: download.id }, data: { jobId: job.id }, include: { nzbDocument: true } });
+  } catch (error) {
+    return prisma.download.update({
+      where: { id: download.id },
+      data: { status: "failed", error: error instanceof Error ? error.message : "failed to fetch NZB URL" }
+    });
+  }
+}
+
+export function getQueue() {
+  return prisma.download.findMany({
+    where: {
+      status: { in: ["mounted", "queued", "fetching_nzb", "verifying", "prepared", "downloading", "paused", "waiting_for_provider", "waiting_for_nzb"] },
+      OR: [{ status: { not: "queued" } }, { nzbDocumentId: { not: null } }, { jobId: { not: null } }]
+    },
+    orderBy: [{ priority: "desc" }, { createdAt: "asc" }],
+    include: { nzbDocument: true }
+  }).then((downloads) =>
+    downloads.map((download) => ({
+      ...download,
+      error: humanizeDownloadError(download.error),
+      statusLabel: statusLabelForDownload(download.status, download.error)
+    }))
+  );
+}
+
+export function getHistory() {
+  return prisma.download.findMany({
+    where: { status: { in: ["available", "completed", "failed", "cancelled"] } },
+    orderBy: { updatedAt: "desc" },
+    take: 100,
+    include: { nzbDocument: true }
+  }).then((downloads) =>
+    downloads.map((download) => ({
+      ...download,
+      error: humanizeDownloadError(download.error),
+      statusLabel: statusLabelForDownload(download.status, download.error)
+    }))
+  );
+}
+
+export async function cleanupDownloadHistory(input?: { keepFailed?: number; keepCancelled?: number }) {
+  const keepFailed = input?.keepFailed ?? 0;
+  const keepCancelled = input?.keepCancelled ?? 0;
+  const attachedDownloadIds = new Set(
+    (
+      await prisma.mediaRequest.findMany({
+        where: { downloadId: { not: null } },
+        select: { downloadId: true }
+      })
+    ).flatMap((request) => (request.downloadId ? [request.downloadId] : []))
+  );
+  const terminalDownloads = await prisma.download.findMany({
+    where: {
+      OR: [
+        { status: { in: ["failed", "cancelled"] } },
+        { status: "queued", nzbDocumentId: null, jobId: null }
+      ]
+    },
+    orderBy: { updatedAt: "desc" },
+    select: { id: true, status: true, nzbDocumentId: true, error: true }
+  });
+  const seen: Record<string, number> = { failed: 0, cancelled: 0 };
+  const toDelete = terminalDownloads.filter((download) => {
+    if (attachedDownloadIds.has(download.id)) return false;
+    if (/duplicate nzb already exists|unique constraint failed on the fields: \(`guid`\)/i.test(download.error ?? "")) return true;
+    const count = (seen[download.status] ?? 0) + 1;
+    seen[download.status] = count;
+    if (download.status === "queued") return true;
+    return download.status === "failed" ? count > keepFailed : count > keepCancelled;
+  });
+  const cleanedFailedJobs = await nzbDownloadQueue.clean(0, 1000, "failed").catch(() => []);
+  if (toDelete.length === 0) {
+    return {
+      deleted: 0,
+      cleanedFailedJobs: cleanedFailedJobs.length,
+      keptFailed: Math.min(seen.failed ?? 0, keepFailed),
+      keptCancelled: Math.min(seen.cancelled ?? 0, keepCancelled)
+    };
+  }
+
+  const documentIds = toDelete.flatMap((download) => (download.nzbDocumentId ? [download.nzbDocumentId] : []));
+  await prisma.download.deleteMany({ where: { id: { in: toDelete.map((download) => download.id) } } });
+  if (documentIds.length > 0) {
+    await prisma.nzbDocument.deleteMany({ where: { id: { in: documentIds } } }).catch(() => undefined);
+  }
+  await prisma.failedRelease.deleteMany({ where: { downloadId: { in: toDelete.map((download) => download.id) } } }).catch(() => undefined);
+  return {
+    deleted: toDelete.length,
+    cleanedFailedJobs: cleanedFailedJobs.length,
+    keptFailed: Math.min(seen.failed ?? 0, keepFailed),
+    keptCancelled: Math.min(seen.cancelled ?? 0, keepCancelled)
+  };
+}
+
+export async function makeDownloadAvailable(id: string) {
+  const request = await prisma.mediaRequest.findFirst({ where: { downloadId: id }, select: { id: true } });
+  const existingImport = request ? null : await prisma.importItem.findFirst({ where: { downloadId: id, requestId: { not: null } }, select: { requestId: true } });
+  return makeMountedDownloadAvailable({ downloadId: id, requestId: request?.id ?? existingImport?.requestId ?? undefined });
+}
+
+export async function setDownloadStatus(id: string, status: string) {
+  const data = status === "completed" ? { status, completedAt: new Date() } : { status };
+  return prisma.download.update({ where: { id }, data });
+}
+
+export async function enqueueDownload(id: string) {
+  const download = await prisma.download.findUniqueOrThrow({ where: { id } });
+  const job = await nzbDownloadQueue.add("retry-download", {
+    downloadId: download.id,
+    nzbDocumentId: download.nzbDocumentId ?? undefined,
+    title: download.title
+  });
+  return prisma.download.update({
+    where: { id },
+    data: {
+      status: "queued",
+      jobId: job.id,
+      error: null,
+      progress: 0,
+      downloaded: 0,
+      speedBytesSec: 0,
+      etaSeconds: null
+    }
+  });
+}
+
+export async function deleteDownload(id: string) {
+  await prisma.download.delete({ where: { id } });
+  return { ok: true };
+}

@@ -1,0 +1,71 @@
+services:
+  backend:
+    image: drakkar-backend:latest
+    build: .
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    env_file:
+      - .env.example
+    environment:
+      VFS_ROOT: /data
+      VFS_DOWNLOADS_DIR: /data/downloads
+      VFS_COMPLETED_DIR: /data/completed
+      VFS_NZB_DIR: /data/nzb
+      MEDIA_SYMLINKS_DIR: /data/media
+      MEDIA_MOVIES_DIR: /data/media/movies
+      MEDIA_TV_DIR: /data/media/tv
+      NZB_BACKUPS_DIR: /data/nzb-backup
+    ports:
+      - "3000:3000"
+    volumes:
+      - ./data/config:/config
+      - ./data/runtime:/data
+      - ./data/fuse:/fuse:rshared
+      - ./data/cache:/cache
+    devices:
+      - /dev/fuse:/dev/fuse
+    cap_add:
+      - SYS_ADMIN
+    security_opt:
+      - apparmor:unconfined
+    healthcheck:
+      test: ["CMD", "node", "-e", "fetch('http://127.0.0.1:3000/health').then(r=>process.exit(r.ok?0:1)).catch(()=>process.exit(1))"]
+      interval: 30s
+      timeout: 10s
+      retries: 5
+
+  postgres:
+    image: postgres:16-alpine
+    environment:
+      POSTGRES_USER: postgres
+      POSTGRES_PASSWORD: postgres
+      POSTGRES_DB: drakkar
+    ports:
+      - "5432:5432"
+    volumes:
+      - postgres-data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U postgres -d drakkar"]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+
+  redis:
+    image: redis:7-alpine
+    command: ["redis-server", "--appendonly", "yes"]
+    ports:
+      - "6379:6379"
+    volumes:
+      - redis-data:/data
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+
+volumes:
+  postgres-data:
+  redis-data:
