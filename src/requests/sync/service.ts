@@ -82,13 +82,16 @@ export async function syncRequests(providerId?: string) {
     where: { enabled: true, ...(providerId ? { id: providerId } : {}) }
   });
   const imported: MediaRequest[] = [];
+  const providerResults: { providerId: string; providerName: string; imported: number; ok: boolean; error?: string }[] = [];
 
   for (const provider of providers) {
+    let importedForProvider = 0;
     try {
       const requests = await fetchProviderRequests(provider);
       for (const request of requests) {
         const synced = await upsertRequest(provider, request);
         imported.push(synced);
+        importedForProvider += 1;
         if (shouldAutoGrabSyncedRequest(synced)) {
           try {
             if (synced.mediaType === "tv") await grabMissingTvForRequest(synced.id);
@@ -106,16 +109,24 @@ export async function syncRequests(providerId?: string) {
         }
       }
       await prisma.requestProvider.update({ where: { id: provider.id }, data: { lastSyncAt: new Date(), lastError: null } });
+      providerResults.push({ providerId: provider.id, providerName: provider.name, imported: importedForProvider, ok: true });
     } catch (error) {
+      const message = error instanceof Error ? error.message : "unknown sync error";
       await prisma.requestProvider.update({
         where: { id: provider.id },
-        data: { lastError: error instanceof Error ? error.message : "unknown sync error" }
+        data: { lastError: message }
       });
+      providerResults.push({ providerId: provider.id, providerName: provider.name, imported: importedForProvider, ok: false, error: message });
     }
   }
 
   await refreshMediaLibrary().catch(() => undefined);
-  return { imported: imported.length, requests: imported };
+  return {
+    imported: imported.length,
+    requests: imported,
+    providerResults,
+    failedProviders: providerResults.filter((item) => !item.ok).length
+  };
 }
 
 export async function recoverFailedRequestDownloads() {

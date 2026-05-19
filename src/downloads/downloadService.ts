@@ -1,6 +1,7 @@
 import { createHash, randomUUID } from "node:crypto";
 import { access, mkdir, readFile, writeFile } from "node:fs/promises";
 import { extname, join } from "node:path";
+import { Prisma } from "@prisma/client";
 import { prisma } from "../db/prisma.js";
 import { env } from "../config/env.js";
 import { nzbDownloadQueue } from "../queues/downloadQueue.js";
@@ -18,6 +19,13 @@ function safeNzbName(name: string) {
 }
 
 class NzbPolicyError extends Error {}
+
+function isDuplicateGuidError(error: unknown) {
+  return error instanceof Prisma.PrismaClientKnownRequestError
+    && error.code === "P2002"
+    && Array.isArray(error.meta?.target)
+    && error.meta.target.includes("guid");
+}
 
 async function existingDownloadForGuid(guid?: string | null) {
   if (!guid) return null;
@@ -127,7 +135,43 @@ export async function storeNzbForDownload(input: {
   await writeFile(path, content);
   const storedBackupPath = await writeNzbBackupIfEnabled(backupPath, content);
 
-  const nzbDocument = await storeNzbDocument({ parsed, path, backupPath: storedBackupPath ?? undefined, guid: documentGuid });
+  let nzbDocument;
+  try {
+    nzbDocument = await storeNzbDocument({ parsed, path, backupPath: storedBackupPath ?? undefined, guid: documentGuid });
+  } catch (error) {
+    if (!isDuplicateGuidError(error)) throw error;
+
+    const existing = await prisma.nzbDocument.findUnique({ where: { guid: documentGuid }, include: { download: true } });
+    const reason = `duplicate NZB already exists as ${existing?.title ?? input.title ?? parsed.title}`;
+
+    if (policies.duplicateNzbBehavior === "download_again_with_suffix") {
+      nzbDocument = await storeNzbDocument({
+        parsed,
+        path,
+        backupPath: storedBackupPath ?? undefined,
+        guid: `${duplicateKey}-${randomUUID()}`
+      });
+    } else if (policies.duplicateNzbBehavior === "replace_existing" && existing) {
+      await prisma.nzbDocument.delete({ where: { id: existing.id } }).catch(() => undefined);
+      nzbDocument = await storeNzbDocument({ parsed, path, backupPath: storedBackupPath ?? undefined, guid: documentGuid });
+    } else {
+      await prisma.download.update({
+        where: { id: input.downloadId },
+        data: {
+          status: policies.duplicateNzbBehavior === "ignore_existing" ? "cancelled" : "failed",
+          error: reason,
+          size: existing?.totalSize ?? parsed.totalSize
+        }
+      }).catch(() => undefined);
+      await createBlocklistItem({
+        guid: documentGuid,
+        title: input.title ?? existing?.title ?? parsed.title,
+        reason: "duplicate_nzb",
+        source: "nzb-policy-race"
+      }).catch(() => undefined);
+      throw new NzbPolicyError(reason);
+    }
+  }
   await prisma.download.update({
     where: { id: input.downloadId },
     data: {

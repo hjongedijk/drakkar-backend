@@ -29,8 +29,34 @@ function classifyFailure(message: string): BlockReason {
   return "import_failed";
 }
 
-export async function recoverFailedDownloadForRequest(input: { downloadId: string; error: string; source?: string }) {
-  const request = await prisma.mediaRequest.findFirst({ where: { downloadId: input.downloadId } });
+function titleNeedle(title: string) {
+  return (title.split(":")[0] ?? title).trim();
+}
+
+async function resolveRequestForFailedDownload(input: { downloadId: string; requestId?: string; title?: string }) {
+  if (input.requestId) {
+    const direct = await prisma.mediaRequest.findUnique({ where: { id: input.requestId } });
+    if (direct) return direct;
+  }
+
+  const linked = await prisma.mediaRequest.findFirst({ where: { downloadId: input.downloadId } });
+  if (linked) return linked;
+
+  if (!input.title) return null;
+  const needle = titleNeedle(input.title);
+  const candidates = await prisma.mediaRequest.findMany({
+    where: {
+      mediaType: "tv",
+      status: { in: ["approved", "grabbed", "available", "release_failed", "no_release_found", "auto_grab_failed", "import_failed"] }
+    },
+    orderBy: { updatedAt: "desc" },
+    take: 25
+  });
+  return candidates.find((candidate) => needle.toLowerCase().includes(titleNeedle(candidate.title).toLowerCase())) ?? null;
+}
+
+export async function recoverFailedDownloadForRequest(input: { downloadId: string; requestId?: string; title?: string; error: string; source?: string }) {
+  const request = await resolveRequestForFailedDownload(input);
   if (!request) return { recovered: false, reason: "download is not attached to a request" };
 
   const download = await prisma.download.findUnique({

@@ -65,6 +65,8 @@ export function startDownloadWorkers(logger: FastifyBaseLogger) {
             await prisma.mediaRequest.updateMany({ where: { downloadId: job.data.downloadId }, data: { status: "import_failed" } });
             const recovery = await recoverFailedDownloadForRequest({
               downloadId: job.data.downloadId,
+              requestId: job.data.requestId,
+              title: current?.title,
               error: rawMessage,
               source: "import-validation"
             });
@@ -114,6 +116,8 @@ export function startDownloadWorkers(logger: FastifyBaseLogger) {
         });
         const recovery = await recoverFailedDownloadForRequest({
           downloadId: job.data.downloadId,
+          requestId: job.data.requestId,
+          title: job.data.title,
           error: rawMessage,
           source: "usenet-validation"
         });
@@ -147,10 +151,15 @@ export async function recoverInterruptedDownloads(logger: FastifyBaseLogger) {
   });
 
   for (const download of interrupted) {
+    const linkedRequest = await prisma.mediaRequest.findFirst({
+      where: { downloadId: download.id },
+      select: { id: true }
+    });
     const job = await nzbDownloadQueue.add("startup-recovery", {
       downloadId: download.id,
       nzbDocumentId: download.nzbDocumentId ?? undefined,
-      title: download.title
+      title: download.title,
+      requestId: linkedRequest?.id
     });
     await prisma.download.update({
       where: { id: download.id },

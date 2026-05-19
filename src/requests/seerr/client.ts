@@ -54,8 +54,17 @@ async function fetchMediaDetails(provider: RequestProvider, request: SeerrReques
 }
 
 export async function testSeerrConnection(provider: RequestProvider) {
-  const response = await providerFetch(provider, "/api/v1/status");
-  return { ok: response.ok, status: response.status };
+  const status = await providerFetch(provider, "/api/v1/status");
+  if (!status.ok) return { ok: false, status: status.status, endpoint: "status", message: `${provider.name} status check failed (${status.status})` };
+  const requests = await providerFetch(provider, "/api/v1/request?take=1&skip=0&filter=all&sort=added");
+  return {
+    ok: requests.ok,
+    status: requests.status,
+    endpoint: requests.ok ? "requests" : "request-list",
+    message: requests.ok
+      ? `${provider.name} connection OK`
+      : `${provider.name} request list failed (${requests.status}). Check host, API key, and permissions.`
+  };
 }
 
 export async function fetchSeerrRequests(provider: RequestProvider): Promise<ExternalMediaRequest[]> {

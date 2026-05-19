@@ -29,7 +29,7 @@ const envSchema = z.object({
   MEDIA_TV_DIR: z.string().optional(),
   NZB_BACKUPS_DIR: z.string().default("/data/nzb-backup"),
   FUSE_MOUNT_ENABLED: envBoolean.default(false),
-  FUSE_MOUNT_PATH: z.string().default("/mnt"),
+  FUSE_MOUNT_PATH: z.string().default("/mnt/fuse"),
   FUSE_ALLOW_OTHER: envBoolean.default(false),
   FUSE_FORCE_MOUNT: envBoolean.default(true),
   FUSE_DEBUG: envBoolean.default(false),
@@ -55,5 +55,6 @@ export const requiredDirectories = [
   env.MEDIA_SYMLINKS_DIR,
   env.MEDIA_MOVIES_DIR,
   env.MEDIA_TV_DIR,
-  env.NZB_BACKUPS_DIR
+  env.NZB_BACKUPS_DIR,
+  env.FUSE_MOUNT_PATH
 ] as const;

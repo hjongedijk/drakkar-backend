@@ -116,6 +116,7 @@ export async function listVfs(path = "/", showHidden = false) {
 
   if (normalizedPath === "/") return rootFolders.map((folder) => virtualFolderNode(folder.name, folder.path));
   if (normalizedPath === "/media") return mediaFolders.map((folder) => virtualFolderNode(folder.name, folder.path));
+  if (normalizedPath === "/mounted") return [virtualFolderNode("releases", "/mounted/releases")];
   if (normalizedPath === "/mounted/releases") return listMounts("/mounted/releases");
   if (normalizedPath.startsWith("/mounted/releases/")) return listMountedFiles(normalizedPath);
   if (isMountedPath(normalizedPath)) return listMountedFiles(normalizedPath);
