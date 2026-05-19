@@ -1,4 +1,4 @@
-import type { FastifyInstance } from "fastify";
+import type { FastifyInstance, FastifyReply, FastifyRequest } from "fastify";
 import { listVfs, readVfsBytes, refreshVfs, statVfs, streamVfsFile, treeVfs } from "../vfs/vfsService.js";
 import { listMounts } from "../vfs/mountedNzbService.js";
 import { createBrowserPlayableStream } from "../streaming/browserPlay.service.js";
@@ -31,7 +31,7 @@ export async function vfsRoutes(app: FastifyInstance): Promise<void> {
   app.get("/api/vfs/bandwidth", async () => getBandwidthStatus());
   app.get("/api/vfs/fuse", async () => getFuseMountStatus());
 
-  async function sendFile(request: any, reply: any) {
+  async function sendFile(request: FastifyRequest<{ Querystring: { path?: string } }>, reply: FastifyReply) {
     const query = request.query as { path?: string };
     if (!query.path) return reply.status(400).send({ error: "path is required" });
     const result = await streamVfsFile(query.path, request.headers.range);

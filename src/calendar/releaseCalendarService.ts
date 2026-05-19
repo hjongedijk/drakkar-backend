@@ -42,19 +42,6 @@ function monthRange(month?: string) {
   };
 }
 
-function requestSeasonNumbers(value: unknown) {
-  if (!Array.isArray(value) || value.length === 0) return [];
-  const seasons = new Set<number>();
-  for (const item of value) {
-    if (!item || typeof item !== "object") continue;
-    const record = item as Record<string, unknown>;
-    const season = record.seasonNumber ?? record.season ?? record.number;
-    const parsed = typeof season === "number" ? season : typeof season === "string" ? Number(season) : NaN;
-    if (Number.isFinite(parsed) && parsed > 0) seasons.add(parsed);
-  }
-  return [...seasons].sort((a, b) => a - b);
-}
-
 function toIsoDate(date: Date) {
   return date.toISOString().slice(0, 10);
 }

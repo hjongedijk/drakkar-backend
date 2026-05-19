@@ -65,7 +65,7 @@ export async function verifyAndRepairPar2(path: string): Promise<Par2Result> {
       message: "PAR2 verify passed",
       output: trimOutput(verify.stdout, verify.stderr)
     };
-  } catch (verifyError) {
+  } catch {
     try {
       const repair = await execFileAsync(par2, ["repair", basename(par2File)], {
         cwd: dirname(par2File),

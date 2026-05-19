@@ -1,4 +1,4 @@
-import { Prisma, type MediaRequest, type RequestProvider } from "@prisma/client";
+import type { MediaRequest, Prisma, RequestProvider } from "@prisma/client";
 import { prisma } from "../../db/prisma.js";
 import { redis } from "../../db/redis.js";
 import { downloadNzb } from "../../indexers/nzbhydra/client.js";

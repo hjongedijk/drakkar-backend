@@ -1,5 +1,6 @@
 import { z } from "zod";
 import type { FastifyInstance } from "fastify";
+import type { Release } from "../releases/types.js";
 import {
   createProfile,
   deleteProfile,
@@ -49,7 +50,7 @@ export async function profileRoutes(app: FastifyInstance): Promise<void> {
 
   app.post("/api/profiles/:id/test", async (request) => {
     const profile = await getProfile((request.params as { id: string }).id);
-    return scoreRelease((request.body as { release: any }).release, profile);
+    return scoreRelease((request.body as { release: Release }).release, profile);
   });
 
   app.post("/api/releases/score", async (request) => {

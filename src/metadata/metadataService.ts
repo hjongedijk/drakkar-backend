@@ -369,7 +369,7 @@ export async function fetchDiscoverHome(settings: AppSettings) {
   };
 }
 
-export async function writeImportMetadata(input: {
+export async function writeImportMetadata(_input: {
   importId: string;
   title: string;
   completedPath: string;
@@ -378,5 +378,6 @@ export async function writeImportMetadata(input: {
   season?: number | null;
   episode?: number | null;
 }) {
+  void _input;
   return { metadataPath: null, stableIdPath: null };
 }
