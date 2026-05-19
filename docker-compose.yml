@@ -9,22 +9,11 @@ services:
         condition: service_healthy
     env_file:
       - .env.example
-    environment:
-      VFS_ROOT: /data
-      VFS_DOWNLOADS_DIR: /data/downloads
-      VFS_COMPLETED_DIR: /data/completed
-      VFS_NZB_DIR: /data/nzb
-      MEDIA_SYMLINKS_DIR: /data/media
-      MEDIA_MOVIES_DIR: /data/media/movies
-      MEDIA_TV_DIR: /data/media/tv
-      NZB_BACKUPS_DIR: /data/nzb-backup
     ports:
       - "3000:3000"
     volumes:
-      - ./data/config:/config
-      - ./data/runtime:/data
-      - ./data/fuse:/fuse:rshared
-      - ./data/cache:/cache
+      - ./data:/data
+      - /mnt:/mnt:rshared,z
     devices:
       - /dev/fuse:/dev/fuse
     cap_add:
