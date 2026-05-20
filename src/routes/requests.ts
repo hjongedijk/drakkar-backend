@@ -14,6 +14,7 @@ import {
   markRequestAvailable,
   rankReleasesForRequest,
   recoverFailedRequestDownloads,
+  ensureMonitoredRequests,
   refreshRequest,
   setRequestStatus,
   syncRequests,
@@ -84,7 +85,13 @@ export async function requestRoutes(app: FastifyInstance): Promise<void> {
   app.post("/api/requests/sync", async (request) => {
     const result = await syncRequests((request.body as { providerId?: string } | undefined)?.providerId);
     const recovery = await recoverFailedRequestDownloads();
-    return publicResult({ ...result, recovery, requests: result.requests.map(publicRequest) });
+    const monitored = await ensureMonitoredRequests();
+    return publicResult({
+      ...result,
+      recovery: { recovered: recovery.recovered },
+      monitored: { retried: monitored.retried },
+      requests: result.requests.map(publicRequest)
+    });
   });
   app.post("/api/requests/:id/approve", async (request) => publicRequest(await setRequestStatus(idParam(request), "approved")));
   app.post("/api/requests/:id/reject", async (request) => publicRequest(await setRequestStatus(idParam(request), "rejected")));

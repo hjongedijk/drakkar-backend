@@ -38,11 +38,11 @@ try {
   await bootstrapDevelopmentTestConnectionData(app.log);
   const namingMigration = await migrateImportsToCurrentNaming();
   if (namingMigration.moved > 0 || namingMigration.relinked > 0) app.log.info({ namingMigration }, "library naming migration completed");
-  if (env.REQUEST_SYNC_ENABLED) startRequestSyncSchedule(app.log);
   await recoverInterruptedDownloads(app.log);
   startDownloadWorkers(app.log);
   await app.listen({ port: env.PORT, host: "0.0.0.0" });
   await startFuseMount(app.log);
+  if (env.REQUEST_SYNC_ENABLED) startRequestSyncSchedule(app.log);
   startBackgroundRepairSchedule(app.log);
 } catch (error) {
   app.log.error({ err: error }, "startup failed");

@@ -1,16 +1,22 @@
 import { Worker, type Job } from "bullmq";
+import { join } from "node:path";
 import type { FastifyBaseLogger } from "fastify";
+import { env } from "../config/env.js";
 import { redis } from "../db/redis.js";
 import { prisma } from "../db/prisma.js";
-import { makeMountedDownloadAvailable } from "../import/importService.js";
+import { importCompletedPath, makeMountedDownloadAvailable } from "../import/importService.js";
 import type { DownloadJobData } from "../queues/downloadQueue.js";
-import { prepareNzbDocumentForStreaming } from "./downloadEngine.js";
+import { downloadNzbDocument, prepareNzbDocumentForStreaming } from "./downloadEngine.js";
 import { fetchAndStoreNzbForDownload } from "./urlNzb.js";
 import { nzbDownloadQueue } from "../queues/downloadQueue.js";
 import { recoverFailedDownloadForRequest } from "../requests/recovery/releaseRecoveryService.js";
 import { humanizeDownloadError } from "../downloads/presentation.js";
 
 let workers: Worker[] = [];
+
+function requiresMaterializedImport(message: string) {
+  return /no streamable video file|archive file/i.test(message);
+}
 
 export function startDownloadWorkers(logger: FastifyBaseLogger) {
   if (workers.length > 0) return workers;
@@ -59,6 +65,31 @@ export function startDownloadWorkers(logger: FastifyBaseLogger) {
             logger.info({ downloadId: job.data.downloadId, streamPath: available.streamPath }, "streaming NZB prepared and symlinked");
           } catch (error) {
             const rawMessage = error instanceof Error ? error.message : "import failed";
+            if (requiresMaterializedImport(rawMessage)) {
+              logger.warn({ downloadId: job.data.downloadId, err: error }, "mounted import needs full download fallback");
+              const completed = await downloadNzbDocument({
+                downloadId: job.data.downloadId,
+                nzbDocumentId,
+                logger
+              });
+              if (completed.status === "completed") {
+                const imported = await importCompletedPath({
+                  downloadId: job.data.downloadId,
+                  requestId: job.data.requestId,
+                  sourcePath: join(env.VFS_DOWNLOADS_DIR, job.data.downloadId)
+                });
+                await prisma.download.update({
+                  where: { id: job.data.downloadId },
+                  data: { status: "available", error: null, completedAt: new Date(), progress: 100, speedBytesSec: 0, etaSeconds: 0 }
+                });
+                await prisma.mediaRequest.updateMany({
+                  where: { downloadId: job.data.downloadId },
+                  data: { status: "available" }
+                });
+                logger.info({ downloadId: job.data.downloadId, imported: imported.length }, "full NZB download extracted and imported");
+                return { status: "available", imports: imported.length, mode: "materialized_fallback" };
+              }
+            }
             const message = humanizeDownloadError(rawMessage) ?? rawMessage;
             logger.warn({ downloadId: job.data.downloadId, err: error }, "streaming NZB prepared but symlink import failed");
             await prisma.download.update({ where: { id: job.data.downloadId }, data: { status: "failed", error: message } });
