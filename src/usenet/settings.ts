@@ -1,5 +1,6 @@
 import { z } from "zod";
 import { prisma } from "../db/prisma.js";
+import { invalidatePolicyCache } from "../policies/policyService.js";
 
 export const usenetServerSchema = z.object({
   name: z.string().min(1),
@@ -20,13 +21,16 @@ export function listUsenetServers() {
 }
 
 export function createUsenetServer(input: unknown) {
+  invalidatePolicyCache();
   return prisma.usenetServer.create({ data: usenetServerSchema.parse(input) });
 }
 
 export function updateUsenetServer(id: string, input: unknown) {
+  invalidatePolicyCache();
   return prisma.usenetServer.update({ where: { id }, data: usenetServerSchema.partial().parse(input) });
 }
 
 export function deleteUsenetServer(id: string) {
+  invalidatePolicyCache();
   return prisma.usenetServer.delete({ where: { id } });
 }

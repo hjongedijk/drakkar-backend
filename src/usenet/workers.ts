@@ -249,7 +249,7 @@ export async function reconcileDownloadQueueState(logger: FastifyBaseLogger) {
       data: {
         status: "queued",
         jobId: String(job.id),
-        error: "Recovered queued download with missing worker job",
+        error: null,
         speedBytesSec: 0,
         etaSeconds: null
       }
@@ -274,7 +274,7 @@ export async function recoverInterruptedDownloads(logger: FastifyBaseLogger) {
         data: {
           status: "queued",
           jobId: String(existingJob.id),
-          error: "Recovered interrupted download; existing queue job retained",
+          error: null,
           speedBytesSec: 0,
           etaSeconds: null
         }
@@ -297,7 +297,7 @@ export async function recoverInterruptedDownloads(logger: FastifyBaseLogger) {
       data: {
         status: "queued",
         jobId: job.id,
-        error: "Recovered interrupted download; queued to continue",
+        error: null,
         speedBytesSec: 0,
         etaSeconds: null
       }

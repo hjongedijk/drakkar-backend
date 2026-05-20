@@ -97,6 +97,26 @@ const POLICY_CACHE_MS = 30_000;
 let cachedPolicies: { value: PolicySettings; expiresAt: number } | null = null;
 let cachedIgnoredPatterns: { value: string[]; expiresAt: number } | null = null;
 
+async function enabledUsenetConnectionCount() {
+  const aggregate = await prisma.usenetServer.aggregate({
+    where: { enabled: true },
+    _sum: { connections: true }
+  });
+  return Math.max(1, aggregate._sum.connections ?? 0);
+}
+
+async function derivePolicySettings(input: object) {
+  const parsed = policySettingsSchema.parse({ ...DEFAULT_POLICIES, ...input });
+  const totalEnabledConnections = await enabledUsenetConnectionCount();
+
+  return {
+    ...parsed,
+    maxDownloadConnections: totalEnabledConnections,
+    maxTotalUsenetConnections: totalEnabledConnections,
+    maxStreamingConnections: Math.min(parsed.maxStreamingConnections, totalEnabledConnections)
+  } satisfies PolicySettings;
+}
+
 async function getSetting<T>(key: string, fallback: T) {
   const row = await prisma.setting.findUnique({ where: { key } });
   if (!row) return fallback;
@@ -105,13 +125,14 @@ async function getSetting<T>(key: string, fallback: T) {
 
 export async function getPolicySettings() {
   if (cachedPolicies && cachedPolicies.expiresAt > Date.now()) return cachedPolicies.value;
-  const value = policySettingsSchema.parse({ ...DEFAULT_POLICIES, ...(await getSetting(POLICIES_KEY, {})) });
+  const value = await derivePolicySettings(await getSetting(POLICIES_KEY, {}));
   cachedPolicies = { value, expiresAt: Date.now() + POLICY_CACHE_MS };
   return value;
 }
 
 export async function updatePolicySettings(input: unknown) {
-  const policies = policySettingsSchema.parse({ ...DEFAULT_POLICIES, ...(input as object) });
+  const incoming = policySettingsSchema.parse({ ...DEFAULT_POLICIES, ...(input as object) });
+  const policies = await derivePolicySettings(incoming);
   await prisma.setting.upsert({
     where: { key: POLICIES_KEY },
     update: { value: policies },
@@ -119,6 +140,10 @@ export async function updatePolicySettings(input: unknown) {
   });
   cachedPolicies = { value: policies, expiresAt: Date.now() + POLICY_CACHE_MS };
   return policies;
+}
+
+export function invalidatePolicyCache() {
+  cachedPolicies = null;
 }
 
 export async function getIgnoredPatterns() {

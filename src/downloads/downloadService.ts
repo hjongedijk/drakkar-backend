@@ -86,6 +86,13 @@ function hasPotentialVideoPayload(parsed: ParsedNzb) {
     || parsed.fileCount > 0;
 }
 
+function isQueueRecoveryMessage(error: string | null) {
+  return error === "Queue entry has no active worker job yet"
+    || error === "Recovered queued download with missing worker job"
+    || error === "Recovered interrupted download; existing queue job retained"
+    || error === "Recovered interrupted download; queued to continue";
+}
+
 export async function storeNzbForDownload(input: {
   downloadId: string;
   filename?: string;
@@ -313,7 +320,7 @@ export async function getQueue() {
       const liveJob = jobByDownloadId.get(download.id);
       let nextStatus = download.status;
       let nextJobId = download.jobId ? String(download.jobId) : null;
-      let nextError = download.error;
+      let nextError = isQueueRecoveryMessage(download.error) ? null : download.error;
 
       if (liveJob) {
         nextJobId = String(liveJob.id);
@@ -322,8 +329,7 @@ export async function getQueue() {
         if ((state === "waiting" || state === "delayed" || state === "prioritized") && download.status !== "paused") nextStatus = "queued";
       } else if (download.status === "queued" || download.status === "downloading" || download.status === "fetching_nzb" || download.status === "verifying" || download.status === "waiting_for_provider" || download.status === "waiting_for_nzb") {
         nextStatus = "queued";
-        nextJobId = null;
-        nextError = download.error ?? "Queue entry has no active worker job yet";
+        nextJobId = nextJobId && nextStatus === "queued" ? nextJobId : null;
       }
 
       if (nextStatus !== download.status || nextJobId !== (download.jobId ? String(download.jobId) : null) || nextError !== download.error) {
