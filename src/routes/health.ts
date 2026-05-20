@@ -11,7 +11,7 @@ export async function healthRoutes(app: FastifyInstance): Promise<void> {
           properties: {
             status: { type: "string" },
             database: { type: "string" },
-            redis: { type: "string" },
+            valkey: { type: "string" },
             version: { type: "string" },
             servicesUp: { type: "number" },
             servicesTotal: { type: "number" },
@@ -32,7 +32,7 @@ export async function healthRoutes(app: FastifyInstance): Promise<void> {
     }
   }, async () => {
     let database = "ok";
-    let redisStatus = "ok";
+    let valkeyStatus = "ok";
 
     try {
       await prisma.$queryRaw`SELECT 1`;
@@ -43,20 +43,20 @@ export async function healthRoutes(app: FastifyInstance): Promise<void> {
     try {
       await redis.ping();
     } catch {
-      redisStatus = "error";
+      valkeyStatus = "error";
     }
 
-    const healthy = database === "ok" && redisStatus === "ok";
+    const healthy = database === "ok" && valkeyStatus === "ok";
     const checks = [
       { name: "database", status: database },
-      { name: "redis", status: redisStatus }
+      { name: "valkey", status: valkeyStatus }
     ];
     const servicesUp = checks.filter((check) => check.status === "ok").length;
     const servicesTotal = checks.length;
     return {
       status: healthy ? "ok" : "degraded",
       database,
-      redis: redisStatus,
+      valkey: valkeyStatus,
       version: "0.1.1",
       servicesUp,
       servicesTotal,

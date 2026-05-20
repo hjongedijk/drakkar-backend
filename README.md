@@ -8,7 +8,7 @@ Drakkar coordinates request sync, NZB search, download queueing, FUSE-mounted me
 
 - Fastify API with OpenAPI docs
 - PostgreSQL via Prisma
-- Redis for queueing and distributed cache
+- Valkey for queueing and distributed cache
 - Native FUSE mount support
 - NZBHydra2 search + Seerr sync
 - Browser playback endpoints
@@ -35,7 +35,7 @@ FUSE is mounted under `/mnt`, so Plex/Jellyfin/Emby can point at `/mnt/media`.
 ## Requirements
 
 - PostgreSQL
-- Redis
+- Valkey
 - Linux host with FUSE available
 - shared bind mount on the host for `/mnt`
 
@@ -106,4 +106,3 @@ Important endpoints:
 - [Configuration](docs/configuration.md)
 - [Integrations](docs/integrations.md)
 - [Troubleshooting](docs/troubleshooting.md)
-

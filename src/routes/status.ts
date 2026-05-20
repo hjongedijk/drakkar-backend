@@ -59,7 +59,7 @@ export async function statusRoutes(app: FastifyInstance): Promise<void> {
       version: "0.1.1",
       backend: "ok",
       postgresql: "ok",
-      redis: "ok",
+      valkey: "ok",
       nzbhydra,
       seerr,
       activeDownloads: active,
