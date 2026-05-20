@@ -3,6 +3,7 @@ import assert from "node:assert/strict";
 
 process.env.DATABASE_URL ??= "postgresql://test:test@localhost:5432/test";
 process.env.REDIS_URL ??= "redis://localhost:6379";
+process.env.MEDIA_SYMLINKS_DIR ??= "/mnt/media";
 
 const { applyNamingTemplate, cleanPathPart, completedPathFor, DEFAULT_NAMING_SETTINGS, libraryPathFor } = await import("../src/naming/namingService.js");
 
@@ -28,7 +29,7 @@ describe("naming service", () => {
     const libraryPath = libraryPathFor({ media, completedPath, naming: DEFAULT_NAMING_SETTINGS, strategy: "strm" });
 
     assert.match(completedPath, /Example Movie \(2026\)\.mkv$/);
-    assert.match(libraryPath, /^\/mnt\/usenet-vfs\/movies\//);
+    assert.match(libraryPath, new RegExp(`^${process.env.MEDIA_SYMLINKS_DIR?.replace(/\//g, "\\/")}\\/movies\\/`));
     assert.match(libraryPath, /Example Movie \(2026\)\.strm$/);
   });
 });

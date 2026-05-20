@@ -20,7 +20,7 @@ async function unmountStaleFuse(mountPath: string, logger: FastifyBaseLogger) {
       return;
     } catch (error) {
       const message = error instanceof Error ? error.message : String(error);
-      if (!/not mounted|no mount point|not found|Invalid argument/i.test(message)) {
+      if (!/ENOENT|not mounted|no mount point|not found|Invalid argument/i.test(message)) {
         logger.debug({ err: error, mountPath, command }, "stale FUSE cleanup skipped during folder validation");
       }
     }
