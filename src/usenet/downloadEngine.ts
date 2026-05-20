@@ -314,7 +314,7 @@ export async function prepareNzbDocumentForStreaming(input: { downloadId: string
   });
 
   const allowedConnections = await getAllowedDownloadConnections();
-  const pool = new NntpPool(providers, Math.max(1, Math.min(policies.maxDownloadConnections, allowedConnections)), input.logger);
+  const pool = new NntpPool(providers, Math.max(1, allowedConnections), input.logger);
   const totalSize = nzb.totalSize;
   let verified = 0;
   let verifiedBytes = 0;
@@ -408,7 +408,7 @@ export async function downloadNzbDocument(input: { downloadId: string; nzbDocume
   });
 
   const allowedConnections = await getAllowedDownloadConnections();
-  const pool = new NntpPool(providers, Math.max(1, Math.min(policies.maxDownloadConnections, allowedConnections)), input.logger);
+  const pool = new NntpPool(providers, Math.max(1, allowedConnections), input.logger);
   const files = [];
   let downloaded = 0;
   const startedAt = Date.now();
