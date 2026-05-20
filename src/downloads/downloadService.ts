@@ -303,7 +303,7 @@ export async function addUrl(url: string, title?: string) {
 }
 
 export async function getQueue() {
-  const [downloads, jobs] = await Promise.all([
+  const [downloads, activeJobs, waitingJobs, delayedJobs, prioritizedJobs] = await Promise.all([
     prisma.download.findMany({
       where: {
         status: { in: ["mounted", "queued", "fetching_nzb", "verifying", "prepared", "downloading", "paused", "waiting_for_provider", "waiting_for_nzb"] },
@@ -312,21 +312,35 @@ export async function getQueue() {
       orderBy: [{ priority: "desc" }, { createdAt: "asc" }],
       include: { nzbDocument: true }
     }),
-    nzbDownloadQueue.getJobs(["active", "waiting", "delayed", "prioritized"], 0, 500, true)
+    nzbDownloadQueue.getJobs(["active"], 0, 500, true),
+    nzbDownloadQueue.getJobs(["waiting"], 0, 500, true),
+    nzbDownloadQueue.getJobs(["delayed"], 0, 500, true),
+    nzbDownloadQueue.getJobs(["prioritized"], 0, 500, true)
   ]);
-  const jobByDownloadId = new Map(jobs.map((job) => [String(job.data?.downloadId ?? ""), job] as const));
+  const jobStateByDownloadId = new Map<string, { id: string; state: "active" | "waiting" | "delayed" | "prioritized" }>();
+  for (const [state, jobs] of [
+    ["active", activeJobs],
+    ["waiting", waitingJobs],
+    ["delayed", delayedJobs],
+    ["prioritized", prioritizedJobs]
+  ] as const) {
+    for (const job of jobs) {
+      const downloadId = String(job.data?.downloadId ?? "");
+      if (!downloadId || jobStateByDownloadId.has(downloadId)) continue;
+      jobStateByDownloadId.set(downloadId, { id: String(job.id), state });
+    }
+  }
   const normalized = await Promise.all(
     downloads.map(async (download) => {
-      const liveJob = jobByDownloadId.get(download.id);
+      const liveJob = jobStateByDownloadId.get(download.id);
       let nextStatus = download.status;
       let nextJobId = download.jobId ? String(download.jobId) : null;
       let nextError = isQueueRecoveryMessage(download.error) ? null : download.error;
 
       if (liveJob) {
-        nextJobId = String(liveJob.id);
-        const state = await liveJob.getState();
-        if (state === "active" && download.status !== "paused") nextStatus = "downloading";
-        if ((state === "waiting" || state === "delayed" || state === "prioritized") && download.status !== "paused") nextStatus = "queued";
+        nextJobId = liveJob.id;
+        if (liveJob.state === "active" && download.status !== "paused") nextStatus = "downloading";
+        if ((liveJob.state === "waiting" || liveJob.state === "delayed" || liveJob.state === "prioritized") && download.status !== "paused") nextStatus = "queued";
       } else if (download.status === "queued" || download.status === "downloading" || download.status === "fetching_nzb" || download.status === "verifying" || download.status === "waiting_for_provider" || download.status === "waiting_for_nzb") {
         nextStatus = "queued";
         nextJobId = nextJobId && nextStatus === "queued" ? nextJobId : null;

@@ -33,18 +33,31 @@ async function storageUsage() {
   }
 }
 
+function countByStatus(rows: Array<{ status: string; _count: { status: number } }>) {
+  return Object.fromEntries(rows.map((row) => [row.status, row._count.status]));
+}
+
 export async function statusRoutes(app: FastifyInstance): Promise<void> {
   await healthRoutes(app);
 
   app.get("/api/status", async () => {
-    const [counts, settings, requestProviders] = await Promise.all([
+    const [counts, downloadStatusRows, settings, requestProviders] = await Promise.all([
       nzbDownloadQueue.getJobCounts("waiting", "active", "completed", "failed", "delayed", "paused"),
+      prisma.download.groupBy({
+        by: ["status"],
+        where: {
+          status: {
+            in: ["queued", "fetching_nzb", "verifying", "downloading", "prepared", "waiting_for_provider", "waiting_for_nzb", "paused"]
+          }
+        },
+        _count: { status: true }
+      }),
       getSettings(),
       prisma.requestProvider.findMany({ where: { enabled: true }, select: { id: true } })
     ]);
-    const waiting = counts.waiting ?? 0;
-    const active = counts.active ?? 0;
-    const delayed = counts.delayed ?? 0;
+    const downloadCounts = countByStatus(downloadStatusRows);
+    const activeDownloads = (downloadCounts.downloading ?? 0) + (downloadCounts.verifying ?? 0) + (downloadCounts.fetching_nzb ?? 0) + (downloadCounts.prepared ?? 0);
+    const queueSize = (downloadCounts.queued ?? 0) + (downloadCounts.waiting_for_provider ?? 0) + (downloadCounts.waiting_for_nzb ?? 0);
     const [nzbhydra, seerr] = await Promise.all([
       serviceStatus(() => testNzbhydraConnection(settings), Boolean(settings.nzbhydraUrl && settings.nzbhydraApiKey)),
       serviceStatus(async () => {
@@ -62,8 +75,8 @@ export async function statusRoutes(app: FastifyInstance): Promise<void> {
       valkey: "ok",
       nzbhydra,
       seerr,
-      activeDownloads: active,
-      queueSize: waiting + delayed,
+      activeDownloads,
+      queueSize,
       storageUsage: storage,
       queues: counts,
       bandwidth,
