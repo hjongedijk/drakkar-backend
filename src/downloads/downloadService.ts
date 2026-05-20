@@ -4,7 +4,7 @@ import { extname, join } from "node:path";
 import { Prisma } from "@prisma/client";
 import { prisma } from "../db/prisma.js";
 import { env } from "../config/env.js";
-import { nzbDownloadQueue } from "../queues/downloadQueue.js";
+import { nzbDownloadQueue, queueDownloadJob } from "../queues/downloadQueue.js";
 import { parseNzbXml, type ParsedNzb } from "../nzb/parser.js";
 import { storeNzbDocument } from "../nzb/store.js";
 import { createBlocklistItem, getPolicySettings } from "../policies/policyService.js";
@@ -215,7 +215,11 @@ export async function addNzbUpload(input: { filename?: string; content: string |
     return prisma.download.findUniqueOrThrow({ where: { id: download.id }, include: { nzbDocument: true } });
   }
 
-  const job = await nzbDownloadQueue.add("parse-and-download", { downloadId: download.id, nzbDocumentId: nzbDocument.id, title: download.title });
+  const job = await queueDownloadJob(download, "parse-and-download", {
+    downloadId: download.id,
+    nzbDocumentId: nzbDocument.id,
+    title: download.title
+  });
   return prisma.download.update({ where: { id: download.id }, data: { jobId: job.id } });
 }
 
@@ -266,7 +270,7 @@ export async function addNzbFromPath(path: string, title?: string, options?: { q
   }
 
   await attachExistingDownloadToRequest(options?.requestId, download.id, title ?? download.title);
-  const job = await nzbDownloadQueue.add("parse-and-download", {
+  const job = await queueDownloadJob(download, "parse-and-download", {
     downloadId: download.id,
     nzbDocumentId: nzbDocument.id,
     title: download.title,
@@ -292,7 +296,11 @@ export async function addUrl(url: string, title?: string) {
       data: { status: "queued", nzbDocumentId: document.id, error: fetched.looksLikeNzb ? null : "URL response did not look like an NZB but parsed successfully" },
       include: { nzbDocument: true }
     });
-    const job = await nzbDownloadQueue.add("prepare-url-nzb", { downloadId: download.id, nzbDocumentId: document.id, title: queued.title });
+    const job = await queueDownloadJob(queued, "prepare-url-nzb", {
+      downloadId: download.id,
+      nzbDocumentId: document.id,
+      title: queued.title
+    });
     return prisma.download.update({ where: { id: download.id }, data: { jobId: job.id }, include: { nzbDocument: true } });
   } catch (error) {
     return prisma.download.update({
@@ -330,6 +338,17 @@ export async function getQueue() {
       jobStateByDownloadId.set(downloadId, { id: String(job.id), state });
     }
   }
+  const liveOrder = new Map<string, number>();
+  let liveIndex = 0;
+  for (const jobs of [activeJobs, waitingJobs, prioritizedJobs, delayedJobs]) {
+    for (const job of jobs) {
+      const downloadId = String(job.data?.downloadId ?? "");
+      if (!downloadId || liveOrder.has(downloadId)) continue;
+      liveOrder.set(downloadId, liveIndex);
+      liveIndex += 1;
+    }
+  }
+
   const normalized = await Promise.all(
     downloads.map(async (download) => {
       const liveJob = jobStateByDownloadId.get(download.id);
@@ -367,7 +386,17 @@ export async function getQueue() {
     })
   );
 
-  return normalized;
+  return normalized.sort((a, b) => {
+    const aLive = liveOrder.get(a.id);
+    const bLive = liveOrder.get(b.id);
+    if (aLive !== undefined || bLive !== undefined) {
+      if (aLive === undefined) return 1;
+      if (bLive === undefined) return -1;
+      return aLive - bLive;
+    }
+    if (a.priority !== b.priority) return b.priority - a.priority;
+    return a.createdAt.getTime() - b.createdAt.getTime();
+  });
 }
 
 export function getHistory() {
@@ -452,7 +481,7 @@ export async function setDownloadStatus(id: string, status: string) {
 
 export async function enqueueDownload(id: string) {
   const download = await prisma.download.findUniqueOrThrow({ where: { id } });
-  const job = await nzbDownloadQueue.add("retry-download", {
+  const job = await queueDownloadJob(download, "retry-download", {
     downloadId: download.id,
     nzbDocumentId: download.nzbDocumentId ?? undefined,
     title: download.title

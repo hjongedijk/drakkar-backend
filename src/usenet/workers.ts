@@ -9,7 +9,7 @@ import { importCompletedPath, makeMountedDownloadAvailable } from "../import/imp
 import type { DownloadJobData } from "../queues/downloadQueue.js";
 import { downloadNzbDocument, prepareNzbDocumentForStreaming } from "./downloadEngine.js";
 import { fetchAndStoreNzbForDownload } from "./urlNzb.js";
-import { nzbDownloadQueue } from "../queues/downloadQueue.js";
+import { nzbDownloadQueue, queueDownloadJob } from "../queues/downloadQueue.js";
 import { recoverFailedDownloadForRequest } from "../requests/recovery/releaseRecoveryService.js";
 import { humanizeDownloadError } from "../downloads/presentation.js";
 
@@ -25,8 +25,8 @@ export function startDownloadWorkers(logger: FastifyBaseLogger) {
   const worker = new Worker<DownloadJobData>(
     "nzb-download",
     async (job: Job<DownloadJobData>) => {
+      let current = await prisma.download.findUnique({ where: { id: job.data.downloadId } });
       try {
-        const current = await prisma.download.findUnique({ where: { id: job.data.downloadId } });
         if (!current) {
           logger.warn({ downloadId: job.data.downloadId, jobId: job.id }, "download job skipped because download no longer exists");
           return { status: "missing" };
@@ -125,7 +125,14 @@ export function startDownloadWorkers(logger: FastifyBaseLogger) {
               speedBytesSec: 0
             }
           });
-          const retry = await nzbDownloadQueue.add(
+          current = current ?? await prisma.download.findUnique({ where: { id: job.data.downloadId } });
+          const retry = await queueDownloadJob(
+            current ?? {
+              id: job.data.downloadId,
+              title: job.data.title,
+              createdAt: new Date(),
+              priority: 0
+            },
             "provider-backoff-retry",
             {
               downloadId: job.data.downloadId,
@@ -223,6 +230,8 @@ export async function reconcileDownloadQueueState(logger: FastifyBaseLogger) {
     select: {
       id: true,
       title: true,
+      createdAt: true,
+      priority: true,
       status: true,
       jobId: true,
       nzbDocumentId: true
@@ -240,7 +249,7 @@ export async function reconcileDownloadQueueState(logger: FastifyBaseLogger) {
       where: { downloadId: download.id },
       select: { id: true }
     });
-    const job = await nzbDownloadQueue.add("startup-recovery", {
+    const job = await queueDownloadJob(download, "startup-recovery", {
       downloadId: download.id,
       nzbDocumentId: download.nzbDocumentId,
       title: download.title,

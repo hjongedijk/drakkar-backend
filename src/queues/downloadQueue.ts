@@ -1,4 +1,4 @@
-import { Queue } from "bullmq";
+import { Queue, type JobsOptions } from "bullmq";
 import { redis } from "../db/redis.js";
 
 export type DownloadJobData = {
@@ -20,6 +20,29 @@ export const importQueue = new Queue<DownloadJobData>("import", { connection: re
 export const symlinkQueue = new Queue<DownloadJobData>("symlink", { connection: redis });
 export const cleanupQueue = new Queue<DownloadJobData>("cleanup", { connection: redis });
 export const requestSyncQueue = new Queue<{ providerId?: string }>("request-sync", { connection: redis });
+
+function queuePriority(priority: number | null | undefined) {
+  const normalized = Math.max(0, Math.min(999, Number(priority ?? 0)));
+  return 1000 - normalized;
+}
+
+export async function queueDownloadJob(
+  input: {
+    id: string;
+    title: string;
+    createdAt: Date;
+    priority?: number | null;
+  },
+  name: string,
+  data: DownloadJobData,
+  options?: JobsOptions
+) {
+  return nzbDownloadQueue.add(name, data, {
+    timestamp: input.createdAt.getTime(),
+    priority: queuePriority(input.priority),
+    ...options
+  });
+}
 
 export const pipelineQueues = [
   nzbDownloadQueue,
