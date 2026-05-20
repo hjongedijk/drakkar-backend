@@ -8,11 +8,24 @@ import { completedPathToVfsPath, getNamingSettings, libraryPathFor } from "../na
 import { getPolicySettings } from "../policies/policyService.js";
 import { getSettings } from "../settings/settingsStore.js";
 
+function fallbackMediaTitle(value?: string | null) {
+  if (!value) return undefined;
+  const prefix = value.split(/\bS\d{1,2}E\d{1,3}\b/i)[0] ?? value;
+  const cleaned = prefix
+    .replace(/[._]+/g, " ")
+    .replace(/\s+-\s+[A-Za-z0-9]+$/, "")
+    .trim();
+  return cleaned || undefined;
+}
+
 async function mediaFromImport(item: ImportItem) {
   const request = item.requestId ? await prisma.mediaRequest.findUnique({ where: { id: item.requestId } }) : null;
+  const download = item.downloadId ? await prisma.download.findUnique({ where: { id: item.downloadId } }) : null;
+  const suspiciousTitle = !item.title || /^[a-z0-9]+-[a-z0-9-]+$/i.test(item.title);
+  const titleFallback = suspiciousTitle ? fallbackMediaTitle(download?.title) ?? item.title : item.title;
   const media = {
     mediaType: item.mediaType,
-    title: item.title,
+    title: titleFallback,
     year: item.year,
     season: item.season,
     episode: item.episode,
@@ -34,7 +47,15 @@ async function mediaFromImport(item: ImportItem) {
     imdbId: request?.imdbId
   }).catch(() => undefined);
 
-  if (!metadata?.year) return media;
+  if (!metadata?.year) {
+    if (titleFallback && titleFallback !== item.title) {
+      await prisma.importItem.update({
+        where: { id: item.id },
+        data: { title: titleFallback }
+      }).catch(() => undefined);
+    }
+    return media;
+  }
 
   const nextMedia = {
     ...media,

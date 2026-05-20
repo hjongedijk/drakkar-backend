@@ -59,7 +59,11 @@ function normalizeMountedFilename(value: string) {
 }
 
 function suspiciousImportTitle(value: string) {
-  return /&quot;|^\s*\d+\]\s*|^[a-z0-9]{20,}$/i.test(value);
+  return !value
+    || value.includes("&quot;")
+    || /^\s*\d+\]\s*/.test(value)
+    || /^[a-z0-9]{20,}$/i.test(value)
+    || /^[a-z0-9]+-[a-z0-9-]+$/i.test(value);
 }
 
 function inferMedia(path: string) {
@@ -92,6 +96,22 @@ async function requestMetadata(requestId?: string): Promise<Partial<ImportMedia>
     tmdbId: request.tmdbId ?? undefined,
     tvdbId: request.tvdbId ?? undefined
   };
+}
+
+function suspiciousMountedTitle(value: string) {
+  return !value
+    || /^[a-z0-9]+-[a-z0-9-]+$/i.test(value)
+    || /^[a-z0-9-]{3,}$/i.test(value.replace(/\bS\d{1,2}E\d{1,3}\b/i, "").replace(/\b(19\d{2}|20\d{2})\b/g, "").trim());
+}
+
+function fallbackMediaTitle(value?: string | null) {
+  if (!value) return undefined;
+  const prefix = value.split(/\bS\d{1,2}E\d{1,3}\b/i)[0] ?? value;
+  const cleaned = prefix
+    .replace(/[._]+/g, " ")
+    .replace(/\s+-\s+[A-Za-z0-9]+$/, "")
+    .trim();
+  return cleaned || undefined;
 }
 
 export async function importCompletedPath(input: { sourcePath: string; downloadId?: string; requestId?: string }) {
@@ -179,7 +199,10 @@ export async function makeMountedDownloadAvailable(input: { downloadId: string; 
     const filename = nzbFile
       ? filenameFromSubject(nzbFile.subject, 0)
       : normalizeMountedFilename(selected.name.replace(/^[-_\s]+|[_\s]+$/g, ""));
-    const inferred = { ...inferMedia(filename), ...requestInfo };
+    const downloadFallback = !input.requestId && suspiciousMountedTitle(inferMedia(filename).title)
+      ? inferMedia(download.title)
+      : {};
+    const inferred = { ...inferMedia(filename), ...downloadFallback, ...requestInfo };
     const matchingImport = await findWorkingImportByIdentity(inferred);
 
     const existing = await prisma.importItem.findFirst({
@@ -219,26 +242,19 @@ export async function makeMountedDownloadAvailable(input: { downloadId: string; 
 
 export async function repairSuspiciousImports() {
   const settings = await getSettings();
-  const imports = await prisma.importItem.findMany({
-    where: {
-      OR: [
-        { title: { contains: "&quot;" } },
-        { title: { startsWith: "[" } },
-        { title: { startsWith: "7]" } },
-        { title: { startsWith: "8]" } },
-        { title: { startsWith: "9]" } },
-        { title: { startsWith: "10]" } }
-      ]
-    },
-    include: { request: true, symlinks: true }
-  });
+  const imports = (await prisma.importItem.findMany({
+    include: { request: true, download: true, symlinks: true }
+  })).filter((item) => suspiciousImportTitle(item.title));
 
   let repaired = 0;
   let hidden = 0;
   for (const item of imports) {
     const requestInfo = item.requestId ? await requestMetadata(item.requestId) : {};
     const filename = normalizeMountedFilename(decodePathBasename(item.completedPath));
-    const inferred = { ...inferMedia(filename), ...requestInfo };
+    const downloadFallback = !item.requestId && suspiciousMountedTitle(inferMedia(filename).title)
+      ? inferMedia(item.download?.title ?? fallbackMediaTitle(item.download?.title) ?? item.title)
+      : {};
+    const inferred = { ...inferMedia(filename), ...downloadFallback, ...requestInfo };
     const metadata = inferred.title ? await fetchMediaMetadata(settings, {
       mediaType: inferred.mediaType,
       title: inferred.title,
@@ -316,6 +332,7 @@ export function getImport(id: string) {
 export async function reprocessImport(id: string) {
   const item = await getImport(id);
   await createLibraryEntryForImport(item);
+  await refreshMediaLibrary();
   return getImport(id);
 }
 

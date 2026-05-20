@@ -82,8 +82,7 @@ export async function bootstrapDevelopmentTestConnectionData(log: { info: (input
           ssl: server.ssl,
           username: server.username,
           password: server.password,
-          connections: server.connections,
-          enabled: true
+          connections: server.connections
         }
       });
     } else {
@@ -111,8 +110,7 @@ export async function bootstrapDevelopmentTestConnectionData(log: { info: (input
           type: "seerr",
           name: requester.name,
           baseUrl: requester.host,
-          apiKey: requester.api_key,
-          enabled: true
+          apiKey: requester.api_key
         }
       });
     } else {

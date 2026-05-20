@@ -1,4 +1,5 @@
 import { Worker, type Job } from "bullmq";
+import { rm } from "node:fs/promises";
 import { join } from "node:path";
 import type { FastifyBaseLogger } from "fastify";
 import { env } from "../config/env.js";
@@ -86,6 +87,7 @@ export function startDownloadWorkers(logger: FastifyBaseLogger) {
                   where: { downloadId: job.data.downloadId },
                   data: { status: "available" }
                 });
+                await rm(join(env.VFS_DOWNLOADS_DIR, job.data.downloadId), { recursive: true, force: true }).catch(() => undefined);
                 logger.info({ downloadId: job.data.downloadId, imported: imported.length }, "full NZB download extracted and imported");
                 return { status: "available", imports: imported.length, mode: "materialized_fallback" };
               }

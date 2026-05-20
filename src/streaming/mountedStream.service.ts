@@ -17,6 +17,85 @@ const inFlightReadAhead = new Set<string>();
 const sessionControllers = new Map<string, AbortController>();
 const markedStreamSessions = new Set<string>();
 let cachedProviders: { value: UsenetServer[]; expiresAt: number } | null = null;
+let mountedPool: MountedNntpPool | null = null;
+let mountedPoolSignature: string | null = null;
+
+type MountedPoolSlot = {
+  provider: UsenetServer;
+  client?: NntpClient;
+  busy: boolean;
+};
+
+class MountedNntpPool {
+  private readonly slots: MountedPoolSlot[];
+  private readonly waiters: Array<{ excludedProviders: Set<string>; resolve: (slot: MountedPoolSlot) => void }> = [];
+
+  constructor(providers: UsenetServer[], maxConnections: number) {
+    const slots: MountedPoolSlot[] = [];
+    for (const provider of providers) {
+      const limit = Math.max(1, Math.min(provider.connections, maxConnections - slots.length));
+      for (let index = 0; index < limit; index += 1) slots.push({ provider, busy: false });
+      if (slots.length >= maxConnections) break;
+    }
+    this.slots = slots.length > 0 ? slots : providers.slice(0, 1).map((provider) => ({ provider, busy: false }));
+  }
+
+  async body(articleId: string, signal?: AbortSignal) {
+    const errors: string[] = [];
+    const permanentFailures = new Set<string>();
+    const providerCount = new Set(this.slots.map((slot) => slot.provider.id)).size;
+    const maxAttempts = Math.max(providerCount, this.slots.length * 2);
+
+    for (let attempt = 1; attempt <= maxAttempts; attempt += 1) {
+      if (permanentFailures.size >= providerCount) break;
+      const slot = await this.acquire(permanentFailures);
+      try {
+        if (!slot.client) {
+          slot.client = new NntpClient(slot.provider);
+          await slot.client.connect(signal);
+        }
+        return await slot.client.body(articleId, signal);
+      } catch (error) {
+        const message = error instanceof Error ? error.message : "unknown NNTP error";
+        errors.push(`${slot.provider.name}: ${message}`);
+        await slot.client?.quit().catch(() => undefined);
+        slot.client = undefined;
+        permanentFailures.add(slot.provider.id);
+      } finally {
+        this.release(slot);
+      }
+    }
+
+    throw new Error(`all providers failed for ${articleId}: ${errors.join("; ")}`);
+  }
+
+  async close() {
+    await Promise.all(this.slots.map((slot) => slot.client?.quit().catch(() => undefined)));
+  }
+
+  private acquire(excludedProviders = new Set<string>()) {
+    const available = this.slots.find((slot) => !slot.busy && !excludedProviders.has(slot.provider.id));
+    if (available) {
+      available.busy = true;
+      return Promise.resolve(available);
+    }
+
+    return new Promise<MountedPoolSlot>((resolve) => {
+      this.waiters.push({ excludedProviders: new Set(excludedProviders), resolve });
+    });
+  }
+
+  private release(slot: MountedPoolSlot) {
+    const waiterIndex = this.waiters.findIndex((waiter) => !waiter.excludedProviders.has(slot.provider.id));
+    const waiter = waiterIndex >= 0 ? this.waiters.splice(waiterIndex, 1)[0] : undefined;
+    if (waiter) {
+      slot.busy = true;
+      waiter.resolve(slot);
+      return;
+    }
+    slot.busy = false;
+  }
+}
 
 export type StreamSession = {
   id: string;
@@ -44,6 +123,29 @@ async function getProviders() {
   });
   cachedProviders = { value, expiresAt: Date.now() + 15_000 };
   return value;
+}
+
+async function getMountedPool() {
+  const providers = await getProviders();
+  const policies = await getPolicySettings();
+  const maxConnections = Math.max(1, policies.maxTotalUsenetConnections || providers.reduce((sum, provider) => sum + provider.connections, 0) || 1);
+  const desiredSize = Math.min(providers.reduce((sum, provider) => sum + provider.connections, 0) || 1, maxConnections);
+  const nextSignature = JSON.stringify({
+    maxConnections: desiredSize,
+    providers: providers.map((provider) => ({
+      id: provider.id,
+      host: provider.host,
+      port: provider.port,
+      connections: provider.connections,
+      enabled: provider.enabled
+    }))
+  });
+  if (!mountedPool || mountedPoolSignature !== nextSignature) {
+    await mountedPool?.close().catch(() => undefined);
+    mountedPool = new MountedNntpPool(providers, desiredSize);
+    mountedPoolSignature = nextSignature;
+  }
+  return mountedPool;
 }
 
 function createAbortError() {
@@ -94,23 +196,11 @@ function markStreamedOnce(sessionId: string, path: string) {
 }
 
 async function downloadArticle(articleId: string, providers: UsenetServer[], signal?: AbortSignal) {
-  const errors: string[] = [];
-  for (const provider of providers) {
-    throwIfAborted(signal);
-    const client = new NntpClient(provider);
-    try {
-      await client.connect(signal);
-      const body = await client.body(articleId, signal);
-      await incrementMetric("providerHits");
-      return decodeArticleBody(body);
-    } catch (error) {
-      errors.push(`${provider.name}: ${error instanceof Error ? error.message : "unknown NNTP error"}`);
-      if (signal?.aborted) throw createAbortError();
-    } finally {
-      await client.quit().catch(() => undefined);
-    }
-  }
-  throw new Error(`all providers failed for ${articleId}: ${errors.join("; ")}`);
+  throwIfAborted(signal);
+  const pool = await getMountedPool();
+  const body = await pool.body(articleId, signal);
+  await incrementMetric("providerHits");
+  return decodeArticleBody(body);
 }
 
 async function getOrFetchSegmentBuffer(input: {
@@ -347,19 +437,22 @@ export async function readMountedFileRange(input: {
   });
 
   const existingBytesSent = Number((await redis.hget(`vfs:stream:session:${session.id}`, "bytesSent")) ?? 0);
+  const decodedRanges = await Promise.all(
+    plan.ranges.map(async (segment) => {
+      throwIfAborted(session.controller.signal);
+      const decoded = await getOrFetchSegmentBuffer({
+        fileId: segment.fileId,
+        segmentNumber: segment.segmentNumber,
+        articleId: segment.articleId,
+        providers,
+        signal: session.controller.signal
+      });
+      return decoded.subarray(segment.segmentOffset, segment.segmentOffset + segment.length);
+    })
+  );
   const buffers: Buffer[] = [];
   let total = 0;
-
-  for (const segment of plan.ranges) {
-    throwIfAborted(session.controller.signal);
-    const decoded = await getOrFetchSegmentBuffer({
-      fileId: segment.fileId,
-      segmentNumber: segment.segmentNumber,
-      articleId: segment.articleId,
-      providers,
-      signal: session.controller.signal
-    });
-    const chunk = decoded.subarray(segment.segmentOffset, segment.segmentOffset + segment.length);
+  for (const chunk of decodedRanges) {
     buffers.push(chunk);
     total += chunk.length;
   }
