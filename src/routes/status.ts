@@ -10,6 +10,8 @@ import { getBandwidthStatus } from "../bandwidth/bandwidthScheduler.js";
 import { getFuseMountStatus } from "../vfs/fuseMountService.js";
 import { healthRoutes } from "./health.js";
 
+const SERVICE_STATUS_CACHE_TTL_MS = 30_000;
+
 async function serviceStatus(check: () => Promise<{ ok: boolean }>, configured: boolean) {
   if (!configured) return "not_configured";
   try {
@@ -37,6 +39,20 @@ function countByStatus(rows: Array<{ status: string; _count: { status: number } 
   return Object.fromEntries(rows.map((row) => [row.status, row._count.status]));
 }
 
+const cachedServiceStatuses = new Map<string, { expiresAt: number; value: string }>();
+
+async function cachedServiceStatus(key: string, check: () => Promise<{ ok: boolean }>, configured: boolean) {
+  const cached = cachedServiceStatuses.get(key);
+  const now = Date.now();
+  if (cached && cached.expiresAt > now) return cached.value;
+  const value = await serviceStatus(check, configured);
+  cachedServiceStatuses.set(key, {
+    value,
+    expiresAt: now + SERVICE_STATUS_CACHE_TTL_MS
+  });
+  return value;
+}
+
 export async function statusRoutes(app: FastifyInstance): Promise<void> {
   await healthRoutes(app);
 
@@ -59,8 +75,8 @@ export async function statusRoutes(app: FastifyInstance): Promise<void> {
     const activeDownloads = (downloadCounts.downloading ?? 0) + (downloadCounts.verifying ?? 0) + (downloadCounts.fetching_nzb ?? 0) + (downloadCounts.prepared ?? 0);
     const queueSize = (downloadCounts.queued ?? 0) + (downloadCounts.waiting_for_provider ?? 0) + (downloadCounts.waiting_for_nzb ?? 0);
     const [nzbhydra, seerr] = await Promise.all([
-      serviceStatus(() => testNzbhydraConnection(settings), Boolean(settings.nzbhydraUrl && settings.nzbhydraApiKey)),
-      serviceStatus(async () => {
+      cachedServiceStatus("nzbhydra", () => testNzbhydraConnection(settings), Boolean(settings.nzbhydraUrl && settings.nzbhydraApiKey)),
+      cachedServiceStatus("request-providers", async () => {
         const results = await Promise.all(requestProviders.map((provider) => testRequestProvider(provider.id)));
         return { ok: results.length > 0 && results.every((result) => result.ok) };
       }, requestProviders.length > 0)
