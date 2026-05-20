@@ -3,12 +3,14 @@ import { dirname } from "node:path";
 import type { ImportItem } from "@prisma/client";
 import { env } from "../config/env.js";
 import { prisma } from "../db/prisma.js";
+import { fetchMediaMetadata } from "../metadata/metadataService.js";
 import { completedPathToVfsPath, getNamingSettings, libraryPathFor } from "../naming/namingService.js";
 import { getPolicySettings } from "../policies/policyService.js";
+import { getSettings } from "../settings/settingsStore.js";
 
 async function mediaFromImport(item: ImportItem) {
   const request = item.requestId ? await prisma.mediaRequest.findUnique({ where: { id: item.requestId } }) : null;
-  return {
+  const media = {
     mediaType: item.mediaType,
     title: item.title,
     year: item.year,
@@ -17,6 +19,40 @@ async function mediaFromImport(item: ImportItem) {
     tmdbId: request?.tmdbId,
     tvdbId: request?.tvdbId
   };
+
+  if (media.year) return media;
+
+  const settings = await getSettings();
+  const metadata = await fetchMediaMetadata(settings, {
+    mediaType: media.mediaType,
+    title: media.title,
+    year: media.year,
+    season: media.season,
+    episode: media.episode,
+    tmdbId: media.tmdbId,
+    tvdbId: media.tvdbId,
+    imdbId: request?.imdbId
+  }).catch(() => undefined);
+
+  if (!metadata?.year) return media;
+
+  const nextMedia = {
+    ...media,
+    title: metadata.title ?? media.title,
+    year: metadata.year,
+    tmdbId: media.tmdbId ?? metadata.tmdbId,
+    tvdbId: media.tvdbId ?? metadata.tvdbId
+  };
+
+  await prisma.importItem.update({
+    where: { id: item.id },
+    data: {
+      title: nextMedia.title,
+      year: nextMedia.year
+    }
+  }).catch(() => undefined);
+
+  return nextMedia;
 }
 
 async function removeExisting(path: string) {
