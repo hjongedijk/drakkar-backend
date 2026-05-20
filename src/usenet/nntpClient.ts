@@ -1,6 +1,5 @@
 import net from "node:net";
 import tls from "node:tls";
-import { once } from "node:events";
 import type { UsenetServer } from "@prisma/client";
 
 type Socket = net.Socket | tls.TLSSocket;
@@ -8,10 +7,12 @@ type Socket = net.Socket | tls.TLSSocket;
 export class NntpClient {
   private socket?: Socket;
   private buffer = "";
+  private socketError: Error | null = null;
 
   constructor(private readonly server: UsenetServer) {}
 
   async connect(signal?: AbortSignal) {
+    this.socketError = null;
     this.socket = this.server.ssl
       ? tls.connect({ host: this.server.host, port: this.server.port, servername: this.server.host })
       : net.connect({ host: this.server.host, port: this.server.port });
@@ -19,6 +20,12 @@ export class NntpClient {
     this.socket.setEncoding("binary");
     this.socket.on("data", (chunk) => {
       this.buffer += chunk.toString();
+    });
+    this.socket.on("error", (error) => {
+      this.socketError = error;
+    });
+    this.socket.on("close", () => {
+      this.socketError ??= new Error("NNTP socket closed");
     });
     this.socket.on("timeout", () => this.socket?.destroy(new Error("NNTP socket timeout")));
     await this.waitForSocket("connect", signal);
@@ -71,21 +78,40 @@ export class NntpClient {
   private async waitForSocket(event: "connect" | "data", signal?: AbortSignal) {
     if (!this.socket) throw new Error("NNTP socket is not connected");
     if (signal?.aborted) throw this.abortError();
+    if (this.socketError) throw this.socketError;
+    const socket = this.socket;
 
-    await Promise.race([
-      once(this.socket, event),
-      once(this.socket, "error").then(([error]) => {
-        throw error;
-      }),
-      new Promise((_, reject) => {
-        if (!signal) return;
-        const onAbort = () => {
-          this.socket?.destroy(this.abortError());
-          reject(this.abortError());
-        };
-        signal.addEventListener("abort", onAbort, { once: true });
-      })
-    ]);
+    await new Promise<void>((resolve, reject) => {
+      let settled = false;
+      const onReady = () => {
+        if (settled) return;
+        settled = true;
+        cleanup();
+        resolve();
+      };
+      const onAbort = () => {
+        if (settled) return;
+        settled = true;
+        cleanup();
+        socket.destroy(this.abortError());
+        reject(this.abortError());
+      };
+      const onClose = () => {
+        if (settled) return;
+        settled = true;
+        cleanup();
+        reject(this.socketError ?? new Error("NNTP socket closed"));
+      };
+      const cleanup = () => {
+        socket.off(event, onReady);
+        socket.off("close", onClose);
+        if (signal) signal.removeEventListener("abort", onAbort);
+      };
+
+      socket.on(event, onReady);
+      socket.on("close", onClose);
+      if (signal) signal.addEventListener("abort", onAbort, { once: true });
+    });
   }
 
   private async command(command: string, accepted: string[], signal?: AbortSignal) {
@@ -98,7 +124,41 @@ export class NntpClient {
   private async write(data: string, signal?: AbortSignal) {
     if (!this.socket) throw new Error("NNTP socket is not connected");
     if (signal?.aborted) throw this.abortError();
-    if (!this.socket.write(data, "binary")) await once(this.socket, "drain");
+    if (this.socketError) throw this.socketError;
+    if (this.socket.write(data, "binary")) return;
+
+    const socket = this.socket;
+    await new Promise<void>((resolve, reject) => {
+      let settled = false;
+      const onDrain = () => {
+        if (settled) return;
+        settled = true;
+        cleanup();
+        resolve();
+      };
+      const onAbort = () => {
+        if (settled) return;
+        settled = true;
+        cleanup();
+        socket.destroy(this.abortError());
+        reject(this.abortError());
+      };
+      const onClose = () => {
+        if (settled) return;
+        settled = true;
+        cleanup();
+        reject(this.socketError ?? new Error("NNTP socket closed"));
+      };
+      const cleanup = () => {
+        socket.off("drain", onDrain);
+        socket.off("close", onClose);
+        if (signal) signal.removeEventListener("abort", onAbort);
+      };
+
+      socket.on("drain", onDrain);
+      socket.on("close", onClose);
+      if (signal) signal.addEventListener("abort", onAbort, { once: true });
+    });
   }
 
   private async readLine(signal?: AbortSignal): Promise<string> {

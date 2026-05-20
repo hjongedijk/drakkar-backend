@@ -253,10 +253,12 @@ export async function addNzbFromPath(path: string, title?: string, options?: { q
     });
   }
   if (options?.queueDownload === false) {
+    await attachExistingDownloadToRequest(options?.requestId, download.id, title ?? download.title);
     await makeMountedDownloadAvailable({ downloadId: download.id });
     return prisma.download.findUniqueOrThrow({ where: { id: download.id }, include: { nzbDocument: true } });
   }
 
+  await attachExistingDownloadToRequest(options?.requestId, download.id, title ?? download.title);
   const job = await nzbDownloadQueue.add("parse-and-download", {
     downloadId: download.id,
     nzbDocumentId: nzbDocument.id,
@@ -293,21 +295,59 @@ export async function addUrl(url: string, title?: string) {
   }
 }
 
-export function getQueue() {
-  return prisma.download.findMany({
-    where: {
-      status: { in: ["mounted", "queued", "fetching_nzb", "verifying", "prepared", "downloading", "paused", "waiting_for_provider", "waiting_for_nzb"] },
-      OR: [{ status: { not: "queued" } }, { nzbDocumentId: { not: null } }, { jobId: { not: null } }]
-    },
-    orderBy: [{ priority: "desc" }, { createdAt: "asc" }],
-    include: { nzbDocument: true }
-  }).then((downloads) =>
-    downloads.map((download) => ({
-      ...download,
-      error: humanizeDownloadError(download.error),
-      statusLabel: statusLabelForDownload(download.status, download.error)
-    }))
+export async function getQueue() {
+  const [downloads, jobs] = await Promise.all([
+    prisma.download.findMany({
+      where: {
+        status: { in: ["mounted", "queued", "fetching_nzb", "verifying", "prepared", "downloading", "paused", "waiting_for_provider", "waiting_for_nzb"] },
+        OR: [{ status: { not: "queued" } }, { nzbDocumentId: { not: null } }, { jobId: { not: null } }]
+      },
+      orderBy: [{ priority: "desc" }, { createdAt: "asc" }],
+      include: { nzbDocument: true }
+    }),
+    nzbDownloadQueue.getJobs(["active", "waiting", "delayed", "prioritized"], 0, 500, true)
+  ]);
+  const jobByDownloadId = new Map(jobs.map((job) => [String(job.data?.downloadId ?? ""), job] as const));
+  const normalized = await Promise.all(
+    downloads.map(async (download) => {
+      const liveJob = jobByDownloadId.get(download.id);
+      let nextStatus = download.status;
+      let nextJobId = download.jobId ? String(download.jobId) : null;
+      let nextError = download.error;
+
+      if (liveJob) {
+        nextJobId = String(liveJob.id);
+        const state = await liveJob.getState();
+        if (state === "active" && download.status !== "paused") nextStatus = "downloading";
+        if ((state === "waiting" || state === "delayed" || state === "prioritized") && download.status !== "paused") nextStatus = "queued";
+      } else if (download.status === "queued" || download.status === "downloading" || download.status === "fetching_nzb" || download.status === "verifying" || download.status === "waiting_for_provider" || download.status === "waiting_for_nzb") {
+        nextStatus = "queued";
+        nextJobId = null;
+        nextError = download.error ?? "Queue entry has no active worker job yet";
+      }
+
+      if (nextStatus !== download.status || nextJobId !== (download.jobId ? String(download.jobId) : null) || nextError !== download.error) {
+        await prisma.download.update({
+          where: { id: download.id },
+          data: {
+            status: nextStatus,
+            jobId: nextJobId,
+            error: nextError
+          }
+        }).catch(() => undefined);
+      }
+
+      return {
+        ...download,
+        status: nextStatus,
+        jobId: nextJobId,
+        error: humanizeDownloadError(nextError),
+        statusLabel: statusLabelForDownload(nextStatus, nextError)
+      };
+    })
   );
+
+  return normalized;
 }
 
 export function getHistory() {
