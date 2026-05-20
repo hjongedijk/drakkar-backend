@@ -13,6 +13,9 @@ import { humanizeDownloadError } from "../downloads/presentation.js";
 type NzbWithFiles = NonNullable<Awaited<ReturnType<typeof loadNzbDocument>>>;
 export { filenameFromSubject } from "./filename.js";
 
+const DOWNLOAD_PROGRESS_UPDATE_INTERVAL_MS = 3000;
+const DOWNLOAD_PROGRESS_UPDATE_BYTES = 8 * 1024 * 1024;
+
 async function loadNzbDocument(id: string) {
   return prisma.nzbDocument.findUnique({
     where: { id },
@@ -210,6 +213,7 @@ async function reconstructFile(input: {
   let downloaded = input.downloadedBefore;
   let aborted = false;
   let lastProgressUpdateAt = 0;
+  let lastProgressPersistedBytes = input.downloadedBefore;
   let progressWrite = Promise.resolve();
 
   const outputDir = join(env.VFS_DOWNLOADS_DIR, input.downloadId);
@@ -218,14 +222,11 @@ async function reconstructFile(input: {
   const outputPath = join(outputDir, filename);
   const handle = await open(outputPath, "w");
 
-  const offsets = new Map<string, number>();
-  let offset = 0;
-  for (const segment of input.file.segments) {
-    offsets.set(segment.id, offset);
-    offset += Number(segment.bytes);
-  }
-
   let nextSegmentIndex = 0;
+  let nextWriteIndex = 0;
+  let writeOffset = 0;
+  let writeChain = Promise.resolve();
+  const pendingChunks = new Map<number, Buffer>();
 
   function progressData(downloadedSnapshot: number) {
     const elapsedSeconds = Math.max(1, (Date.now() - input.startedAt) / 1000);
@@ -242,9 +243,15 @@ async function reconstructFile(input: {
   async function updateProgress(chunkLength = 0, force = false) {
     downloaded += chunkLength;
     const now = Date.now();
-    if (!force && now - lastProgressUpdateAt < 1000) return;
+    const bytesSincePersist = downloaded - lastProgressPersistedBytes;
+    if (
+      !force &&
+      now - lastProgressUpdateAt < DOWNLOAD_PROGRESS_UPDATE_INTERVAL_MS &&
+      bytesSincePersist < DOWNLOAD_PROGRESS_UPDATE_BYTES
+    ) return;
     lastProgressUpdateAt = now;
     const downloadedSnapshot = downloaded;
+    lastProgressPersistedBytes = downloadedSnapshot;
     progressWrite = progressWrite
       .catch(() => undefined)
       .then(async () => {
@@ -259,22 +266,41 @@ async function reconstructFile(input: {
     await progressWrite;
   }
 
+  function drainWrites() {
+    writeChain = writeChain
+      .catch(() => undefined)
+      .then(async () => {
+        while (pendingChunks.has(nextWriteIndex)) {
+          const chunk = pendingChunks.get(nextWriteIndex);
+          pendingChunks.delete(nextWriteIndex);
+          if (!chunk) continue;
+          await handle.write(chunk, 0, chunk.length, writeOffset);
+          writeOffset += chunk.length;
+          nextWriteIndex += 1;
+          await updateProgress(chunk.length);
+        }
+      });
+    return writeChain;
+  }
+
   async function worker(workerIndex: number) {
     while (!aborted) {
       await waitForQueueCapacity(workerIndex);
-      const segment = input.file.segments[nextSegmentIndex];
+      const segmentIndex = nextSegmentIndex;
+      const segment = input.file.segments[segmentIndex];
       nextSegmentIndex += 1;
       if (!segment) return;
 
       const chunk = await input.pool.article(segment.articleId);
-      await handle.write(chunk, 0, chunk.length, offsets.get(segment.id) ?? 0);
-      await updateProgress(chunk.length);
+      pendingChunks.set(segmentIndex, chunk);
+      await drainWrites();
     }
   }
 
   try {
     const concurrency = Math.max(1, Math.min(input.pool.size, input.file.segments.length));
     await Promise.all(Array.from({ length: concurrency }, (_, workerIndex) => worker(workerIndex)));
+    await writeChain;
     await updateProgress(0, true);
   } catch (error) {
     aborted = true;
@@ -319,6 +345,7 @@ export async function prepareNzbDocumentForStreaming(input: { downloadId: string
   let verified = 0;
   let verifiedBytes = 0;
   let lastProgressUpdateAt = 0;
+  let lastProgressPersistedBytes = 0;
   const startedAt = Date.now();
 
   const decodeSamples = sampleSegmentsForDecodeCheck(nzb);
@@ -332,8 +359,14 @@ export async function prepareNzbDocumentForStreaming(input: { downloadId: string
 
   async function updateProgress(force = false) {
     const now = Date.now();
-    if (!force && now - lastProgressUpdateAt < 1000) return;
+    const bytesSincePersist = verifiedBytes - lastProgressPersistedBytes;
+    if (
+      !force &&
+      now - lastProgressUpdateAt < DOWNLOAD_PROGRESS_UPDATE_INTERVAL_MS &&
+      bytesSincePersist < DOWNLOAD_PROGRESS_UPDATE_BYTES
+    ) return;
     lastProgressUpdateAt = now;
+    lastProgressPersistedBytes = verifiedBytes;
     await prisma.download.update({
       where: { id: input.downloadId },
       data: {
