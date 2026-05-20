@@ -19,8 +19,8 @@ export const blockReasonSchema = z.enum([
 
 export const policySettingsSchema = z.object({
   streamingPriority: z.number().int().min(0).max(100).default(80),
-  maxDownloadConnections: z.number().int().positive().default(20),
-  maxStreamingConnections: z.number().int().positive().default(10),
+  maxDownloadConnections: z.number().int().min(0).default(20),
+  maxStreamingConnections: z.number().int().min(0).default(10),
   maxTotalUsenetConnections: z.number().int().positive().default(30),
   streamCacheEnabled: z.boolean().default(true),
   streamCacheMaxSizeGb: z.number().positive().default(20),
@@ -108,12 +108,14 @@ async function enabledUsenetConnectionCount() {
 async function derivePolicySettings(input: object) {
   const parsed = policySettingsSchema.parse({ ...DEFAULT_POLICIES, ...input });
   const totalEnabledConnections = await enabledUsenetConnectionCount();
+  const maxStreamingConnections = Math.min(parsed.maxStreamingConnections, totalEnabledConnections);
+  const maxDownloadConnections = Math.min(parsed.maxDownloadConnections, Math.max(0, totalEnabledConnections - maxStreamingConnections));
 
   return {
     ...parsed,
-    maxDownloadConnections: totalEnabledConnections,
+    maxDownloadConnections,
     maxTotalUsenetConnections: totalEnabledConnections,
-    maxStreamingConnections: Math.min(parsed.maxStreamingConnections, totalEnabledConnections)
+    maxStreamingConnections
   } satisfies PolicySettings;
 }
 
