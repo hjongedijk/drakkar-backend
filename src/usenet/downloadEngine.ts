@@ -74,11 +74,91 @@ type PoolSlot = {
   busy: boolean;
 };
 
+type PoolDebugSlot = {
+  providerId: string;
+  providerName: string;
+  busy: boolean;
+  connected: boolean;
+};
+
+type PoolDebugState = {
+  ownerId: string;
+  phase: "verifying" | "downloading";
+  allowedConnections: number;
+  slotCount: number;
+  connectedSlots: number;
+  busySlots: number;
+  slots: PoolDebugSlot[];
+  providers: Array<{
+    providerId: string;
+    providerName: string;
+    configuredConnections: number;
+    slotCount: number;
+    connectedSlots: number;
+    busySlots: number;
+  }>;
+};
+
+const activePoolDebugStates = new Map<string, PoolDebugState>();
+
+function syncPoolDebugState(input: {
+  ownerId: string;
+  phase: "verifying" | "downloading";
+  allowedConnections: number;
+  slots: PoolSlot[];
+}) {
+  const slots = input.slots.map((slot) => ({
+    providerId: slot.provider.id,
+    providerName: slot.provider.name,
+    busy: slot.busy,
+    connected: Boolean(slot.client)
+  }));
+  const providerStates = new Map<string, PoolDebugState["providers"][number]>();
+  for (const slot of input.slots) {
+    const current = providerStates.get(slot.provider.id) ?? {
+      providerId: slot.provider.id,
+      providerName: slot.provider.name,
+      configuredConnections: slot.provider.connections,
+      slotCount: 0,
+      connectedSlots: 0,
+      busySlots: 0
+    };
+    current.slotCount += 1;
+    if (slot.client) current.connectedSlots += 1;
+    if (slot.busy) current.busySlots += 1;
+    providerStates.set(slot.provider.id, current);
+  }
+  activePoolDebugStates.set(input.ownerId, {
+    ownerId: input.ownerId,
+    phase: input.phase,
+    allowedConnections: input.allowedConnections,
+    slotCount: input.slots.length,
+    connectedSlots: slots.filter((slot) => slot.connected).length,
+    busySlots: slots.filter((slot) => slot.busy).length,
+    slots,
+    providers: [...providerStates.values()]
+  });
+}
+
+function clearPoolDebugState(ownerId: string) {
+  activePoolDebugStates.delete(ownerId);
+}
+
+export function getDownloadPoolDebugState() {
+  return [...activePoolDebugStates.values()];
+}
+
 class NntpPool {
   private readonly slots: PoolSlot[];
   private readonly waiters: Array<{ excludedProviders: Set<string>; resolve: (slot: PoolSlot) => void }> = [];
 
-  constructor(providers: Provider[], maxConnections: number, private readonly logger: FastifyBaseLogger) {
+  constructor(
+    providers: Provider[],
+    private readonly maxConnections: number,
+    private readonly logger: FastifyBaseLogger,
+    private readonly ownerId: string,
+    private readonly phase: "verifying" | "downloading"
+  ) {
     const slots: PoolSlot[] = [];
     for (const provider of providers) {
       const limit = Math.max(1, Math.min(provider.connections, maxConnections - slots.length));
@@ -86,6 +166,7 @@ class NntpPool {
       if (slots.length >= maxConnections) break;
     }
     this.slots = slots.length > 0 ? slots : providers.slice(0, 1).map((provider) => ({ provider, busy: false }));
+    this.syncDebug();
   }
 
   get size() {
@@ -105,6 +186,7 @@ class NntpPool {
         if (!slot.client) {
           slot.client = new NntpClient(slot.provider);
           await slot.client.connect();
+          this.syncDebug();
         }
         const body = await slot.client.body(articleId);
         return decodeArticleBody(body);
@@ -114,6 +196,7 @@ class NntpPool {
         this.logger.warn({ provider: slot.provider.name, articleId, attempt, err: error }, "segment download failed");
         await slot.client?.quit().catch(() => undefined);
         slot.client = undefined;
+        this.syncDebug();
         if (isProviderConnectionLimit(message)) {
           permanentFailures.add(slot.provider.id);
           if (permanentFailures.size >= providerCount) throw new Error(`too many connections from all configured providers`);
@@ -145,6 +228,7 @@ class NntpPool {
         if (!slot.client) {
           slot.client = new NntpClient(slot.provider);
           await slot.client.connect();
+          this.syncDebug();
         }
         await slot.client.stat(articleId);
         return;
@@ -154,6 +238,7 @@ class NntpPool {
         this.logger.warn({ provider: slot.provider.name, articleId, attempt, err: error }, "segment availability check failed");
         await slot.client?.quit().catch(() => undefined);
         slot.client = undefined;
+        this.syncDebug();
         if (isProviderConnectionLimit(message)) {
           permanentFailures.add(slot.provider.id);
           if (permanentFailures.size >= providerCount) throw new Error(`too many connections from all configured providers`);
@@ -174,12 +259,14 @@ class NntpPool {
 
   async close() {
     await Promise.all(this.slots.map((slot) => slot.client?.quit().catch(() => undefined)));
+    clearPoolDebugState(this.ownerId);
   }
 
   private acquire(excludedProviders = new Set<string>()) {
     const available = this.slots.find((slot) => !slot.busy && !excludedProviders.has(slot.provider.id));
     if (available) {
       available.busy = true;
+      this.syncDebug();
       return Promise.resolve(available);
     }
 
@@ -193,10 +280,21 @@ class NntpPool {
     const waiter = waiterIndex >= 0 ? this.waiters.splice(waiterIndex, 1)[0] : undefined;
     if (waiter) {
       slot.busy = true;
+      this.syncDebug();
       waiter.resolve(slot);
       return;
     }
     slot.busy = false;
+    this.syncDebug();
+  }
+
+  private syncDebug() {
+    syncPoolDebugState({
+      ownerId: this.ownerId,
+      phase: this.phase,
+      allowedConnections: this.maxConnections,
+      slots: this.slots
+    });
   }
 }
 
@@ -340,7 +438,7 @@ export async function prepareNzbDocumentForStreaming(input: { downloadId: string
   });
 
   const allowedConnections = await getAllowedDownloadConnections();
-  const pool = new NntpPool(providers, Math.max(1, allowedConnections), input.logger);
+  const pool = new NntpPool(providers, Math.max(1, allowedConnections), input.logger, input.downloadId, "verifying");
   const totalSize = nzb.totalSize;
   let verified = 0;
   let verifiedBytes = 0;
@@ -441,7 +539,7 @@ export async function downloadNzbDocument(input: { downloadId: string; nzbDocume
   });
 
   const allowedConnections = await getAllowedDownloadConnections();
-  const pool = new NntpPool(providers, Math.max(1, allowedConnections), input.logger);
+  const pool = new NntpPool(providers, Math.max(1, allowedConnections), input.logger, input.downloadId, "downloading");
   const files = [];
   let downloaded = 0;
   const startedAt = Date.now();

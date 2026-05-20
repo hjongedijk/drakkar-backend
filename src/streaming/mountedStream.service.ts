@@ -34,6 +34,22 @@ type MountedPoolSlot = {
   busy: boolean;
 };
 
+type MountedPoolDebugState = {
+  slotCount: number;
+  connectedSlots: number;
+  busySlots: number;
+  providers: Array<{
+    providerId: string;
+    providerName: string;
+    configuredConnections: number;
+    slotCount: number;
+    connectedSlots: number;
+    busySlots: number;
+  }>;
+};
+
+let mountedPoolDebugState: MountedPoolDebugState | null = null;
+
 class MountedNntpPool {
   private readonly slots: MountedPoolSlot[];
   private readonly waiters: Array<{ excludedProviders: Set<string>; resolve: (slot: MountedPoolSlot) => void }> = [];
@@ -46,6 +62,7 @@ class MountedNntpPool {
       if (slots.length >= maxConnections) break;
     }
     this.slots = slots.length > 0 ? slots : providers.slice(0, 1).map((provider) => ({ provider, busy: false }));
+    this.syncDebug();
   }
 
   async body(articleId: string, signal?: AbortSignal) {
@@ -61,6 +78,7 @@ class MountedNntpPool {
         if (!slot.client) {
           slot.client = new NntpClient(slot.provider);
           await slot.client.connect(signal);
+          this.syncDebug();
         }
         return await slot.client.body(articleId, signal);
       } catch (error) {
@@ -68,6 +86,7 @@ class MountedNntpPool {
         errors.push(`${slot.provider.name}: ${message}`);
         await slot.client?.quit().catch(() => undefined);
         slot.client = undefined;
+        this.syncDebug();
         permanentFailures.add(slot.provider.id);
       } finally {
         this.release(slot);
@@ -79,12 +98,14 @@ class MountedNntpPool {
 
   async close() {
     await Promise.all(this.slots.map((slot) => slot.client?.quit().catch(() => undefined)));
+    mountedPoolDebugState = null;
   }
 
   private acquire(excludedProviders = new Set<string>()) {
     const available = this.slots.find((slot) => !slot.busy && !excludedProviders.has(slot.provider.id));
     if (available) {
       available.busy = true;
+      this.syncDebug();
       return Promise.resolve(available);
     }
 
@@ -98,11 +119,41 @@ class MountedNntpPool {
     const waiter = waiterIndex >= 0 ? this.waiters.splice(waiterIndex, 1)[0] : undefined;
     if (waiter) {
       slot.busy = true;
+      this.syncDebug();
       waiter.resolve(slot);
       return;
     }
     slot.busy = false;
+    this.syncDebug();
   }
+
+  private syncDebug() {
+    const providerStates = new Map<string, MountedPoolDebugState["providers"][number]>();
+    for (const slot of this.slots) {
+      const current = providerStates.get(slot.provider.id) ?? {
+        providerId: slot.provider.id,
+        providerName: slot.provider.name,
+        configuredConnections: slot.provider.connections,
+        slotCount: 0,
+        connectedSlots: 0,
+        busySlots: 0
+      };
+      current.slotCount += 1;
+      if (slot.client) current.connectedSlots += 1;
+      if (slot.busy) current.busySlots += 1;
+      providerStates.set(slot.provider.id, current);
+    }
+    mountedPoolDebugState = {
+      slotCount: this.slots.length,
+      connectedSlots: this.slots.filter((slot) => Boolean(slot.client)).length,
+      busySlots: this.slots.filter((slot) => slot.busy).length,
+      providers: [...providerStates.values()]
+    };
+  }
+}
+
+export function getMountedPoolDebugState() {
+  return mountedPoolDebugState;
 }
 
 export type StreamSession = {

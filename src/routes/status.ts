@@ -7,6 +7,8 @@ import { nzbDownloadQueue, pipelineQueues } from "../queues/downloadQueue.js";
 import { testRequestProvider } from "../requests/sync/service.js";
 import { getSettings } from "../settings/settingsStore.js";
 import { getBandwidthStatus } from "../bandwidth/bandwidthScheduler.js";
+import { getDownloadPoolDebugState } from "../usenet/downloadEngine.js";
+import { getMountedPoolDebugState } from "../streaming/mountedStream.service.js";
 import { getFuseMountStatus } from "../vfs/fuseMountService.js";
 import { healthRoutes } from "./health.js";
 
@@ -116,6 +118,33 @@ export async function statusRoutes(app: FastifyInstance): Promise<void> {
       usenetProvidersEnabled: providers,
       downloadsByStatus: Object.fromEntries(queuedDownloads.map((row) => [row.status, row._count.status])),
       queues
+    };
+  });
+
+  app.get("/api/debug/usenet", async () => {
+    const [providers, bandwidth] = await Promise.all([
+      prisma.usenetServer.findMany({
+        where: { enabled: true },
+        orderBy: [{ isBackup: "asc" }, { priority: "asc" }],
+        select: {
+          id: true,
+          name: true,
+          host: true,
+          port: true,
+          connections: true,
+          priority: true,
+          enabled: true,
+          isBackup: true
+        }
+      }),
+      getBandwidthStatus()
+    ]);
+
+    return {
+      providers,
+      bandwidth,
+      activeDownloadPools: getDownloadPoolDebugState(),
+      mountedStreamPool: getMountedPoolDebugState()
     };
   });
 }
