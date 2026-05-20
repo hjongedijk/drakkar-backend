@@ -16,9 +16,17 @@ const hotSegmentCache = new Map<string, { value: Buffer; updatedAt: number }>();
 const inFlightReadAhead = new Set<string>();
 const sessionControllers = new Map<string, AbortController>();
 const markedStreamSessions = new Set<string>();
+const sessionSnapshots = new Map<string, Record<string, string | number>>();
+const pendingSessionUpdates = new Map<string, Record<string, string | number>>();
+const pendingMetricIncrements = new Map<string, number>();
 let cachedProviders: { value: UsenetServer[]; expiresAt: number } | null = null;
 let mountedPool: MountedNntpPool | null = null;
 let mountedPoolSignature: string | null = null;
+let sessionFlushTimer: NodeJS.Timeout | null = null;
+let metricsFlushTimer: NodeJS.Timeout | null = null;
+
+const SESSION_FLUSH_MS = 2000;
+const METRICS_FLUSH_MS = 1000;
 
 type MountedPoolSlot = {
   provider: UsenetServer;
@@ -158,8 +166,29 @@ function throwIfAborted(signal?: AbortSignal) {
   if (signal?.aborted) throw createAbortError();
 }
 
+async function flushMetrics() {
+  if (metricsFlushTimer) {
+    clearTimeout(metricsFlushTimer);
+    metricsFlushTimer = null;
+  }
+  if (pendingMetricIncrements.size === 0) return;
+  const updates = [...pendingMetricIncrements.entries()];
+  pendingMetricIncrements.clear();
+  const pipeline = redis.multi();
+  for (const [field, count] of updates) pipeline.hincrby(streamMetricsKey, field, count);
+  await pipeline.exec();
+}
+
+function scheduleMetricFlush() {
+  if (metricsFlushTimer) return;
+  metricsFlushTimer = setTimeout(() => {
+    void flushMetrics().catch(() => undefined);
+  }, METRICS_FLUSH_MS);
+}
+
 async function incrementMetric(field: string, count = 1) {
-  await redis.hincrby(streamMetricsKey, field, count);
+  pendingMetricIncrements.set(field, (pendingMetricIncrements.get(field) ?? 0) + count);
+  scheduleMetricFlush();
 }
 
 function segmentCacheKey(fileId: string, segmentNumber: number) {
@@ -181,11 +210,47 @@ function pruneHotCache(maxSizeBytes: number, maxAgeMs: number) {
   }
 }
 
-async function updateSession(sessionId: string, payload: Record<string, string | number>) {
-  await redis.hset(`vfs:stream:session:${sessionId}`, {
-    ...payload,
-    updatedAt: new Date().toISOString()
+async function flushSessionUpdates() {
+  if (sessionFlushTimer) {
+    clearTimeout(sessionFlushTimer);
+    sessionFlushTimer = null;
+  }
+  if (pendingSessionUpdates.size === 0) return;
+  const updates = [...pendingSessionUpdates.entries()];
+  pendingSessionUpdates.clear();
+  const pipeline = redis.multi();
+  for (const [sessionId, payload] of updates) {
+    const next = {
+      ...(sessionSnapshots.get(sessionId) ?? {}),
+      ...payload,
+      updatedAt: new Date().toISOString()
+    };
+    sessionSnapshots.set(sessionId, next);
+    pipeline.hset(`vfs:stream:session:${sessionId}`, next);
+  }
+  await pipeline.exec();
+}
+
+function scheduleSessionFlush() {
+  if (sessionFlushTimer) return;
+  sessionFlushTimer = setTimeout(() => {
+    void flushSessionUpdates().catch(() => undefined);
+  }, SESSION_FLUSH_MS);
+}
+
+function sessionField(sessionId: string, field: string) {
+  const pending = pendingSessionUpdates.get(sessionId)?.[field];
+  if (pending !== undefined) return pending;
+  return sessionSnapshots.get(sessionId)?.[field];
+}
+
+async function updateSession(sessionId: string, payload: Record<string, string | number>, options?: { force?: boolean }) {
+  pendingSessionUpdates.set(sessionId, {
+    ...(pendingSessionUpdates.get(sessionId) ?? {}),
+    ...payload
   });
+  if (options?.force) await flushSessionUpdates();
+  else scheduleSessionFlush();
 }
 
 function markStreamedOnce(sessionId: string, path: string) {
@@ -346,14 +411,15 @@ async function* streamPlannedRanges(input: {
     }
   } finally {
     const status = input.signal.aborted ? "cancelled" : "closed";
-    await redis.hset(`vfs:stream:session:${input.sessionId}`, {
+    await updateSession(input.sessionId, {
       status,
       bytesSent,
-      updatedAt: new Date().toISOString(),
       closedAt: new Date().toISOString()
-    });
+    }, { force: true });
     await redis.expire(`vfs:stream:session:${input.sessionId}`, 300);
     await redis.srem(sessionSetKey, input.sessionId);
+    sessionSnapshots.delete(input.sessionId);
+    pendingSessionUpdates.delete(input.sessionId);
     sessionControllers.delete(input.sessionId);
   }
 }
@@ -369,7 +435,7 @@ export async function getOrCreateStreamSession(input: {
   const now = new Date().toISOString();
   sessionControllers.set(sessionId, controller);
   await redis.sadd(sessionSetKey, sessionId);
-  await redis.hset(`vfs:stream:session:${sessionId}`, {
+  const initialState = {
     id: sessionId,
     path: input.path,
     range: input.range ?? "",
@@ -380,7 +446,9 @@ export async function getOrCreateStreamSession(input: {
     updatedAt: now,
     source: input.source ?? "api",
     userAgent: input.userAgent ?? ""
-  });
+  };
+  sessionSnapshots.set(sessionId, initialState);
+  await redis.hset(`vfs:stream:session:${sessionId}`, initialState);
   await redis.expire(`vfs:stream:session:${sessionId}`, 3600);
   await incrementMetric("sessionsStarted");
   return { id: sessionId, controller };
@@ -389,13 +457,14 @@ export async function getOrCreateStreamSession(input: {
 export async function stopStreamSession(sessionId: string) {
   const controller = sessionControllers.get(sessionId);
   if (controller) controller.abort();
-  await redis.hset(`vfs:stream:session:${sessionId}`, {
+  await updateSession(sessionId, {
     status: "cancelled",
-    updatedAt: new Date().toISOString(),
     closedAt: new Date().toISOString()
-  });
+  }, { force: true });
   await redis.expire(`vfs:stream:session:${sessionId}`, 300);
   await redis.srem(sessionSetKey, sessionId);
+  sessionSnapshots.delete(sessionId);
+  pendingSessionUpdates.delete(sessionId);
   sessionControllers.delete(sessionId);
   await incrementMetric("sessionsStopped");
   return { ok: true };
@@ -434,9 +503,9 @@ export async function readMountedFileRange(input: {
     start: plan.start,
     end: plan.end,
     currentOffset: plan.start
-  });
+  }, { force: true });
 
-  const existingBytesSent = Number((await redis.hget(`vfs:stream:session:${session.id}`, "bytesSent")) ?? 0);
+  const existingBytesSent = Number(sessionField(session.id, "bytesSent") ?? 0);
   const decodedRanges = await Promise.all(
     plan.ranges.map(async (segment) => {
       throwIfAborted(session.controller.signal);
@@ -461,7 +530,7 @@ export async function readMountedFileRange(input: {
   await updateSession(session.id, {
     bytesSent: existingBytesSent + total,
     currentOffset: plan.end + 1
-  });
+  }, { force: true });
 
   if (policies.streamReadAheadBytes > 0 && plan.end + 1 < plan.size) {
     const readAheadStart = plan.end + 1;
@@ -495,7 +564,7 @@ export async function streamMountedFile(path: string, range?: string, options?: 
     size: plan.size,
     start: plan.start,
     end: plan.end
-  });
+  }, { force: true });
   markStreamedOnce(session.id, path);
 
   const stream = Readable.from(
@@ -549,6 +618,7 @@ export async function listActiveStreamSessions() {
 }
 
 export async function getStreamMetrics() {
+  await Promise.all([flushMetrics(), flushSessionUpdates()]);
   const [rawMetrics, sessions] = await Promise.all([redis.hgetall(streamMetricsKey), listActiveStreamSessions()]);
   return {
     activeStreamCount: sessions.filter((session) => session.status === "active").length,
