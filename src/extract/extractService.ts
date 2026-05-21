@@ -47,14 +47,18 @@ async function walk(path: string): Promise<string[]> {
   return children.flat();
 }
 
-function extractionDir(archivePath: string) {
+function extractionDir(archivePath: string, outputRootDir?: string) {
   const ext = extname(archivePath);
   const base = basename(archivePath, ext).replace(/\.part0*1$/i, "");
-  return join(dirname(archivePath), `${base}_extracted`);
+  return outputRootDir ? join(outputRootDir, `${base}_extracted`) : join(dirname(archivePath), `${base}_extracted`);
 }
 
-async function extractArchive(archivePath: string, kind: Exclude<ArchiveKind, "none">): Promise<ExtractionResult> {
-  const outputDir = extractionDir(archivePath);
+async function extractArchive(
+  archivePath: string,
+  kind: Exclude<ArchiveKind, "none">,
+  outputRootDir?: string
+): Promise<ExtractionResult> {
+  const outputDir = extractionDir(archivePath, outputRootDir);
   await mkdir(outputDir, { recursive: true });
 
   if (kind === "zip" && (await toolAvailable("unzip"))) {
@@ -75,16 +79,21 @@ async function extractArchive(archivePath: string, kind: Exclude<ArchiveKind, "n
   throw new Error(`no extractor available for ${kind} archive ${archivePath}`);
 }
 
-export async function extractArchivesInPath(path: string) {
+export async function extractArchiveFiles(
+  archives: Array<{ archivePath: string; kind: Exclude<ArchiveKind, "none"> }>,
+  options?: { outputRootDir?: string }
+) {
+  const results: ExtractionResult[] = [];
+  for (const archive of archives) {
+    results.push(await extractArchive(archive.archivePath, archive.kind, options?.outputRootDir));
+  }
+  return results;
+}
+
+export async function extractArchivesInPath(path: string, options?: { outputRootDir?: string }) {
   const files = await walk(path);
   const archives = files
     .map((archivePath) => ({ archivePath, kind: detectArchive(archivePath) }))
     .filter((archive): archive is { archivePath: string; kind: Exclude<ArchiveKind, "none"> } => archive.kind !== "none");
-  const results: ExtractionResult[] = [];
-
-  for (const archive of archives) {
-    results.push(await extractArchive(archive.archivePath, archive.kind));
-  }
-
-  return results;
+  return extractArchiveFiles(archives, options);
 }

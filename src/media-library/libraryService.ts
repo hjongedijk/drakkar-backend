@@ -15,9 +15,9 @@ function sortTitle(title: string) {
   return title.replace(/^(the|a|an)\s+/i, "").toLowerCase();
 }
 
-function statusFromRequest(status: string) {
+function statusFromRequest(status: string, hasFilesystemEntry = false) {
   if (status === "grabbed") return "grabbed";
-  if (status === "available") return "available";
+  if (status === "available") return hasFilesystemEntry ? "available" : "grabbed";
   if (status.includes("failed") || status.includes("rejected") || status.includes("blocklisted")) return "failed";
   if (status === "approved") return "searching";
   return "requested";
@@ -179,11 +179,15 @@ export async function refreshMediaLibrary() {
   const settings = await getSettings();
   const providers = await prisma.requestProvider.findMany();
   const providerNames = new Map(providers.map((provider) => [provider.id, provider.name]));
+  const imports = await prisma.importItem.findMany({ include: { symlinks: { orderBy: { updatedAt: "desc" } } } });
+  const importRequestIds = new Set(imports.map((item) => item.requestId).filter((value): value is string => Boolean(value)));
+  const importDownloadIds = new Set(imports.map((item) => item.downloadId).filter((value): value is string => Boolean(value)));
 
   const requests = await prisma.mediaRequest.findMany({ include: { provider: true } });
   for (const request of requests) {
     const sourceKey = `request:${request.id}`;
     touched.add(sourceKey);
+    const hasFilesystemEntry = importRequestIds.has(request.id) || (request.downloadId ? importDownloadIds.has(request.downloadId) : false);
     const item = await prisma.mediaLibraryItem.upsert({
       where: { sourceKey },
       update: {
@@ -199,7 +203,7 @@ export async function refreshMediaLibrary() {
         requestId: request.id,
         qualityProfileId: request.selectedProfileId,
         downloadId: request.downloadId,
-        libraryStatus: statusFromRequest(request.status),
+        libraryStatus: statusFromRequest(request.status, hasFilesystemEntry),
         healthStatus: healthFromStatus(request.status),
         quality: request.requestedQuality ?? selectedReleaseField(request.selectedRelease, "resolution"),
         source: selectedReleaseField(request.selectedRelease, "source"),
@@ -223,7 +227,7 @@ export async function refreshMediaLibrary() {
         requestId: request.id,
         qualityProfileId: request.selectedProfileId,
         downloadId: request.downloadId,
-        libraryStatus: statusFromRequest(request.status),
+        libraryStatus: statusFromRequest(request.status, hasFilesystemEntry),
         healthStatus: healthFromStatus(request.status),
         quality: request.requestedQuality ?? selectedReleaseField(request.selectedRelease, "resolution"),
         source: selectedReleaseField(request.selectedRelease, "source"),
@@ -237,8 +241,10 @@ export async function refreshMediaLibrary() {
     await enrichLibraryItem(item, settings).catch(() => undefined);
   }
 
-  const imports = await prisma.importItem.findMany({ include: { symlinks: { orderBy: { updatedAt: "desc" } } } });
   for (const item of imports) {
+    const request = item.requestId
+      ? await prisma.mediaRequest.findUnique({ where: { id: item.requestId }, include: { provider: true } })
+      : null;
     const link = item.symlinks[0];
     const strategy = importStrategy(link?.status);
     const sourceKey = `import:${item.id}`;
@@ -247,13 +253,19 @@ export async function refreshMediaLibrary() {
       where: { sourceKey },
       update: {
         mediaType: item.mediaType,
-        title: item.title,
-        sortTitle: sortTitle(item.title),
-        year: item.year,
+        title: request?.title ?? item.title,
+        sortTitle: sortTitle(request?.title ?? item.title),
+        year: request?.year ?? item.year,
+        tmdbId: request?.tmdbId,
+        tvdbId: request?.tvdbId,
+        imdbId: request?.imdbId,
         season: item.season,
         episode: item.episode,
         requestId: item.requestId,
         downloadId: item.downloadId,
+        requestedBy: request?.requestedBy,
+        requestProvider: request?.provider?.name,
+        qualityProfileId: request?.selectedProfileId,
         importStrategy: strategy,
         libraryStatus: "available",
         streamStatus: item.completedPath.startsWith("/mounted/") ? "streamable" : "local",
@@ -266,13 +278,19 @@ export async function refreshMediaLibrary() {
       create: {
         sourceKey,
         mediaType: item.mediaType,
-        title: item.title,
-        sortTitle: sortTitle(item.title),
-        year: item.year,
+        title: request?.title ?? item.title,
+        sortTitle: sortTitle(request?.title ?? item.title),
+        year: request?.year ?? item.year,
+        tmdbId: request?.tmdbId,
+        tvdbId: request?.tvdbId,
+        imdbId: request?.imdbId,
         season: item.season,
         episode: item.episode,
         requestId: item.requestId,
         downloadId: item.downloadId,
+        requestedBy: request?.requestedBy,
+        requestProvider: request?.provider?.name,
+        qualityProfileId: request?.selectedProfileId,
         importStrategy: strategy,
         libraryStatus: "available",
         streamStatus: item.completedPath.startsWith("/mounted/") ? "streamable" : "local",
@@ -344,6 +362,9 @@ async function enrichLibraryItem(item: MediaLibraryItem, settings: Awaited<Retur
 }
 
 function shouldRefreshMetadata(item: MediaLibraryItem, ttlHours: number) {
+  if (!item.year) return true;
+  if ((item.title.toLowerCase().includes("unknown") || item.title.trim().length < 2) && !item.tmdbId && !item.imdbId && !item.tvdbId) return true;
+  if (item.mediaType === "tv" && item.season != null && item.episode != null && !item.episodeTitle) return true;
   if (!item.posterUrl && !item.overview && (item.mediaType === "movie" || item.mediaType === "tv")) return true;
   if (!item.metadataUpdatedAt) return true;
   return Date.now() - item.metadataUpdatedAt.getTime() > ttlHours * 60 * 60 * 1000;

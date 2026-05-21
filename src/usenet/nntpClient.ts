@@ -16,7 +16,9 @@ export class NntpClient {
     this.socket = this.server.ssl
       ? tls.connect({ host: this.server.host, port: this.server.port, servername: this.server.host })
       : net.connect({ host: this.server.host, port: this.server.port });
-    this.socket.setTimeout(30000);
+    this.socket.setKeepAlive(true, 30_000);
+    this.socket.setNoDelay(true);
+    this.socket.setTimeout(120000);
     this.socket.setEncoding("binary");
     this.socket.on("data", (chunk) => {
       this.buffer += chunk.toString();
@@ -51,6 +53,72 @@ export class NntpClient {
     const status = await this.readLine(signal);
     if (!status.startsWith("222")) throw new Error(`BODY failed: ${status}`);
     return this.readMultiline(signal);
+  }
+
+  async *decodedBodyChunks(articleId: string, decodeLine: (line: string) => Buffer, signal?: AbortSignal): AsyncGenerator<Buffer> {
+    const normalized = articleId.startsWith("<") ? articleId : `<${articleId}>`;
+    let yenc = false;
+
+    await this.write(`BODY ${normalized}\r\n`, signal);
+    const status = await this.readLine(signal);
+    if (!status.startsWith("222")) throw new Error(`BODY failed: ${status}`);
+
+    while (true) {
+      const line = await this.readLine(signal);
+      if (line === ".") break;
+      if (line.startsWith("=ybegin")) {
+        yenc = true;
+        continue;
+      }
+      if (yenc && (line.startsWith("=ypart") || line.startsWith("=yend"))) continue;
+      const normalizedLine = line.startsWith("..") ? line.slice(1) : line;
+      yield yenc ? decodeLine(normalizedLine) : Buffer.from(normalizedLine, "binary");
+    }
+  }
+
+  async bodySlice(articleId: string, startOffset: number, length: number, decodeLine: (line: string) => Buffer, signal?: AbortSignal) {
+    const normalized = articleId.startsWith("<") ? articleId : `<${articleId}>`;
+    const targetEnd = startOffset + length;
+    const chunks: Buffer[] = [];
+    let total = 0;
+    let decodedOffset = 0;
+    let yenc = false;
+
+    await this.write(`BODY ${normalized}\r\n`, signal);
+    const status = await this.readLine(signal);
+    if (!status.startsWith("222")) throw new Error(`BODY failed: ${status}`);
+
+    while (true) {
+      const line = await this.readLine(signal);
+      if (line === ".") break;
+      if (line.startsWith("=ybegin")) {
+        yenc = true;
+        continue;
+      }
+      if (yenc && (line.startsWith("=ypart") || line.startsWith("=yend"))) continue;
+
+      const decoded = yenc ? decodeLine(line) : Buffer.from(line, "binary");
+      const lineStart = decodedOffset;
+      const lineEnd = decodedOffset + decoded.length;
+      decodedOffset = lineEnd;
+
+      if (lineEnd <= startOffset) continue;
+      const sliceStart = Math.max(0, startOffset - lineStart);
+      const sliceEnd = Math.min(decoded.length, targetEnd - lineStart);
+      if (sliceEnd > sliceStart) {
+        const chunk = decoded.subarray(sliceStart, sliceEnd);
+        chunks.push(chunk);
+        total += chunk.length;
+      }
+
+      if (decodedOffset >= targetEnd) {
+        this.socket?.destroy();
+        this.socket = undefined;
+        return Buffer.concat(chunks, total);
+      }
+    }
+
+    return Buffer.concat(chunks, total);
   }
 
   async stat(articleId: string, signal?: AbortSignal) {

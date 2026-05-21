@@ -1,9 +1,10 @@
 import { z } from "zod";
 import type { FastifyInstance } from "fastify";
-import { getImport, importCompletedPath, listImports, reprocessImport } from "../import/importService.js";
+import { getImport, importCompletedPath, listImports, migrateImportsToCurrentNaming, reprocessImport } from "../import/importService.js";
 import { getNamingSettings, previewNaming, updateNamingSettings } from "../naming/namingService.js";
+import { refreshMediaLibrary } from "../media-library/libraryService.js";
 import { extractDownloadPath, listRepairJobs, runCompletedHealthcheck, runRepair } from "../repair/repairService.js";
-import { cleanupSymlinks, listSymlinks, repairSymlinks } from "../symlinks/symlinkService.js";
+import { cleanupSymlinks, listSymlinks, pruneLibraryDirectories, repairSymlinks } from "../symlinks/symlinkService.js";
 
 const reprocessSchema = z.object({
   sourcePath: z.string().optional()
@@ -56,6 +57,13 @@ export async function processingRoutes(app: FastifyInstance): Promise<void> {
   app.post("/api/symlinks/cleanup", async () => cleanupSymlinks());
 
   app.get("/api/naming", async () => getNamingSettings());
-  app.put("/api/naming", async (request) => updateNamingSettings(request.body));
+  app.put("/api/naming", async (request) => {
+    const naming = await updateNamingSettings(request.body);
+    await migrateImportsToCurrentNaming();
+    await repairSymlinks();
+    await pruneLibraryDirectories();
+    await refreshMediaLibrary();
+    return naming;
+  });
   app.post("/api/naming/preview", async (request) => previewNaming(namingPreviewSchema.parse(request.body ?? {})));
 }

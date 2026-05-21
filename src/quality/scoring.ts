@@ -41,6 +41,7 @@ export function scoreRelease(release: Release, profile: QualityProfile): Release
   if (!profile.allowX264 && (codec === "x264" || codec === "h264")) reasons.push("x264 is not allowed");
   if (!profile.allowX265 && (codec === "x265" || codec === "h265" || codec === "hevc")) reasons.push("x265/HEVC is not allowed");
   if (!profile.allowAV1 && codec === "av1") reasons.push("AV1 is not allowed");
+  if (!profile.allowMultiAudio && (language === "multi" || language === "dual")) reasons.push("multi-audio release rejected");
   if (profile.rejectCam && source === "cam") reasons.push("cam release rejected");
   if (profile.rejectTelesync && source === "telesync") reasons.push("telesync release rejected");
   if (profile.rejectScreener && source === "screener") reasons.push("screener release rejected");

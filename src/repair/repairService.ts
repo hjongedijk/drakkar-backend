@@ -8,6 +8,7 @@ import { extractArchivesInPath } from "../extract/extractService.js";
 import { importCompletedPath } from "../import/importService.js";
 import { verifyAndRepairPar2 } from "./par2Service.js";
 import { listMountedFiles } from "../vfs/mountedNzbService.js";
+import { readMountedFileRange } from "../streaming/mountedStream.service.js";
 
 async function toolAvailable(name: string) {
   const paths = (process.env.PATH ?? "").split(":").map((path) => join(path, name));
@@ -32,6 +33,16 @@ async function listFiles(path: string): Promise<string[]> {
 
 function mountedVideoFiles(files: Awaited<ReturnType<typeof listMountedFiles>>) {
   return files.filter((file) => /\.(mkv|mp4|avi|mov|m4v|ts)$/i.test(file.name) && !/sample/i.test(file.name));
+}
+
+async function probeMountedVideo(path: string) {
+  const probe = await readMountedFileRange({
+    path,
+    start: 0,
+    length: 64 * 1024,
+    source: "api"
+  });
+  return probe.length;
 }
 
 export function listRepairJobs() {
@@ -109,8 +120,14 @@ async function assessMountedDownload(downloadId: string) {
   try {
     const files = await listMountedFiles(`/mounted/releases/${download.nzbDocumentId}`);
     const videos = mountedVideoFiles(files);
-    const status = videos.length > 0 ? "completed" : "needs_attention";
-    const message = videos.length > 0 ? `mounted healthcheck passed: ${videos.length} playable video file(s)` : "mounted healthcheck failed: no playable video files found";
+    let probedBytes = 0;
+    if (videos[0]) probedBytes = await probeMountedVideo(videos[0].path);
+    const status = videos.length > 0 && probedBytes > 0 ? "completed" : "needs_attention";
+    const message = videos.length > 0 && probedBytes > 0
+      ? `mounted healthcheck passed: ${videos.length} playable video file(s); probed ${probedBytes} bytes`
+      : videos.length > 0
+        ? "mounted healthcheck failed: could not probe stream bytes from mounted video"
+        : "mounted healthcheck failed: no playable video files found";
     if (videos.length === 0) {
       await prisma.download.update({
         where: { id: downloadId },

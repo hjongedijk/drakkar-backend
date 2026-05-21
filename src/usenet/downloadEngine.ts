@@ -8,13 +8,16 @@ import { NntpClient } from "./nntpClient.js";
 import { getPolicySettings } from "../policies/policyService.js";
 import { getAllowedDownloadConnections } from "../bandwidth/bandwidthScheduler.js";
 import { filenameFromSubject } from "./filename.js";
+import { classifyNzbImportMode, type NzbImportMode } from "./importMode.js";
 import { humanizeDownloadError } from "../downloads/presentation.js";
+import { getUsenetRuntimeVersion } from "./settings.js";
 
 type NzbWithFiles = NonNullable<Awaited<ReturnType<typeof loadNzbDocument>>>;
 export { filenameFromSubject } from "./filename.js";
 
 const DOWNLOAD_PROGRESS_UPDATE_INTERVAL_MS = 3000;
 const DOWNLOAD_PROGRESS_UPDATE_BYTES = 8 * 1024 * 1024;
+const DOWNLOAD_WRITE_BATCH_BYTES = 4 * 1024 * 1024;
 
 async function loadNzbDocument(id: string) {
   return prisma.nzbDocument.findUnique({
@@ -150,7 +153,10 @@ export function getDownloadPoolDebugState() {
 
 class NntpPool {
   private readonly slots: PoolSlot[];
-  private readonly waiters: Array<{ excludedProviders: Set<string>; resolve: (slot: PoolSlot) => void }> = [];
+  private readonly waiters: Array<{ excludedProviders: Set<string>; includeBackups: boolean; resolve: (slot: PoolSlot) => void }> = [];
+  private readonly runtimeVersion = getUsenetRuntimeVersion();
+  private readonly primaryProviderIds: Set<string>;
+  private readonly primaryProviderCount: number;
 
   constructor(
     providers: Provider[],
@@ -160,6 +166,9 @@ class NntpPool {
     private readonly phase: "verifying" | "downloading"
   ) {
     const slots: PoolSlot[] = [];
+    const primaryProviders = providers.filter((provider) => !provider.isBackup);
+    this.primaryProviderIds = new Set(primaryProviders.map((provider) => provider.id));
+    this.primaryProviderCount = this.primaryProviderIds.size;
     for (const provider of providers) {
       const limit = Math.max(1, Math.min(provider.connections, maxConnections - slots.length));
       for (let index = 0; index < limit; index += 1) slots.push({ provider, busy: false });
@@ -174,14 +183,16 @@ class NntpPool {
   }
 
   async article(articleId: string) {
+    this.assertRuntimeVersion();
     const errors: string[] = [];
     const permanentFailures = new Set<string>();
     const providerCount = new Set(this.slots.map((slot) => slot.provider.id)).size;
     const maxAttempts = Math.max(providerCount, this.slots.length * 2);
+    let includeBackups = this.primaryProviderCount === 0;
 
     for (let attempt = 1; attempt <= maxAttempts; attempt += 1) {
       if (permanentFailures.size >= providerCount) break;
-      const slot = await this.acquire(permanentFailures);
+      const slot = await this.acquire(permanentFailures, includeBackups);
       try {
         if (!slot.client) {
           slot.client = new NntpClient(slot.provider);
@@ -199,6 +210,7 @@ class NntpPool {
         this.syncDebug();
         if (isProviderConnectionLimit(message)) {
           permanentFailures.add(slot.provider.id);
+          if (!includeBackups && this.allPrimaryProvidersFailed(permanentFailures)) includeBackups = true;
           if (permanentFailures.size >= providerCount) throw new Error(`too many connections from all configured providers`);
           continue;
         }
@@ -206,6 +218,7 @@ class NntpPool {
           if (attempt < maxAttempts) await sleep(Math.min(15000, attempt * 2000));
         } else {
           permanentFailures.add(slot.provider.id);
+          if (!includeBackups && this.allPrimaryProvidersFailed(permanentFailures)) includeBackups = true;
         }
       } finally {
         this.release(slot);
@@ -216,14 +229,16 @@ class NntpPool {
   }
 
   async stat(articleId: string) {
+    this.assertRuntimeVersion();
     const errors: string[] = [];
     const permanentFailures = new Set<string>();
     const providerCount = new Set(this.slots.map((slot) => slot.provider.id)).size;
     const maxAttempts = Math.max(providerCount, this.slots.length * 2);
+    let includeBackups = this.primaryProviderCount === 0;
 
     for (let attempt = 1; attempt <= maxAttempts; attempt += 1) {
       if (permanentFailures.size >= providerCount) break;
-      const slot = await this.acquire(permanentFailures);
+      const slot = await this.acquire(permanentFailures, includeBackups);
       try {
         if (!slot.client) {
           slot.client = new NntpClient(slot.provider);
@@ -241,6 +256,7 @@ class NntpPool {
         this.syncDebug();
         if (isProviderConnectionLimit(message)) {
           permanentFailures.add(slot.provider.id);
+          if (!includeBackups && this.allPrimaryProvidersFailed(permanentFailures)) includeBackups = true;
           if (permanentFailures.size >= providerCount) throw new Error(`too many connections from all configured providers`);
           continue;
         }
@@ -248,6 +264,7 @@ class NntpPool {
           if (attempt < maxAttempts) await sleep(Math.min(15000, attempt * 2000));
         } else {
           permanentFailures.add(slot.provider.id);
+          if (!includeBackups && this.allPrimaryProvidersFailed(permanentFailures)) includeBackups = true;
         }
       } finally {
         this.release(slot);
@@ -262,8 +279,10 @@ class NntpPool {
     clearPoolDebugState(this.ownerId);
   }
 
-  private acquire(excludedProviders = new Set<string>()) {
-    const available = this.slots.find((slot) => !slot.busy && !excludedProviders.has(slot.provider.id));
+  private acquire(excludedProviders = new Set<string>(), includeBackups = true) {
+    const available = this.slots.find(
+      (slot) => !slot.busy && !excludedProviders.has(slot.provider.id) && (includeBackups || !slot.provider.isBackup)
+    );
     if (available) {
       available.busy = true;
       this.syncDebug();
@@ -271,12 +290,14 @@ class NntpPool {
     }
 
     return new Promise<PoolSlot>((resolve) => {
-      this.waiters.push({ excludedProviders: new Set(excludedProviders), resolve });
+      this.waiters.push({ excludedProviders: new Set(excludedProviders), includeBackups, resolve });
     });
   }
 
   private release(slot: PoolSlot) {
-    const waiterIndex = this.waiters.findIndex((waiter) => !waiter.excludedProviders.has(slot.provider.id));
+    const waiterIndex = this.waiters.findIndex(
+      (waiter) => !waiter.excludedProviders.has(slot.provider.id) && (waiter.includeBackups || !slot.provider.isBackup)
+    );
     const waiter = waiterIndex >= 0 ? this.waiters.splice(waiterIndex, 1)[0] : undefined;
     if (waiter) {
       slot.busy = true;
@@ -295,6 +316,21 @@ class NntpPool {
       allowedConnections: this.maxConnections,
       slots: this.slots
     });
+  }
+
+  private assertRuntimeVersion() {
+    if (this.runtimeVersion !== getUsenetRuntimeVersion()) {
+      throw new Error("Usenet provider configuration changed; restarting download with new connection pool");
+    }
+  }
+
+  private allPrimaryProvidersFailed(permanentFailures: Set<string>) {
+    if (this.primaryProviderCount === 0) return true;
+    let failed = 0;
+    for (const providerId of this.primaryProviderIds) {
+      if (permanentFailures.has(providerId)) failed += 1;
+    }
+    return failed >= this.primaryProviderCount;
   }
 }
 
@@ -325,6 +361,8 @@ async function reconstructFile(input: {
   let writeOffset = 0;
   let writeChain = Promise.resolve();
   const pendingChunks = new Map<number, Buffer>();
+  const maxBufferedChunks = Math.max(8, input.pool.size * 2);
+  let pendingProgressSnapshot: number | null = null;
 
   function progressData(downloadedSnapshot: number) {
     const elapsedSeconds = Math.max(1, (Date.now() - input.startedAt) / 1000);
@@ -350,18 +388,22 @@ async function reconstructFile(input: {
     lastProgressUpdateAt = now;
     const downloadedSnapshot = downloaded;
     lastProgressPersistedBytes = downloadedSnapshot;
+    pendingProgressSnapshot = downloadedSnapshot;
     progressWrite = progressWrite
       .catch(() => undefined)
       .then(async () => {
+        if (pendingProgressSnapshot === null) return;
+        const snapshot = pendingProgressSnapshot;
+        pendingProgressSnapshot = null;
         await prisma.download.update({
           where: { id: input.downloadId },
-          data: progressData(downloadedSnapshot)
+          data: progressData(snapshot)
         });
       })
       .catch((error) => {
         input.logger.warn({ downloadId: input.downloadId, err: error }, "download progress update failed");
       });
-    await progressWrite;
+    if (force) await progressWrite;
   }
 
   function drainWrites() {
@@ -369,13 +411,24 @@ async function reconstructFile(input: {
       .catch(() => undefined)
       .then(async () => {
         while (pendingChunks.has(nextWriteIndex)) {
-          const chunk = pendingChunks.get(nextWriteIndex);
-          pendingChunks.delete(nextWriteIndex);
-          if (!chunk) continue;
-          await handle.write(chunk, 0, chunk.length, writeOffset);
-          writeOffset += chunk.length;
-          nextWriteIndex += 1;
-          await updateProgress(chunk.length);
+          const chunks: Buffer[] = [];
+          let batchedBytes = 0;
+          while (pendingChunks.has(nextWriteIndex)) {
+            const chunk = pendingChunks.get(nextWriteIndex);
+            pendingChunks.delete(nextWriteIndex);
+            if (!chunk) {
+              nextWriteIndex += 1;
+              continue;
+            }
+            chunks.push(chunk);
+            batchedBytes += chunk.length;
+            nextWriteIndex += 1;
+            if (batchedBytes >= DOWNLOAD_WRITE_BATCH_BYTES) break;
+          }
+          if (chunks.length === 0) continue;
+          await handle.writev(chunks, writeOffset);
+          writeOffset += batchedBytes;
+          await updateProgress(batchedBytes);
         }
       });
     return writeChain;
@@ -384,6 +437,9 @@ async function reconstructFile(input: {
   async function worker(workerIndex: number) {
     while (!aborted) {
       await waitForQueueCapacity(workerIndex);
+      while (!aborted && pendingChunks.size >= maxBufferedChunks) {
+        await writeChain;
+      }
       const segmentIndex = nextSegmentIndex;
       const segment = input.file.segments[segmentIndex];
       nextSegmentIndex += 1;
@@ -391,7 +447,7 @@ async function reconstructFile(input: {
 
       const chunk = await input.pool.article(segment.articleId);
       pendingChunks.set(segmentIndex, chunk);
-      await drainWrites();
+      void drainWrites();
     }
   }
 
@@ -410,7 +466,12 @@ async function reconstructFile(input: {
   return { outputPath, bytes: downloaded - input.downloadedBefore };
 }
 
-export async function prepareNzbDocumentForStreaming(input: { downloadId: string; nzbDocumentId: string; logger: FastifyBaseLogger }) {
+export async function prepareNzbDocumentForStreaming(input: {
+  downloadId: string;
+  nzbDocumentId: string;
+  logger: FastifyBaseLogger;
+  maxConnectionsOverride?: number;
+}) {
   const nzb = await loadNzbDocument(input.nzbDocumentId);
   if (!nzb) throw new Error("NZB document not found");
 
@@ -437,7 +498,7 @@ export async function prepareNzbDocumentForStreaming(input: { downloadId: string
     data: { status: "verifying", streamable: false }
   });
 
-  const allowedConnections = await getAllowedDownloadConnections();
+  const allowedConnections = input.maxConnectionsOverride ?? await getAllowedDownloadConnections();
   const pool = new NntpPool(providers, Math.max(1, allowedConnections), input.logger, input.downloadId, "verifying");
   const totalSize = nzb.totalSize;
   let verified = 0;
@@ -517,6 +578,12 @@ export async function prepareNzbDocumentForStreaming(input: { downloadId: string
   } finally {
     await pool.close();
   }
+}
+
+export async function getNzbImportMode(nzbDocumentId: string): Promise<NzbImportMode> {
+  const nzb = await loadNzbDocument(nzbDocumentId);
+  if (!nzb) throw new Error("NZB document not found");
+  return classifyNzbImportMode(nzb);
 }
 
 export async function downloadNzbDocument(input: { downloadId: string; nzbDocumentId: string; logger: FastifyBaseLogger }) {

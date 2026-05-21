@@ -1,4 +1,4 @@
-import { copyFile, lstat, mkdir, readFile, readlink, symlink, unlink, writeFile } from "node:fs/promises";
+import { copyFile, lstat, mkdir, readFile, readdir, readlink, rmdir, symlink, unlink, writeFile } from "node:fs/promises";
 import { dirname } from "node:path";
 import type { ImportItem } from "@prisma/client";
 import { env } from "../config/env.js";
@@ -18,10 +18,20 @@ function fallbackMediaTitle(value?: string | null) {
   return cleaned || undefined;
 }
 
+function normalizeLookupTitle(value?: string | null) {
+  if (!value) return undefined;
+  return value
+    .replace(/\(\d{4}\)\s*$/g, "")
+    .replace(/\($/g, "")
+    .replace(/[._]+/g, " ")
+    .replace(/\s+/g, " ")
+    .trim() || undefined;
+}
+
 async function mediaFromImport(item: ImportItem) {
   const request = item.requestId ? await prisma.mediaRequest.findUnique({ where: { id: item.requestId } }) : null;
   const download = item.downloadId ? await prisma.download.findUnique({ where: { id: item.downloadId } }) : null;
-  const suspiciousTitle = !item.title || /^[a-z0-9]+-[a-z0-9-]+$/i.test(item.title);
+  const suspiciousTitle = !item.title || /^[a-z0-9]+-[a-z0-9-]+$/i.test(item.title) || /\($/.test(item.title.trim());
   const titleFallback = suspiciousTitle ? fallbackMediaTitle(download?.title) ?? item.title : item.title;
   const media = {
     mediaType: item.mediaType,
@@ -33,13 +43,17 @@ async function mediaFromImport(item: ImportItem) {
     tvdbId: request?.tvdbId
   };
 
-  if (media.year) return media;
+  const needsMetadata = !media.year || (media.mediaType === "movie" ? !media.tmdbId : !media.tvdbId);
+  if (!needsMetadata) return media;
+  const lookupTitle = normalizeLookupTitle(titleFallback) ?? normalizeLookupTitle(media.title) ?? media.title;
+  const lookupYear = request?.year
+    ?? (media.mediaType === "tv" && !media.tvdbId ? undefined : suspiciousTitle ? undefined : media.year);
 
   const settings = await getSettings();
   const metadata = await fetchMediaMetadata(settings, {
     mediaType: media.mediaType,
-    title: media.title,
-    year: media.year,
+    title: lookupTitle,
+    year: lookupYear,
     season: media.season,
     episode: media.episode,
     tmdbId: media.tmdbId,
@@ -47,7 +61,7 @@ async function mediaFromImport(item: ImportItem) {
     imdbId: request?.imdbId
   }).catch(() => undefined);
 
-  if (!metadata?.year) {
+  if (!metadata) {
     if (titleFallback && titleFallback !== item.title) {
       await prisma.importItem.update({
         where: { id: item.id },
@@ -60,7 +74,7 @@ async function mediaFromImport(item: ImportItem) {
   const nextMedia = {
     ...media,
     title: metadata.title ?? media.title,
-    year: metadata.year,
+    year: metadata.year ?? media.year,
     tmdbId: media.tmdbId ?? metadata.tmdbId,
     tvdbId: media.tvdbId ?? metadata.tvdbId
   };
@@ -181,4 +195,21 @@ export async function cleanupSymlinks() {
     }
   }
   return { orphaned: removed };
+}
+
+async function pruneEmptyTree(root: string) {
+  const entries = await readdir(root, { withFileTypes: true }).catch(() => []);
+  for (const entry of entries) {
+    if (!entry.isDirectory()) continue;
+    await pruneEmptyTree(`${root}/${entry.name}`);
+  }
+  const remaining = await readdir(root).catch(() => null);
+  if (!remaining || remaining.length > 0) return;
+  await rmdir(root).catch(() => undefined);
+}
+
+export async function pruneLibraryDirectories() {
+  await pruneEmptyTree(env.MEDIA_MOVIES_DIR);
+  await pruneEmptyTree(env.MEDIA_TV_DIR);
+  return { ok: true };
 }

@@ -3,7 +3,7 @@ import type { FastifyInstance } from "fastify";
 import { addNzbFromPath } from "../downloads/downloadService.js";
 import { getSettings } from "../settings/settingsStore.js";
 import { downloadNzb, fetchNzbForRelease, testDownloadNzb, testNzbhydraConnection } from "../indexers/nzbhydra/client.js";
-import { fetchDiscoverHome } from "../metadata/metadataService.js";
+import { fetchDiscoverHome, fetchDiscoverList } from "../metadata/metadataService.js";
 import { getSearchHistory, runSearch } from "../search/searchService.js";
 import { toPublicReleases } from "../releases/public.js";
 
@@ -24,6 +24,15 @@ const downloadSchema = z.object({
 export async function searchRoutes(app: FastifyInstance): Promise<void> {
   app.post("/api/indexers/nzbhydra/test", async () => testNzbhydraConnection(await getSettings()));
   app.get("/api/discover/home", async () => fetchDiscoverHome(await getSettings()));
+  app.get("/api/discover/:mediaType", async (request) => {
+    const params = z.object({
+      mediaType: z.enum(["movie", "tv"])
+    }).parse(request.params);
+    const query = z.object({
+      page: z.coerce.number().int().positive().optional()
+    }).parse(request.query);
+    return fetchDiscoverList(await getSettings(), params.mediaType, query.page ?? 1);
+  });
 
   app.post("/api/search/movie", async (request) => toPublicReleases(await runSearch({ ...baseSearchSchema.parse(request.body), kind: "movie" })));
   app.post("/api/search/tv", async (request) => toPublicReleases(await runSearch({ ...baseSearchSchema.parse(request.body), kind: "tv" })));

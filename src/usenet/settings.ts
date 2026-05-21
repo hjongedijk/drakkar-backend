@@ -2,6 +2,8 @@ import { z } from "zod";
 import { prisma } from "../db/prisma.js";
 import { invalidatePolicyCache } from "../policies/policyService.js";
 
+let usenetRuntimeVersion = 0;
+
 export const usenetServerSchema = z.object({
   name: z.string().min(1),
   host: z.string().min(1),
@@ -20,17 +22,28 @@ export function listUsenetServers() {
   return prisma.usenetServer.findMany({ orderBy: [{ priority: "asc" }, { name: "asc" }] });
 }
 
+export function getUsenetRuntimeVersion() {
+  return usenetRuntimeVersion;
+}
+
+function bumpUsenetRuntimeVersion() {
+  usenetRuntimeVersion += 1;
+}
+
 export function createUsenetServer(input: unknown) {
   invalidatePolicyCache();
+  bumpUsenetRuntimeVersion();
   return prisma.usenetServer.create({ data: usenetServerSchema.parse(input) });
 }
 
 export function updateUsenetServer(id: string, input: unknown) {
   invalidatePolicyCache();
+  bumpUsenetRuntimeVersion();
   return prisma.usenetServer.update({ where: { id }, data: usenetServerSchema.partial().parse(input) });
 }
 
 export function deleteUsenetServer(id: string) {
   invalidatePolicyCache();
+  bumpUsenetRuntimeVersion();
   return prisma.usenetServer.delete({ where: { id } });
 }

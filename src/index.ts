@@ -6,7 +6,14 @@ import { buildApp } from "./app.js";
 import { migrateImportsToCurrentNaming } from "./import/importService.js";
 import { validateRequiredFolders } from "./utils/folders.js";
 import { startRequestSyncSchedule, stopRequestSyncSchedule } from "./requests/sync/scheduler.js";
-import { reconcileDownloadQueueState, recoverInterruptedDownloads, startDownloadWorkers, stopDownloadWorkers } from "./usenet/workers.js";
+import {
+  reconcileAvailableDownloadsWithoutImports,
+  reconcileDownloadQueueState,
+  recoverInterruptedDownloads,
+  startDownloadWorkers,
+  stopDownloadWorkers
+} from "./usenet/workers.js";
+import { primeMountedStreamPool } from "./streaming/mountedStream.service.js";
 import { startFuseMount, stopFuseMount } from "./vfs/fuseMountService.js";
 import { startBackgroundRepairSchedule, stopBackgroundRepairSchedule } from "./repair/repairService.js";
 import { ensureDefaultAdminUser } from "./auth/service.js";
@@ -44,6 +51,7 @@ try {
         app.log.info({ namingMigration }, "library naming migration completed");
       }
       await reconcileDownloadQueueState(app.log);
+      await reconcileAvailableDownloadsWithoutImports(app.log);
       await recoverInterruptedDownloads(app.log);
       startDownloadWorkers(app.log);
     } catch (error) {
@@ -51,6 +59,9 @@ try {
     }
   })();
   await startFuseMount(app.log);
+  void primeMountedStreamPool().catch((error) => {
+    app.log.debug({ err: error }, "mounted stream pool prewarm skipped");
+  });
   if (env.REQUEST_SYNC_ENABLED) startRequestSyncSchedule(app.log);
   startBackgroundRepairSchedule(app.log);
 } catch (error) {

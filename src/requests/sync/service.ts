@@ -148,7 +148,7 @@ export async function syncRequests(providerId?: string) {
           } catch (error) {
             await prisma.mediaRequest.update({
               where: { id: synced.id },
-              data: { status: "auto_grab_failed" }
+              data: { status: "approved", downloadId: null }
             }).catch(() => undefined);
             await prisma.requestProvider.update({
               where: { id: provider.id },
@@ -248,10 +248,10 @@ export async function ensureMonitoredRequests() {
   return { retried: retried.length, results: retried };
 }
 
-function statusFromExternal(externalStatus?: string | null) {
+function statusFromExternal(externalStatus?: string | null, mediaType?: string) {
   if (externalStatus === "2") return "approved";
   if (externalStatus === "3") return "rejected";
-  if (externalStatus === "4" || externalStatus === "5") return "available";
+  if (externalStatus === "4" || externalStatus === "5") return mediaType === "tv" ? "approved" : "available";
   return "pending";
 }
 
@@ -270,7 +270,7 @@ async function upsertRequest(provider: RequestProvider, request: ExternalMediaRe
       ? existing?.status ?? "approved"
       : request.externalStatus === "2"
         ? "approved"
-        : existing?.status ?? statusFromExternal(request.externalStatus);
+        : existing?.status ?? statusFromExternal(request.externalStatus, request.mediaType);
 
   return prisma.mediaRequest.upsert({
     where: { providerId_externalId: { providerId: provider.id, externalId: request.externalId } },
@@ -302,7 +302,7 @@ async function upsertRequest(provider: RequestProvider, request: ExternalMediaRe
       requestedBy: request.requestedBy,
       requestedQuality: request.requestedQuality,
       externalStatus: request.externalStatus,
-      status: statusFromExternal(request.externalStatus)
+      status: statusFromExternal(request.externalStatus, request.mediaType)
     }
   });
 }
@@ -597,13 +597,26 @@ export async function grabMissingTvForRequest(id: string) {
   const seasons = requestedSeasons(request.seasons);
   if (seasons.length === 0) return grabBestForRequest(id);
   const requestedEpisodes = requestedEpisodesBySeason(request.episodes);
+  const seasonEpisodeCounts = new Map(
+    Array.isArray(request.seasons)
+      ? request.seasons.flatMap((item) => {
+          if (!item || typeof item !== "object") return [];
+          const record = item as Record<string, unknown>;
+          const seasonNumber = numberField(record.seasonNumber ?? record.season ?? record.number);
+          const episodeCount = numberField(record.episodeCount ?? record.episodesCount ?? record.totalEpisodes);
+          return seasonNumber ? [[seasonNumber, episodeCount ?? 0] as const] : [];
+        })
+      : []
+  );
 
   const results = [];
   for (const season of seasons) {
     if (await hasActiveSeasonPackDownload(request.title, season)) continue;
     const existingEpisodes = await existingEpisodesForSeason(request.id, request.title, season);
     const requestedSeasonEpisodes = requestedEpisodes.get(season);
+    const knownEpisodeCount = seasonEpisodeCounts.get(season) ?? 0;
     if (requestedSeasonEpisodes && requestedSeasonEpisodes.size > 0 && [...requestedSeasonEpisodes].every((episode) => existingEpisodes.has(episode))) continue;
+    if ((!requestedSeasonEpisodes || requestedSeasonEpisodes.size === 0) && knownEpisodeCount > 0 && existingEpisodes.size >= knownEpisodeCount) continue;
     const result = await grabBestTvSeasonForRequest(request, season, existingEpisodes, requestedSeasonEpisodes);
     results.push({ season, result });
   }

@@ -99,4 +99,20 @@ describe("scoreRelease", () => {
     assert.equal(decision.accepted, false);
     assert.ok(decision.reasons.includes("missing required language: english"));
   });
+
+  it("rejects multi-audio releases when profile disallows them", () => {
+    const profile = { ...baseProfile, allowMultiAudio: false };
+    const decision = scoreRelease(
+      release("Movie.2026.1080p.WEB-DL.MULTI.H.265-GROUP", {
+        resolution: "1080p",
+        source: "webdl",
+        codec: "h265",
+        language: "multi"
+      }),
+      profile
+    );
+
+    assert.equal(decision.accepted, false);
+    assert.ok(decision.reasons.includes("multi-audio release rejected"));
+  });
 });

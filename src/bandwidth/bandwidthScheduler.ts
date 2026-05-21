@@ -25,7 +25,14 @@ export async function getBandwidthStatus() {
   const effectiveDownloadCap = Math.min(maxTotalConnections, maxDownloadConnections + unusedStreamingAllowance);
   const maintenanceFloor = maxDownloadConnections > 0 ? 1 : 0;
   const allocatedDownloadConnections = activeStreamCount > 0
-    ? clamp(Math.min(effectiveDownloadCap, Math.max(maintenanceFloor, remainingAfterStreams)), 0, effectiveDownloadCap)
+    ? clamp(
+        Math.min(
+          effectiveDownloadCap,
+          Math.max(maintenanceFloor, Math.floor(remainingAfterStreams * Math.max(0.1, 1 - streamingShare)))
+        ),
+        0,
+        effectiveDownloadCap
+      )
     : Math.min(effectiveDownloadCap, maxTotalConnections);
 
   return {

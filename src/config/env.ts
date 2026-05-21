@@ -30,7 +30,7 @@ const envSchema = z.object({
   NZB_BACKUPS_DIR: z.string().default("/data/nzb-backup"),
   FUSE_MOUNT_ENABLED: envBoolean.default(false),
   FUSE_MOUNT_PATH: z.string().default("/mnt/fuse"),
-  FUSE_ALLOW_OTHER: envBoolean.default(false),
+  FUSE_ALLOW_OTHER: envBoolean.default(true),
   FUSE_FORCE_MOUNT: envBoolean.default(true),
   FUSE_DEBUG: envBoolean.default(false),
   FRONTEND_API_TOKEN: z.string().default("dev-frontend-token"),

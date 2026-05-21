@@ -1,6 +1,4 @@
-import { getMountByPath } from "../vfs/mountedNzbService.js";
-import { detectArchive } from "../extract/detect.js";
-import { filenameFromSubject } from "../usenet/filename.js";
+import { getMountFileByPath } from "../vfs/mountedNzbService.js";
 
 export type PlannedArticleRange = {
   fileId: string;
@@ -20,12 +18,6 @@ export type PlannedStreamRange = {
   size: number;
   ranges: PlannedArticleRange[];
 };
-
-function parseMountedFileId(path: string) {
-  const parts = path.split("/").filter(Boolean);
-  const index = parts[1] === "releases" ? 3 : 2;
-  return decodeURIComponent(parts[index]?.split("-")[0] ?? "");
-}
 
 export function normalizeRange(range: string | undefined, size: number) {
   if (size <= 0) return { start: 0, end: 0 };
@@ -53,18 +45,12 @@ export function normalizeRange(range: string | undefined, size: number) {
 }
 
 export async function planMountedFileRange(path: string, range?: string): Promise<PlannedStreamRange> {
-  const parts = path.split("/").filter(Boolean);
-  const mountPath = parts[1] === "releases" ? `/mounted/releases/${parts[2]}` : `/${parts.slice(0, 2).join("/")}`;
-  const mount = await getMountByPath(mountPath);
+  const mount = await getMountFileByPath(path);
   if (!mount) throw new Error("mounted NZB not found");
   if (!mount.streamable) throw new Error("mounted NZB is not prepared for streaming yet");
 
-  const fileId = parseMountedFileId(path);
-  const file = mount.nzbDocument.files.find((item) => item.id === fileId);
+  const file = mount.nzbDocument.files[0];
   if (!file) throw new Error("mounted NZB file not found");
-  if (detectArchive(filenameFromSubject(file.subject, 0)) !== "none") {
-    throw new Error("requires_extract: archive entries must be extracted before browser/FUSE streaming");
-  }
 
   const size = Math.max(0, Math.floor(file.size));
   const { start, end } = normalizeRange(range, size);

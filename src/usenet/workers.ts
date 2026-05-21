@@ -1,22 +1,52 @@
 import { Worker, type Job } from "bullmq";
-import { rm } from "node:fs/promises";
+import { rm, stat } from "node:fs/promises";
 import { join } from "node:path";
 import type { FastifyBaseLogger } from "fastify";
-import { env } from "../config/env.js";
 import { redis } from "../db/redis.js";
 import { prisma } from "../db/prisma.js";
-import { importCompletedPath, makeMountedDownloadAvailable } from "../import/importService.js";
+import { importCompletedPath, makeMountedDownloadAvailable, reconcileRequestStatusAfterImport } from "../import/importService.js";
 import type { DownloadJobData } from "../queues/downloadQueue.js";
-import { downloadNzbDocument, prepareNzbDocumentForStreaming } from "./downloadEngine.js";
+import { downloadNzbDocument, getNzbImportMode, prepareNzbDocumentForStreaming } from "./downloadEngine.js";
 import { fetchAndStoreNzbForDownload } from "./urlNzb.js";
 import { nzbDownloadQueue, queueDownloadJob } from "../queues/downloadQueue.js";
 import { recoverFailedDownloadForRequest } from "../requests/recovery/releaseRecoveryService.js";
 import { humanizeDownloadError } from "../downloads/presentation.js";
+import { getAllowedDownloadConnections } from "../bandwidth/bandwidthScheduler.js";
+import { env } from "../config/env.js";
 
 let workers: Worker[] = [];
+let activeDownloadJobs = 0;
+
+function downloadWorkerConcurrency() {
+  return 3;
+}
 
 function requiresMaterializedImport(message: string) {
   return /no streamable video file|archive file/i.test(message);
+}
+
+async function finalizeMaterializedImport(input: { downloadId: string; requestId?: string }) {
+  const sourcePath = join(env.VFS_DOWNLOADS_DIR, input.downloadId);
+  const imported = await importCompletedPath({
+    sourcePath,
+    downloadId: input.downloadId,
+    requestId: input.requestId
+  });
+  if (imported.length === 0) throw new Error("materialized download produced no importable media files");
+  await prisma.download.update({
+    where: { id: input.downloadId },
+    data: {
+      status: "available",
+      progress: 100,
+      speedBytesSec: 0,
+      etaSeconds: 0,
+      error: null,
+      completedAt: new Date()
+    }
+  });
+  await reconcileRequestStatusAfterImport(input.requestId, input.downloadId);
+  await rm(sourcePath, { recursive: true, force: true }).catch(() => undefined);
+  return imported;
 }
 
 export function startDownloadWorkers(logger: FastifyBaseLogger) {
@@ -25,6 +55,7 @@ export function startDownloadWorkers(logger: FastifyBaseLogger) {
   const worker = new Worker<DownloadJobData>(
     "nzb-download",
     async (job: Job<DownloadJobData>) => {
+      activeDownloadJobs += 1;
       let current = await prisma.download.findUnique({ where: { id: job.data.downloadId } });
       try {
         if (!current) {
@@ -42,11 +73,32 @@ export function startDownloadWorkers(logger: FastifyBaseLogger) {
 
         const nzbDocumentId =
           job.data.nzbDocumentId ?? (await fetchAndStoreNzbForDownload({ downloadId: job.data.downloadId, logger })).id;
+        const importMode = await getNzbImportMode(nzbDocumentId);
 
+        if (importMode === "materialized") {
+          const result = await downloadNzbDocument({
+            downloadId: job.data.downloadId,
+            nzbDocumentId,
+            logger
+          });
+          if (result.status === "completed") {
+            const imported = await finalizeMaterializedImport({
+              downloadId: job.data.downloadId,
+              requestId: job.data.requestId
+            });
+            logger.info({ downloadId: job.data.downloadId, imported: imported.length }, "archive/materialized NZB downloaded and imported");
+            return { status: "available", imports: imported.length, mode: "materialized" };
+          }
+          return result;
+        }
+
+        const allowedConnections = await getAllowedDownloadConnections();
+        const sharedConnections = Math.max(1, Math.floor(allowedConnections / Math.max(1, activeDownloadJobs)));
         const result = await prepareNzbDocumentForStreaming({
           downloadId: job.data.downloadId,
           nzbDocumentId,
-          logger
+          logger,
+          maxConnectionsOverride: sharedConnections
         });
         if (result.status === "prepared") {
           try {
@@ -57,40 +109,24 @@ export function startDownloadWorkers(logger: FastifyBaseLogger) {
               downloadId: job.data.downloadId,
               requestId: job.data.requestId ?? request?.id
             });
-            if (request) {
-              await prisma.mediaRequest.update({
-                where: { id: request.id },
-                data: { status: "available" }
-              });
-            }
+            await reconcileRequestStatusAfterImport(request?.id, job.data.downloadId);
             logger.info({ downloadId: job.data.downloadId, streamPath: available.streamPath }, "streaming NZB prepared and symlinked");
           } catch (error) {
             const rawMessage = error instanceof Error ? error.message : "import failed";
             if (requiresMaterializedImport(rawMessage)) {
-              logger.warn({ downloadId: job.data.downloadId, err: error }, "mounted import needs full download fallback");
-              const completed = await downloadNzbDocument({
+              logger.warn({ downloadId: job.data.downloadId, err: error }, "mounted import reclassified to materialized download path");
+              const downloadResult = await downloadNzbDocument({
                 downloadId: job.data.downloadId,
                 nzbDocumentId,
                 logger
               });
-              if (completed.status === "completed") {
-                const imported = await importCompletedPath({
-                  downloadId: job.data.downloadId,
-                  requestId: job.data.requestId,
-                  sourcePath: join(env.VFS_DOWNLOADS_DIR, job.data.downloadId)
-                });
-                await prisma.download.update({
-                  where: { id: job.data.downloadId },
-                  data: { status: "available", error: null, completedAt: new Date(), progress: 100, speedBytesSec: 0, etaSeconds: 0 }
-                });
-                await prisma.mediaRequest.updateMany({
-                  where: { downloadId: job.data.downloadId },
-                  data: { status: "available" }
-                });
-                await rm(join(env.VFS_DOWNLOADS_DIR, job.data.downloadId), { recursive: true, force: true }).catch(() => undefined);
-                logger.info({ downloadId: job.data.downloadId, imported: imported.length }, "full NZB download extracted and imported");
-                return { status: "available", imports: imported.length, mode: "materialized_fallback" };
-              }
+              if (downloadResult.status !== "completed") return downloadResult;
+              const imported = await finalizeMaterializedImport({
+                downloadId: job.data.downloadId,
+                requestId: job.data.requestId
+              });
+              logger.info({ downloadId: job.data.downloadId, imported: imported.length }, "reclassified NZB downloaded and imported");
+              return { status: "available", imports: imported.length, mode: "reclassified_materialized" };
             }
             const message = humanizeDownloadError(rawMessage) ?? rawMessage;
             logger.warn({ downloadId: job.data.downloadId, err: error }, "streaming NZB prepared but symlink import failed");
@@ -146,6 +182,36 @@ export function startDownloadWorkers(logger: FastifyBaseLogger) {
           logger.warn({ downloadId: job.data.downloadId, retryJobId: retry.id }, "provider connection limit reached; delayed retry queued");
           return { status: "waiting_for_provider", retryJobId: retry.id };
         }
+        if (/Usenet provider configuration changed; restarting download with new connection pool/i.test(message)) {
+          current = current ?? await prisma.download.findUnique({ where: { id: job.data.downloadId } });
+          const retry = await queueDownloadJob(
+            current ?? {
+              id: job.data.downloadId,
+              title: job.data.title,
+              createdAt: new Date(),
+              priority: 0
+            },
+            "provider-config-refresh",
+            {
+              downloadId: job.data.downloadId,
+              nzbDocumentId: job.data.nzbDocumentId,
+              title: job.data.title,
+              requestId: job.data.requestId
+            }
+          );
+          await prisma.download.update({
+            where: { id: job.data.downloadId },
+            data: {
+              status: "queued",
+              jobId: String(retry.id),
+              speedBytesSec: 0,
+              etaSeconds: null,
+              error: "Usenet provider settings changed. Download restarting with new connection pool."
+            }
+          });
+          logger.warn({ downloadId: job.data.downloadId, retryJobId: retry.id }, "download requeued after provider config change");
+          return { status: "queued", retryJobId: retry.id };
+        }
         await prisma.download.update({
           where: { id: job.data.downloadId },
           data: {
@@ -169,11 +235,13 @@ export function startDownloadWorkers(logger: FastifyBaseLogger) {
         }
         logger.warn({ downloadId: job.data.downloadId, recovery }, "failed release blocklisted and replacement search attempted");
         throw error;
+      } finally {
+        activeDownloadJobs = Math.max(0, activeDownloadJobs - 1);
       }
     },
     {
       connection: redis,
-      concurrency: 1,
+      concurrency: downloadWorkerConcurrency(),
       lockDuration: 5 * 60 * 1000
     }
   );
@@ -267,6 +335,88 @@ export async function reconcileDownloadQueueState(logger: FastifyBaseLogger) {
     });
     logger.warn({ downloadId: download.id, previousJobId: download.jobId, jobId: job.id }, "missing queue job recreated during reconciliation");
   }
+}
+
+export async function reconcileAvailableDownloadsWithoutImports(logger: FastifyBaseLogger) {
+  const candidates = await prisma.download.findMany({
+    where: {
+      status: { in: ["available", "completed"] },
+      nzbDocumentId: { not: null },
+      imports: { none: {} }
+    },
+    include: {
+      nzbDocument: { include: { files: true } }
+    }
+  });
+
+  let mountedFixed = 0;
+  let materializedImported = 0;
+  let requeued = 0;
+  let failed = 0;
+
+  for (const download of candidates) {
+    if (!download.nzbDocumentId || !download.nzbDocument) continue;
+    const linkedRequest = await prisma.mediaRequest.findFirst({
+      where: { downloadId: download.id },
+      select: { id: true }
+    });
+
+    try {
+      const importMode = await getNzbImportMode(download.nzbDocumentId);
+      if (importMode === "mounted") {
+        await makeMountedDownloadAvailable({
+          downloadId: download.id,
+          requestId: linkedRequest?.id
+        });
+        await reconcileRequestStatusAfterImport(linkedRequest?.id, download.id);
+        mountedFixed += 1;
+        continue;
+      }
+
+      const sourcePath = join(env.VFS_DOWNLOADS_DIR, download.id);
+      const sourceStats = await stat(sourcePath).catch(() => null);
+      if (sourceStats) {
+        await finalizeMaterializedImport({
+          downloadId: download.id,
+          requestId: linkedRequest?.id
+        });
+        materializedImported += 1;
+        continue;
+      }
+
+      const existingJob = await existingQueueJobForDownload(download.id);
+      const job = existingJob ?? await queueDownloadJob(
+        download,
+        "startup-materialized-recovery",
+        {
+          downloadId: download.id,
+          nzbDocumentId: download.nzbDocumentId,
+          title: download.title,
+          requestId: linkedRequest?.id
+        }
+      );
+      await prisma.download.update({
+        where: { id: download.id },
+        data: {
+          status: "queued",
+          jobId: String(job.id),
+          error: sourceStats ? null : "Recovering stale available download without imports",
+          speedBytesSec: 0,
+          etaSeconds: null
+        }
+      });
+      requeued += 1;
+    } catch (error) {
+      failed += 1;
+      logger.warn({ downloadId: download.id, err: error }, "available download without imports could not be reconciled");
+    }
+  }
+
+  if (mountedFixed > 0 || materializedImported > 0 || requeued > 0 || failed > 0) {
+    logger.warn({ mountedFixed, materializedImported, requeued, failed }, "reconciled stale available downloads without imports");
+  }
+
+  return { scanned: candidates.length, mountedFixed, materializedImported, requeued, failed };
 }
 
 export async function recoverInterruptedDownloads(logger: FastifyBaseLogger) {

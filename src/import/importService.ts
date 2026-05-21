@@ -1,8 +1,9 @@
-import { mkdir, readdir, rename, stat } from "node:fs/promises";
+import { mkdir, open, readdir, rename, rm, stat } from "node:fs/promises";
 import { basename, dirname, extname, join } from "node:path";
+import { env } from "../config/env.js";
 import { prisma } from "../db/prisma.js";
-import { isJunkFile, isMediaFile } from "../extract/detect.js";
-import { extractArchivesInPath } from "../extract/extractService.js";
+import { detectArchive, isJunkFile, isMediaFile } from "../extract/detect.js";
+import { extractArchiveFiles, extractArchivesInPath } from "../extract/extractService.js";
 import { writeImportMetadata } from "../metadata/metadataService.js";
 import { mediaIdentityKey } from "../media-library/identity.js";
 import { refreshMediaLibrary } from "../media-library/libraryService.js";
@@ -11,6 +12,7 @@ import { getIgnoredPatterns, matchesIgnoredPattern } from "../policies/policySer
 import { createLibraryEntryForImport } from "../symlinks/symlinkService.js";
 import { filenameFromSubject } from "../usenet/filename.js";
 import { listMountedFiles } from "../vfs/mountedNzbService.js";
+import { readMountedFileRange } from "../streaming/mountedStream.service.js";
 import { getSettings } from "../settings/settingsStore.js";
 import { fetchMediaMetadata } from "../metadata/metadataService.js";
 
@@ -85,6 +87,8 @@ function inferMedia(path: string) {
 
 type ImportMedia = ReturnType<typeof inferMedia>;
 
+const TV_ACTIVE_DOWNLOAD_STATUSES = new Set(["queued", "fetching_nzb", "verifying", "prepared", "waiting_for_provider", "waiting_for_nzb", "downloading", "paused"]);
+
 async function requestMetadata(requestId?: string): Promise<Partial<ImportMedia>> {
   if (!requestId) return {};
   const request = await prisma.mediaRequest.findUnique({ where: { id: requestId } });
@@ -96,6 +100,49 @@ async function requestMetadata(requestId?: string): Promise<Partial<ImportMedia>
     tmdbId: request.tmdbId ?? undefined,
     tvdbId: request.tvdbId ?? undefined
   };
+}
+
+export async function reconcileRequestStatusAfterImport(requestId?: string, downloadId?: string | null) {
+  if (!requestId) return;
+  const request = await prisma.mediaRequest.findUnique({ where: { id: requestId } });
+  if (!request) return;
+  if (request.mediaType !== "tv") {
+    await prisma.mediaRequest.update({
+      where: { id: requestId },
+      data: { status: "available", downloadId: downloadId ?? request.downloadId }
+    }).catch(() => undefined);
+    return;
+  }
+
+  const [{ getRequestMonitor }, activeDownload] = await Promise.all([
+    import("../requests/sync/service.js"),
+    request.downloadId
+      ? prisma.download.findUnique({
+          where: { id: request.downloadId },
+          select: { id: true, status: true }
+        })
+      : Promise.resolve(null)
+  ]);
+  const monitor = await getRequestMonitor(requestId).catch(() => null);
+  const hasMissingEpisodes = monitor?.seasons.some((season) => season.missingCount > 0) ?? false;
+  const hasAvailableEpisodes = monitor?.seasons.some((season) => season.availableCount > 0) ?? false;
+  const nextStatus = hasMissingEpisodes
+    ? hasAvailableEpisodes || (activeDownload ? TV_ACTIVE_DOWNLOAD_STATUSES.has(activeDownload.status) : false)
+      ? "grabbed"
+      : "approved"
+    : hasAvailableEpisodes
+      ? "available"
+      : request.status;
+
+  await prisma.mediaRequest.update({
+    where: { id: requestId },
+    data: {
+      status: nextStatus,
+      downloadId: hasMissingEpisodes && (!activeDownload || !TV_ACTIVE_DOWNLOAD_STATUSES.has(activeDownload.status))
+        ? null
+        : downloadId ?? request.downloadId
+    }
+  }).catch(() => undefined);
 }
 
 function suspiciousMountedTitle(value: string) {
@@ -112,6 +159,36 @@ function fallbackMediaTitle(value?: string | null) {
     .replace(/\s+-\s+[A-Za-z0-9]+$/, "")
     .trim();
   return cleaned || undefined;
+}
+
+function mountedFileIdFromPath(path: string) {
+  const match = path.match(/\/mounted\/releases\/[^/]+\/([^/-]+)-/);
+  return match?.[1] ?? null;
+}
+
+async function materializeMountedArchive(input: { mountedPath: string; archiveName: string; outputDir: string; size: number }) {
+  const outputPath = join(input.outputDir, input.archiveName);
+  await mkdir(dirname(outputPath), { recursive: true });
+  const handle = await open(outputPath, "w");
+  const chunkSize = 4 * 1024 * 1024;
+  try {
+    let offset = 0;
+    while (offset < input.size) {
+      const length = Math.min(chunkSize, input.size - offset);
+      const chunk = await readMountedFileRange({
+        path: input.mountedPath,
+        start: offset,
+        length,
+        source: "api"
+      });
+      if (chunk.length === 0) break;
+      await handle.write(chunk, 0, chunk.length, offset);
+      offset += chunk.length;
+    }
+  } finally {
+    await handle.close();
+  }
+  return outputPath;
 }
 
 export async function importCompletedPath(input: { sourcePath: string; downloadId?: string; requestId?: string }) {
@@ -164,6 +241,7 @@ export async function importCompletedPath(input: { sourcePath: string; downloadI
 
 function mainVideoFile(files: Awaited<ReturnType<typeof listMountedFiles>>, ignoredPatterns: string[]) {
   return files
+    .filter((file) => file.type === "streamable-file")
     .filter((file) => /\.(mkv|mp4|avi|mov|m4v|ts)(?:[_\s)]|$)/i.test(file.name))
     .filter((file) => !isJunkFile(file.name) && !matchesIgnoredPattern(file.path, ignoredPatterns))
     .sort((a, b) => b.size - a.size)[0];
@@ -171,6 +249,7 @@ function mainVideoFile(files: Awaited<ReturnType<typeof listMountedFiles>>, igno
 
 function mediaVideoFiles(files: Awaited<ReturnType<typeof listMountedFiles>>, ignoredPatterns: string[]) {
   return files
+    .filter((file) => file.type === "streamable-file")
     .filter((file) => /\.(mkv|mp4|avi|mov|m4v|ts)(?:[_\s)]|$)/i.test(file.name))
     .filter((file) => !isJunkFile(file.name) && !matchesIgnoredPattern(file.path, ignoredPatterns))
     .sort((a, b) => a.name.localeCompare(b.name));
@@ -209,35 +288,134 @@ export async function makeMountedDownloadAvailable(input: { downloadId: string; 
       where: { downloadId: download.id, completedPath: selected.path },
       include: { symlinks: true }
     });
+    const repairable = existing ? null : await findRepairableMountedImport(download.id, input.requestId, inferred);
     if (!existing && matchingImport) {
-      imported.push({ item: matchingImport, link: matchingImport.symlinks[0], streamPath: matchingImport.completedPath });
+      const attached = input.requestId && matchingImport.requestId !== input.requestId
+        ? await prisma.importItem.update({
+            where: { id: matchingImport.id },
+            data: {
+              requestId: input.requestId,
+              title: inferred.title || matchingImport.title,
+              year: inferred.year ?? matchingImport.year,
+              season: inferred.season ?? matchingImport.season,
+              episode: inferred.episode ?? matchingImport.episode
+            },
+            include: { symlinks: true }
+          })
+        : matchingImport;
+      imported.push({ item: attached, link: attached.symlinks[0], streamPath: attached.completedPath });
       continue;
     }
-    const item = existing ?? await prisma.importItem.create({
-      data: {
-        downloadId: download.id,
-        requestId: input.requestId,
-        mediaType: inferred.mediaType,
-        title: inferred.title || download.title,
-        year: inferred.year,
-        season: inferred.season,
-        episode: inferred.episode,
-        sourcePath: selected.path,
-        completedPath: selected.path,
-        status: "streaming_import"
-      }
-    });
+    const item = existing
+      ?? repairable
+      ?? await prisma.importItem.create({
+        data: {
+          downloadId: download.id,
+          requestId: input.requestId,
+          mediaType: inferred.mediaType,
+          title: inferred.title || download.title,
+          year: inferred.year,
+          season: inferred.season,
+          episode: inferred.episode,
+          sourcePath: selected.path,
+          completedPath: selected.path,
+          status: "streaming_import"
+        }
+      });
+    const ensured = existing || !repairable
+      ? item
+      : await prisma.importItem.update({
+          where: { id: item.id },
+          data: {
+            requestId: input.requestId,
+            mediaType: inferred.mediaType,
+            title: inferred.title || download.title,
+            year: inferred.year,
+            season: inferred.season,
+            episode: inferred.episode,
+            sourcePath: selected.path,
+            completedPath: selected.path,
+            status: "streaming_import"
+          }
+        });
 
-    const link = await createLibraryEntryForImport(item);
-    imported.push({ item, link, streamPath: selected.path });
+    const link = await createLibraryEntryForImport(ensured);
+    imported.push({ item: ensured, link, streamPath: selected.path });
   }
   await prisma.download.update({
     where: { id: download.id },
     data: { status: "available", progress: 100, downloaded: 0, speedBytesSec: 0, etaSeconds: 0, completedAt: new Date(), error: null }
   });
-  if (input.requestId) await prisma.mediaRequest.update({ where: { id: input.requestId }, data: { status: "available", downloadId: download.id } });
+  await reconcileRequestStatusAfterImport(input.requestId, download.id);
   await refreshMediaLibrary();
   return { downloadId: download.id, import: imported[0]?.item, symlink: imported[0]?.link, imports: imported.map((item) => item.item), streamPath: imported[0]?.streamPath };
+}
+
+export async function importMountedDownloadByExtraction(input: { downloadId: string; requestId?: string }) {
+  const download = await prisma.download.findUniqueOrThrow({
+    where: { id: input.downloadId },
+    include: { nzbDocument: true }
+  });
+  if (!download.nzbDocumentId || !download.nzbDocument) throw new Error("download has no mounted NZB document");
+
+  const mountedFiles = await listMountedFiles(`/mounted/releases/${download.nzbDocumentId}`);
+  const materializeFiles = mountedFiles
+    .filter((file) => file.type === "archive-file")
+    .map((file) => ({ file, kind: detectArchive(file.name) }))
+    .filter((entry): entry is { file: typeof mountedFiles[number]; kind: "rar" | "rar-part" | "zip" | "7z" } => entry.kind !== "none")
+    .sort((a, b) => a.file.name.localeCompare(b.file.name, undefined, { numeric: true, sensitivity: "base" }));
+  const archiveFiles = materializeFiles
+    .filter((entry) => entry.kind === "zip" || entry.kind === "7z" || entry.kind === "rar-part" || !/\.part\d+\.rar$/i.test(entry.file.name));
+  const tempExtractPath = join(env.VFS_TMP_DIR, "mounted-extract", download.id);
+  const tempArchivePath = join(tempExtractPath, ".archives");
+  await rm(tempExtractPath, { recursive: true, force: true }).catch(() => undefined);
+  await mkdir(tempExtractPath, { recursive: true });
+  await mkdir(tempArchivePath, { recursive: true });
+
+  try {
+    const materializedArchives = await Promise.all(
+      materializeFiles.map(async (entry) => ({
+        archivePath: await materializeMountedArchive({
+          mountedPath: entry.file.path,
+          archiveName: entry.file.name,
+          outputDir: tempArchivePath,
+          size: entry.file.size
+        }),
+        kind: entry.kind
+      }))
+    );
+    const extracted = await extractArchiveFiles(
+      materializedArchives.filter((entry) =>
+        entry.kind === "zip"
+        || entry.kind === "7z"
+        || entry.kind === "rar-part"
+        || (entry.kind === "rar" && !/\.part\d+\.rar$/i.test(entry.archivePath))
+      ),
+      { outputRootDir: tempExtractPath }
+    );
+    if (extracted.length === 0) throw new Error("mounted NZB contains no extractable archive files");
+
+    const imported = await importCompletedPath({
+      sourcePath: tempExtractPath,
+      downloadId: download.id,
+      requestId: input.requestId
+    });
+    if (imported.length === 0) throw new Error("mounted archive extraction produced no importable media files");
+
+    await prisma.download.update({
+      where: { id: download.id },
+      data: { status: "available", progress: 100, speedBytesSec: 0, etaSeconds: 0, completedAt: new Date(), error: null }
+    });
+    if (input.requestId) {
+      await reconcileRequestStatusAfterImport(input.requestId, download.id);
+    } else {
+      await prisma.mediaRequest.updateMany({ where: { downloadId: download.id }, data: { status: "available" } });
+    }
+    await refreshMediaLibrary();
+    return { downloadId: download.id, imports: imported };
+  } finally {
+    await rm(tempExtractPath, { recursive: true, force: true }).catch(() => undefined);
+  }
 }
 
 export async function repairSuspiciousImports() {
@@ -318,7 +496,47 @@ async function findWorkingImportByIdentity(media: Partial<ImportMedia>) {
     season: media.season,
     episode: media.episode
   });
-  return candidates.find((item) => mediaIdentityKey(item) === key) ?? null;
+  for (const item of candidates) {
+    if (mediaIdentityKey(item) !== key) continue;
+    if (!item.completedPath.startsWith("/mounted/")) return item;
+    const fileId = mountedFileIdFromPath(item.completedPath);
+    if (!fileId) continue;
+    const nzbFile = await prisma.nzbFile.findUnique({ where: { id: fileId }, select: { subject: true } });
+    if (!nzbFile?.subject || /\.par2\b/i.test(nzbFile.subject)) continue;
+    return item;
+  }
+  return null;
+}
+
+async function isPar2MountedImportPath(path: string) {
+  if (!path.startsWith("/mounted/")) return false;
+  const fileId = mountedFileIdFromPath(path);
+  if (!fileId) return false;
+  const nzbFile = await prisma.nzbFile.findUnique({ where: { id: fileId }, select: { subject: true } });
+  return Boolean(nzbFile?.subject && /\.par2\b/i.test(nzbFile.subject));
+}
+
+async function findRepairableMountedImport(downloadId: string, requestId: string | undefined, media: Partial<ImportMedia>) {
+  const items = await prisma.importItem.findMany({
+    where: { downloadId, completedPath: { startsWith: "/mounted/" } },
+    include: { symlinks: true },
+    orderBy: { createdAt: "asc" }
+  });
+  const expectedKey = media.mediaType && media.title
+    ? mediaIdentityKey({
+        mediaType: media.mediaType,
+        title: media.title,
+        year: media.year,
+        season: media.season,
+        episode: media.episode
+      })
+    : null;
+  for (const item of items) {
+    if (requestId && item.requestId && item.requestId !== requestId) continue;
+    if (expectedKey && mediaIdentityKey(item) !== expectedKey) continue;
+    if (await isPar2MountedImportPath(item.completedPath)) return item;
+  }
+  return null;
 }
 
 export function listImports() {

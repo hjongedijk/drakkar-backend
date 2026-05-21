@@ -11,8 +11,12 @@ export function detectArchive(path: string): ArchiveKind {
   if (/\.part0*1\.rar$/.test(name)) return "rar-part";
   if (name.endsWith(".rar")) return "rar";
   if (name.endsWith(".zip")) return "zip";
-  if (name.endsWith(".7z")) return "7z";
+  if (name.endsWith(".7z") || /\.7z\.\d+$/.test(name)) return "7z";
   return "none";
+}
+
+export function isPar2File(path: string) {
+  return basename(path).toLowerCase().endsWith(".par2");
 }
 
 export function isMediaFile(path: string) {

@@ -58,6 +58,13 @@ export type DiscoverMediaItem = {
   overview?: string;
 };
 
+export type DiscoverListResponse = {
+  mediaType: "movie" | "tv";
+  page: number;
+  totalPages: number;
+  items: DiscoverMediaItem[];
+};
+
 export type CalendarMediaInfo = {
   mediaType: "movie" | "tv";
   title?: string;
@@ -366,6 +373,24 @@ export async function fetchDiscoverHome(settings: AppSettings) {
   return {
     movies: topMovies.map((item, index) => discoverItemFromTmdb(item, "movie", movieIds[index])),
     tv: topTv.map((item, index) => discoverItemFromTmdb(item, "tv", tvIds[index]))
+  };
+}
+
+export async function fetchDiscoverList(settings: AppSettings, mediaType: "movie" | "tv", page = 1): Promise<DiscoverListResponse> {
+  const normalizedPage = Math.max(1, Math.trunc(page) || 1);
+  const endpoint = mediaType === "movie" ? "trending/movie/day" : "trending/tv/day";
+  const results = await tmdbFetch<{ results: TmdbSearchResult[]; total_pages?: number }>(settings, endpoint, {
+    page: String(normalizedPage)
+  });
+  const items = results?.results ?? [];
+  const externalIds = await Promise.all(
+    items.map((item) => tmdbExternalIds(settings, mediaType, String(item.id)).catch(() => undefined))
+  );
+  return {
+    mediaType,
+    page: normalizedPage,
+    totalPages: Math.max(1, results?.total_pages ?? 1),
+    items: items.map((item, index) => discoverItemFromTmdb(item, mediaType, externalIds[index]))
   };
 }
 

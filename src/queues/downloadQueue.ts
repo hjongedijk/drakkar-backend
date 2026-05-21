@@ -37,9 +37,10 @@ export async function queueDownloadJob(
   data: DownloadJobData,
   options?: JobsOptions
 ) {
+  const normalizedPriority = Number(input.priority ?? 0);
   return nzbDownloadQueue.add(name, data, {
     timestamp: input.createdAt.getTime(),
-    priority: queuePriority(input.priority),
+    ...(normalizedPriority > 0 ? { priority: queuePriority(normalizedPriority) } : {}),
     ...options
   });
 }

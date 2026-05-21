@@ -1,6 +1,7 @@
 import type { FastifyInstance } from "fastify";
 import { prisma } from "../db/prisma.js";
 import { redis } from "../db/redis.js";
+import { classifyRepairOutcome, deriveImportHealth, estimateHealthProgress, isCompletedHealthJob } from "../health/checks.js";
 
 export async function healthRoutes(app: FastifyInstance): Promise<void> {
   app.get("/health", {
@@ -66,6 +67,7 @@ export async function healthRoutes(app: FastifyInstance): Promise<void> {
   });
 
   app.get("/api/health/checks", async () => {
+    const historyWindowStart = new Date(Date.now() - 30 * 24 * 60 * 60 * 1000);
     const [imports, repairJobs] = await Promise.all([
       prisma.importItem.findMany({
         include: {
@@ -88,13 +90,9 @@ export async function healthRoutes(app: FastifyInstance): Promise<void> {
     const scheduleItems = imports.map((item) => {
       const repair = item.downloadId ? latestRepairByDownload.get(item.downloadId) : undefined;
       const primarySymlink = item.symlinks[0];
-      const repairPassed = Boolean(repair && repair.status === "completed" && /passed|playable video|healthy/i.test(repair.message ?? ""));
-      const healthy = repairPassed || (!primarySymlink || primarySymlink.status === "ok");
-      const repaired = Boolean(repair && repair.status === "completed" && /repair/i.test(repair.type));
-      const deleted = Boolean(repair && /deleted/i.test(repair.message ?? ""));
       const lastCheck = repair?.completedAt ?? repair?.updatedAt ?? null;
       const nextCheck = lastCheck ? new Date(lastCheck.getTime() + 10 * 60 * 1000) : null;
-      const activeProgress = repair?.status === "running" ? 55 : 0;
+      const activeProgress = estimateHealthProgress(repair);
       return {
         id: item.id,
         name: item.title,
@@ -103,15 +101,24 @@ export async function healthRoutes(app: FastifyInstance): Promise<void> {
         lastCheckAt: lastCheck?.toISOString() ?? null,
         nextCheckAt: activeProgress > 0 ? null : nextCheck?.toISOString() ?? null,
         progress: activeProgress,
-        health: healthy ? "healthy" : deleted ? "deleted" : repaired ? "repaired" : "unknown",
+        health: deriveImportHealth({ repair, primarySymlink }),
         status: repair?.status ?? "scheduled"
       };
+    }).sort((a, b) => {
+      const aDue = a.nextCheckAt ? Date.parse(a.nextCheckAt) : -1;
+      const bDue = b.nextCheckAt ? Date.parse(b.nextCheckAt) : -1;
+      return aDue - bDue || Date.parse(a.createdAt.toISOString()) - Date.parse(b.createdAt.toISOString());
     });
 
-    const totalChecked = scheduleItems.filter((item) => item.lastCheckAt).length;
-    const healthyCount = scheduleItems.filter((item) => item.health === "healthy").length;
-    const repairedCount = scheduleItems.filter((item) => item.health === "repaired").length;
-    const deletedCount = scheduleItems.filter((item) => item.health === "deleted").length;
+    const recentResults = repairJobs
+      .filter((job) => isCompletedHealthJob(job))
+      .filter((job) => (job.completedAt ?? job.updatedAt) >= historyWindowStart)
+      .map((job) => classifyRepairOutcome(job))
+      .filter((outcome) => outcome !== "unknown");
+    const totalChecked = recentResults.length;
+    const healthyCount = recentResults.filter((item) => item === "healthy").length;
+    const repairedCount = recentResults.filter((item) => item === "repaired").length;
+    const deletedCount = recentResults.filter((item) => item === "deleted").length;
     const uncheckedCount = scheduleItems.filter((item) => !item.lastCheckAt).length;
 
     return {

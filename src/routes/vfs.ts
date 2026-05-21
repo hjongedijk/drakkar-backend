@@ -1,7 +1,6 @@
 import type { FastifyInstance, FastifyReply, FastifyRequest } from "fastify";
 import { listVfs, readVfsBytes, refreshVfs, statVfs, streamVfsFile, treeVfs } from "../vfs/vfsService.js";
 import { listMounts } from "../vfs/mountedNzbService.js";
-import { createBrowserPlayableStream } from "../streaming/browserPlay.service.js";
 import { getStreamMetrics, listActiveStreamSessions, stopStreamSession } from "../streaming/mountedStream.service.js";
 import { planMountedFileRange } from "../streaming/rangePlanner.service.js";
 import { getBandwidthStatus } from "../bandwidth/bandwidthScheduler.js";
@@ -47,15 +46,6 @@ export async function vfsRoutes(app: FastifyInstance): Promise<void> {
 
   app.get("/api/vfs/file", sendFile);
   app.get("/api/vfs/stream", sendFile);
-  app.get("/api/vfs/play", async (request, reply) => {
-    const query = request.query as { path?: string };
-    if (!query.path) return reply.status(400).send({ error: "path is required" });
-    const playable = await createBrowserPlayableStream(query.path);
-    reply.header("content-type", playable.contentType);
-    reply.header("cache-control", "no-store");
-    reply.raw.on("close", () => playable.kill());
-    return reply.send(playable.stream);
-  });
   app.get("/api/vfs/subtitle", async (request, reply) => {
     const query = request.query as { path?: string };
     if (!query.path) return reply.status(400).send({ error: "path is required" });

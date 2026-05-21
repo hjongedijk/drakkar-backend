@@ -68,6 +68,23 @@ export function decodeYenc(body: string): Buffer {
   return out.subarray(0, outIndex);
 }
 
+export function decodeYencLine(line: string): Buffer {
+  const out = Buffer.allocUnsafe(line.length);
+  let outIndex = 0;
+
+  for (let index = 0; index < line.length; index += 1) {
+    let value = line.charCodeAt(index) & 0xff;
+    if (value === 61) {
+      index += 1;
+      value = ((line.charCodeAt(index) & 0xff) - 64 + 256) % 256;
+    }
+    out[outIndex] = (value - 42 + 256) % 256;
+    outIndex += 1;
+  }
+
+  return out.subarray(0, outIndex);
+}
+
 export function decodeArticleBody(body: string): Buffer {
   return body.includes("=ybegin") ? decodeYenc(body) : Buffer.from(body, "binary");
 }

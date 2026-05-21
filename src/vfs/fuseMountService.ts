@@ -5,6 +5,8 @@ import { promisify } from "node:util";
 import Fuse, { type OPERATIONS, type Stats } from "@zkochan/fuse-native";
 import type { FastifyBaseLogger } from "fastify";
 import { env } from "../config/env.js";
+import { getPolicySettings } from "../policies/policyService.js";
+import { closeMountedReadSession } from "../streaming/mountedStream.service.js";
 import { listVfs, readVfsBytes, statVfs, type VfsNodeType } from "./vfsService.js";
 
 let fuseInstance: Fuse | null = null;
@@ -130,7 +132,9 @@ function fuseOperations(): OPERATIONS {
       asyncFuse(
         async () => {
           const handlePath = fileHandles.get(fd) ?? path;
-          const data = await readVfsBytes(handlePath, position, length, String(fd));
+          const policies = await getPolicySettings();
+          const maxReadLength = Math.max(512 * 1024, Math.min(policies.streamChunkSizeBytes, 4 * 1024 * 1024));
+          const data = await readVfsBytes(handlePath, position, Math.min(length, maxReadLength), String(fd));
           data.copy(buffer, 0, 0, data.length);
           return data.length;
         },
@@ -140,6 +144,7 @@ function fuseOperations(): OPERATIONS {
     },
 
     release(_path, fd, callback) {
+      closeMountedReadSession(String(fd));
       fileHandles.delete(fd);
       process.nextTick(callback, 0);
     },
