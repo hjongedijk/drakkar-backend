@@ -1,24 +1,67 @@
 import type { MediaRequest, Prisma, RequestProvider } from "@prisma/client";
 import { prisma } from "../../db/prisma.js";
 import { redis } from "../../db/redis.js";
-import { downloadNzb } from "../../indexers/nzbhydra/client.js";
+import { downloadNzb, refreshNzbhydraUpdateFeeds } from "../../indexers/nzbhydra/client.js";
 import { refreshMediaLibrary } from "../../media-library/libraryService.js";
 import { fetchSeasonEpisodes, fetchSeriesStructure } from "../../metadata/metadataService.js";
 import { runSearch } from "../../search/searchService.js";
 import { getSettings } from "../../settings/settingsStore.js";
-import { addNzbFromPath } from "../../downloads/downloadService.js";
+import { addNzbFromPath, findReusableDownload } from "../../downloads/downloadService.js";
 import { mediaIdentityKey } from "../../media-library/identity.js";
 import { scoreRelease } from "../../quality/scoring.js";
 import { ensureDefaultProfiles } from "../../quality/profileService.js";
 import { createBlocklistItem, isReleaseBlocklisted } from "../../policies/policyService.js";
-import { fetchSeerrRequests, testSeerrConnection, updateSeerrAvailable } from "../seerr/client.js";
+import { createSeerrRequest, fetchSeerrRequests, testSeerrConnection, updateSeerrAvailable } from "../seerr/client.js";
 import type { ExternalMediaRequest } from "../types.js";
 
 const TV_ACTIVE_DOWNLOAD_STATUSES = ["queued", "fetching_nzb", "verifying", "prepared", "waiting_for_provider", "waiting_for_nzb", "downloading", "paused"];
 const SEARCH_COOLDOWN_SECONDS = 300;
+const REQUEST_RELEASE_CACHE_SECONDS = 6 * 60 * 60;
+
+function isAiredDate(value?: string | null) {
+  if (!value) return true;
+  const timestamp = Date.parse(value);
+  if (!Number.isFinite(timestamp)) return true;
+  return timestamp <= Date.now() + 12 * 60 * 60 * 1000;
+}
+
+function intersectEpisodes(left: Set<number>, right: Set<number>) {
+  return new Set([...left].filter((episode) => right.has(episode)));
+}
 
 async function fetchProviderRequests(provider: RequestProvider) {
   return fetchSeerrRequests(provider);
+}
+
+type SyncRequestAction = "created" | "updated" | "skipped";
+
+type SyncProviderResult = {
+  providerId: string;
+  providerName: string;
+  fetched: number;
+  imported: number;
+  updated: number;
+  skipped: number;
+  ok: boolean;
+  error?: string;
+};
+
+async function reuseExistingReleaseDownload(requestId: string, release: { guid?: unknown; title: string }) {
+  const reusable = await findReusableDownload({
+    guid: release.guid === undefined || release.guid === null ? undefined : String(release.guid),
+    title: release.title
+  });
+  if (!reusable) return null;
+  await prisma.mediaRequest.update({
+    where: { id: requestId },
+    data: {
+      status: requestStatusForDownloadStatus(reusable.status),
+      selectedRelease: jsonValue(release),
+      downloadId: reusable.id
+    }
+  });
+  await refreshMediaLibrary().catch(() => undefined);
+  return reusable;
 }
 
 async function updateProviderAvailable(provider: RequestProvider, externalId: string) {
@@ -123,38 +166,67 @@ export async function syncRequests(providerId?: string) {
     where: { enabled: true, ...(providerId ? { id: providerId } : {}) }
   });
   const imported: MediaRequest[] = [];
-  const providerResults: { providerId: string; providerName: string; imported: number; ok: boolean; error?: string }[] = [];
+  const providerResults: SyncProviderResult[] = [];
+  let createdCount = 0;
+  let updatedCount = 0;
+  let skippedCount = 0;
 
   for (const provider of providers) {
+    let fetchedForProvider = 0;
     let importedForProvider = 0;
+    let updatedForProvider = 0;
+    let skippedForProvider = 0;
     try {
       const requests = await fetchProviderRequests(provider);
+      fetchedForProvider = requests.length;
       const syncedRequests: MediaRequest[] = [];
       for (const request of requests) {
         const hydrated = await enrichTvRequestWithStructure(request);
-        const synced = await upsertRequest(provider, hydrated);
+        const { request: synced, action } = await upsertRequest(provider, hydrated);
         imported.push(synced);
         syncedRequests.push(synced);
-        importedForProvider += 1;
+        if (action === "created") {
+          importedForProvider += 1;
+          createdCount += 1;
+        } else if (action === "updated") {
+          updatedForProvider += 1;
+          updatedCount += 1;
+        } else {
+          skippedForProvider += 1;
+          skippedCount += 1;
+        }
       }
       await prisma.requestProvider.update({ where: { id: provider.id }, data: { lastSyncAt: new Date(), lastError: null } });
-      providerResults.push({ providerId: provider.id, providerName: provider.name, imported: importedForProvider, ok: true });
+      providerResults.push({
+        providerId: provider.id,
+        providerName: provider.name,
+        fetched: fetchedForProvider,
+        imported: importedForProvider,
+        updated: updatedForProvider,
+        skipped: skippedForProvider,
+        ok: true
+      });
 
+      const autoGrabCandidates = [];
       for (const synced of syncedRequests) {
-        if (shouldAutoGrabSyncedRequest(synced)) {
-          try {
-            if (synced.mediaType === "tv") await grabMissingTvForRequest(synced.id);
-            else await grabBestForRequest(synced.id);
-          } catch (error) {
-            await prisma.mediaRequest.update({
-              where: { id: synced.id },
-              data: { status: "approved", downloadId: null }
-            }).catch(() => undefined);
-            await prisma.requestProvider.update({
-              where: { id: provider.id },
-              data: { lastError: error instanceof Error ? error.message : "automatic request grab failed" }
-            }).catch(() => undefined);
-          }
+        if (await shouldAutoGrabSyncedRequest(synced)) autoGrabCandidates.push(synced);
+      }
+      if (autoGrabCandidates.length > 0) {
+        await refreshNzbhydraUpdateFeeds(await getSettings()).catch(() => undefined);
+      }
+      for (const synced of autoGrabCandidates) {
+        try {
+          if (synced.mediaType === "tv") await grabMissingTvForRequest(synced.id);
+          else await grabBestForRequest(synced.id);
+        } catch (error) {
+          await prisma.mediaRequest.update({
+            where: { id: synced.id },
+            data: { status: "approved", downloadId: null }
+          }).catch(() => undefined);
+          await prisma.requestProvider.update({
+            where: { id: provider.id },
+            data: { lastError: error instanceof Error ? error.message : "automatic request grab failed" }
+          }).catch(() => undefined);
         }
       }
     } catch (error) {
@@ -163,13 +235,25 @@ export async function syncRequests(providerId?: string) {
         where: { id: provider.id },
         data: { lastError: message }
       });
-      providerResults.push({ providerId: provider.id, providerName: provider.name, imported: importedForProvider, ok: false, error: message });
+      providerResults.push({
+        providerId: provider.id,
+        providerName: provider.name,
+        fetched: fetchedForProvider,
+        imported: importedForProvider,
+        updated: updatedForProvider,
+        skipped: skippedForProvider,
+        ok: false,
+        error: message
+      });
     }
   }
 
   await refreshMediaLibrary().catch(() => undefined);
   return {
-    imported: imported.length,
+    imported: createdCount,
+    updated: updatedCount,
+    skipped: skippedCount,
+    fetched: createdCount + updatedCount + skippedCount,
     requests: imported,
     providerResults,
     failedProviders: providerResults.filter((item) => !item.ok).length
@@ -188,22 +272,26 @@ export async function recoverFailedRequestDownloads() {
     const download = request.downloadId ? await prisma.download.findUnique({ where: { id: request.downloadId } }) : null;
     if (!download) {
       await prisma.mediaRequest.update({ where: { id: request.id }, data: { status: "release_failed", downloadId: null } });
-      recovered.push(await grabBestForRequest(request.id));
+      recovered.push(await grabForRequestMediaType(request.id, request.mediaType));
       continue;
     }
     if (download.status !== "failed") continue;
     await blocklistSelectedRelease(request, download.error ?? "download failed", "request-recovery");
     await prisma.mediaRequest.update({ where: { id: request.id }, data: { status: "release_failed", downloadId: null } });
-    recovered.push(await grabBestForRequest(request.id));
+    recovered.push(await grabForRequestMediaType(request.id, request.mediaType));
   }
   await refreshMediaLibrary().catch(() => undefined);
   return { recovered: recovered.length, results: recovered };
 }
 
+async function grabForRequestMediaType(id: string, mediaType: string) {
+  return mediaType === "tv" ? grabMissingTvForRequest(id) : grabBestForRequest(id);
+}
+
 export async function ensureMonitoredRequests() {
   const requests = await prisma.mediaRequest.findMany({
     where: {
-      status: { in: ["approved", "grabbed", "available", "release_failed", "no_release_found", "auto_grab_failed", "import_failed"] }
+      status: { in: ["approved", "grabbed", "available", "release_failed", "no_release_found", "auto_grab_failed"] }
     }
   });
 
@@ -255,16 +343,47 @@ function statusFromExternal(externalStatus?: string | null, mediaType?: string) 
   return "pending";
 }
 
-function shouldAutoGrabSyncedRequest(request: MediaRequest) {
-  return request.externalStatus === "2" && (request.mediaType === "tv" || !request.downloadId) && ["pending", "approved", "grabbed", "available", "no_release_found", "auto_grab_failed"].includes(request.status);
+async function shouldAutoGrabSyncedRequest(request: MediaRequest) {
+  if (request.externalStatus !== "2") return false;
+  if (!["pending", "approved", "grabbed", "no_release_found", "auto_grab_failed", "release_failed"].includes(request.status)) return false;
+  const activeDownload = await existingActiveDownload(request.downloadId).catch(() => null);
+  if (activeDownload) return false;
+  if (request.mediaType !== "tv") {
+    return !(await findWorkingImportForRequest(request).catch(() => null));
+  }
+  const monitor = await getRequestMonitor(request.id).catch(() => null);
+  if (!monitor) return true;
+  return monitor.seasons.some((season) => season.missingCount > 0);
 }
 
-async function upsertRequest(provider: RequestProvider, request: ExternalMediaRequest) {
+function normalizeJson(value: unknown) {
+  return value === undefined ? undefined : JSON.stringify(value);
+}
+
+function requestNeedsUpdate(existing: MediaRequest, next: ExternalMediaRequest, nextStatus: string, clearDownloadId: boolean) {
+  return (
+    existing.title !== next.title ||
+    existing.year !== next.year ||
+    existing.tmdbId !== next.tmdbId ||
+    existing.tvdbId !== next.tvdbId ||
+    existing.imdbId !== next.imdbId ||
+    existing.requestedBy !== next.requestedBy ||
+    existing.requestedQuality !== next.requestedQuality ||
+    existing.externalStatus !== next.externalStatus ||
+    existing.status !== nextStatus ||
+    normalizeJson(existing.seasons) !== normalizeJson(next.seasons) ||
+    normalizeJson(existing.episodes) !== normalizeJson(next.episodes) ||
+    clearDownloadId
+  );
+}
+
+async function upsertRequest(provider: RequestProvider, request: ExternalMediaRequest): Promise<{ request: MediaRequest; action: SyncRequestAction }> {
   const existing = await prisma.mediaRequest.findUnique({
     where: { providerId_externalId: { providerId: provider.id, externalId: request.externalId } }
   });
   const linkedDownload = existing?.downloadId ? await prisma.download.findUnique({ where: { id: existing.downloadId } }) : null;
   const hasLiveLinkedDownload = Boolean(linkedDownload);
+  const clearDownloadId = Boolean(existing?.downloadId && !hasLiveLinkedDownload);
   const nextStatus =
     request.externalStatus === "2" && hasLiveLinkedDownload
       ? existing?.status ?? "approved"
@@ -272,7 +391,11 @@ async function upsertRequest(provider: RequestProvider, request: ExternalMediaRe
         ? "approved"
         : existing?.status ?? statusFromExternal(request.externalStatus, request.mediaType);
 
-  return prisma.mediaRequest.upsert({
+  if (existing && !requestNeedsUpdate(existing, request, nextStatus, clearDownloadId)) {
+    return { request: existing, action: "skipped" };
+  }
+
+  const synced = await prisma.mediaRequest.upsert({
     where: { providerId_externalId: { providerId: provider.id, externalId: request.externalId } },
     update: {
       title: request.title,
@@ -286,7 +409,7 @@ async function upsertRequest(provider: RequestProvider, request: ExternalMediaRe
       requestedQuality: request.requestedQuality,
       externalStatus: request.externalStatus,
       status: nextStatus,
-      ...(existing?.downloadId && !hasLiveLinkedDownload ? { downloadId: null } : {})
+      ...(clearDownloadId ? { downloadId: null } : {})
     },
     create: {
       providerId: provider.id,
@@ -305,6 +428,8 @@ async function upsertRequest(provider: RequestProvider, request: ExternalMediaRe
       status: statusFromExternal(request.externalStatus, request.mediaType)
     }
   });
+
+  return { request: synced, action: existing ? "updated" : "created" };
 }
 
 export async function listRequests() {
@@ -322,6 +447,73 @@ export async function listRequests() {
 
 export function getRequest(id: string) {
   return prisma.mediaRequest.findUniqueOrThrow({ where: { id }, include: { provider: true } });
+}
+
+export async function createManualRequest(input: {
+  mediaType: "movie" | "tv";
+  title: string;
+  year?: number;
+  tmdbId?: string;
+  tvdbId?: string;
+  imdbId?: string;
+}) {
+  const provider = await prisma.requestProvider.findFirst({ where: { type: "seerr", enabled: true }, orderBy: { createdAt: "asc" } });
+  const externalResult = provider && input.tmdbId
+    ? await createSeerrRequest(provider, { mediaType: input.mediaType, tmdbId: input.tmdbId }).catch((error) => ({ ok: false, status: 0, body: { message: error instanceof Error ? error.message : "Seerr request failed" } }))
+    : null;
+  const externalId = externalResult?.ok && externalResult.body && typeof externalResult.body === "object" && "id" in externalResult.body
+    ? String((externalResult.body as { id: unknown }).id)
+    : `manual:${input.mediaType}:${input.tmdbId ?? input.tvdbId ?? input.imdbId ?? mediaIdentityKey(input)}`;
+  const profileId = input.mediaType === "tv" ? provider?.defaultTvProfile : provider?.defaultMovieProfile;
+  const manualRequest: ExternalMediaRequest = {
+    ...input,
+    externalId,
+    requestedBy: "Drakkar",
+    externalStatus: externalResult?.ok ? "2" : "manual"
+  };
+  const enriched = input.mediaType === "tv"
+    ? await enrichTvRequestWithStructure(manualRequest).catch(() => manualRequest)
+    : manualRequest;
+
+  const existing = provider
+    ? await prisma.mediaRequest.findUnique({ where: { providerId_externalId: { providerId: provider.id, externalId } } })
+    : await prisma.mediaRequest.findFirst({ where: { providerId: null, externalId } });
+  const data = {
+    providerId: provider?.id,
+    externalId,
+    mediaType: input.mediaType,
+    title: enriched.title,
+    year: enriched.year,
+    tmdbId: enriched.tmdbId,
+    tvdbId: enriched.tvdbId,
+    imdbId: enriched.imdbId,
+    seasons: jsonValue(enriched.seasons),
+    episodes: jsonValue(enriched.episodes),
+    requestedBy: enriched.requestedBy,
+    externalStatus: enriched.externalStatus,
+    status: "approved",
+    selectedProfileId: profileId
+  };
+
+  const request = existing
+    ? await prisma.mediaRequest.update({
+      where: { id: existing.id },
+      data: {
+      title: enriched.title,
+      year: enriched.year,
+      tmdbId: enriched.tmdbId,
+      tvdbId: enriched.tvdbId,
+      imdbId: enriched.imdbId,
+      seasons: jsonValue(enriched.seasons),
+      episodes: jsonValue(enriched.episodes),
+      requestedBy: enriched.requestedBy,
+      externalStatus: enriched.externalStatus,
+      status: "approved",
+      selectedProfileId: profileId
+      }
+    })
+    : await prisma.mediaRequest.create({ data });
+  return { request, seerr: externalResult };
 }
 
 export async function getRequestMonitor(id: string) {
@@ -421,14 +613,17 @@ export async function getRequestMonitor(id: string) {
         ? await fetchSeasonEpisodes(settings, structure.tmdbId, season.seasonNumber).catch(() => [])
         : [];
       const episodeNameByNumber = new Map(episodeMetadata.map((episode) => [episode.episodeNumber, episode.name]));
+      const episodeAirDateByNumber = new Map(episodeMetadata.map((episode) => [episode.episodeNumber, episode.airDate]));
       const episodes = Array.from({ length: episodeCount }, (_, index) => index + 1).map((episodeNumber) => {
-        const monitored = monitorWholeSeason || monitoredEpisodes?.has(episodeNumber) || false;
+        const aired = isAiredDate(episodeAirDateByNumber.get(episodeNumber));
+        const monitored = aired && (monitorWholeSeason || monitoredEpisodes?.has(episodeNumber) || false);
         const available = availableBySeason.get(season.seasonNumber)?.has(episodeNumber) ?? false;
         const downloading = downloadingBySeason.get(season.seasonNumber)?.has(episodeNumber) ?? false;
         const status = available ? "available" : downloading ? "downloading" : monitored ? "missing_monitored" : "missing_unmonitored";
         return {
           episodeNumber,
           title: episodeNameByNumber.get(episodeNumber),
+          airDate: episodeAirDateByNumber.get(episodeNumber),
           monitored,
           available,
           downloading,
@@ -461,6 +656,8 @@ export function setRequestStatus(id: string, status: string) {
 
 export async function searchForRequest(id: string) {
   const request = await getRequest(id);
+  const cached = await cachedRequestReleases(request);
+  if (cached) return { request, releases: cached };
   const season = firstRequestedSeason(request.seasons);
   const releases = await runSearch({
     kind: request.mediaType === "tv" && season ? "season" : request.mediaType === "tv" ? "tv" : "movie",
@@ -470,7 +667,31 @@ export async function searchForRequest(id: string) {
     tvdbId: request.tvdbId ?? undefined,
     season
   });
+  await cacheRequestReleases(request, releases);
   return { request, releases };
+}
+
+function requestReleaseCacheKey(request: MediaRequest) {
+  return `request:release-cache:${request.id}:${Buffer.from(JSON.stringify({
+    mediaType: request.mediaType,
+    title: request.title,
+    imdbId: request.imdbId,
+    tmdbId: request.tmdbId,
+    tvdbId: request.tvdbId,
+    seasons: request.seasons,
+    episodes: request.episodes
+  })).toString("base64url")}`;
+}
+
+async function cachedRequestReleases(request: MediaRequest) {
+  const cached = await redis.get(requestReleaseCacheKey(request)).catch(() => null);
+  if (!cached) return null;
+  return JSON.parse(cached) as Awaited<ReturnType<typeof runSearch>>;
+}
+
+async function cacheRequestReleases(request: MediaRequest, releases: Awaited<ReturnType<typeof runSearch>>) {
+  if (releases.length === 0) return;
+  await redis.set(requestReleaseCacheKey(request), JSON.stringify(releases), "EX", REQUEST_RELEASE_CACHE_SECONDS).catch(() => undefined);
 }
 
 function firstRequestedSeason(value: Prisma.JsonValue | null | undefined) {
@@ -514,6 +735,45 @@ export async function rankReleasesForRequest(id: string) {
   return { request, profile, releases: ranked };
 }
 
+export async function rankTvEpisodeForRequest(id: string, season: number, episode: number) {
+  const request = await getRequest(id);
+  if (request.mediaType !== "tv") throw new Error("request is not a TV request");
+  const settings = await getSettings();
+  const configuredProfileId = request.selectedProfileId ?? request.provider?.defaultTvProfile ?? settings.defaultTvProfile;
+  const profile = await resolveProfile(configuredProfileId, request.mediaType);
+  const releases = await runSearch({
+    kind: "episode",
+    query: request.title,
+    imdbId: request.imdbId ?? undefined,
+    tmdbId: request.tmdbId ?? undefined,
+    tvdbId: request.tvdbId ?? undefined,
+    season,
+    episode
+  });
+  const ranked = await Promise.all(
+    releases.map(async (release) => ({
+      release,
+      decision: (await isReleaseBlocklisted(release))
+        ? { ...scoreRelease(release, profile), accepted: false, score: -1000, reasons: ["release is blocklisted"] }
+        : scoreRelease(release, profile)
+    }))
+  );
+  ranked.sort((a, b) => b.decision.score - a.decision.score);
+  return { request, profile, releases: ranked };
+}
+
+export async function grabTvEpisodeForRequest(id: string, season: number, episode: number) {
+  const request = await getRequest(id);
+  if (request.mediaType !== "tv") throw new Error("request is not a TV request");
+  const existingEpisodes = await existingEpisodesForSeason(request.id, request.title, season);
+  if (existingEpisodes.has(episode)) {
+    return { grabbed: false, reason: "episode already available or downloading", season, episode };
+  }
+  const result = await grabBestTvSeasonForRequest(request, season, existingEpisodes, new Set([episode]));
+  await refreshMediaLibrary().catch(() => undefined);
+  return { season, episode, ...result };
+}
+
 export async function grabBestForRequest(id: string) {
   const request = await getRequest(id);
   const workingImport = await findWorkingImportForRequest(request);
@@ -548,6 +808,8 @@ export async function grabBestForRequest(id: string) {
 
   const rejected: string[] = [];
   for (const candidate of ranked) {
+    const reusable = await reuseExistingReleaseDownload(id, candidate.release);
+    if (reusable) return { grabbed: true, release: candidate.release, decision: candidate.decision, download: reusable, reused: true };
     let download: Awaited<ReturnType<typeof addNzbFromPath>>;
     try {
       const nzb = await downloadNzb(settings, candidate.release);
@@ -609,7 +871,7 @@ export async function grabMissingTvForRequest(id: string) {
       : []
   );
 
-  const results = [];
+  const seasonsNeedingSearch: Array<{ season: number; existingEpisodes: Set<number>; requestedSeasonEpisodes?: Set<number> }> = [];
   for (const season of seasons) {
     if (await hasActiveSeasonPackDownload(request.title, season)) continue;
     const existingEpisodes = await existingEpisodesForSeason(request.id, request.title, season);
@@ -617,7 +879,23 @@ export async function grabMissingTvForRequest(id: string) {
     const knownEpisodeCount = seasonEpisodeCounts.get(season) ?? 0;
     if (requestedSeasonEpisodes && requestedSeasonEpisodes.size > 0 && [...requestedSeasonEpisodes].every((episode) => existingEpisodes.has(episode))) continue;
     if ((!requestedSeasonEpisodes || requestedSeasonEpisodes.size === 0) && knownEpisodeCount > 0 && existingEpisodes.size >= knownEpisodeCount) continue;
-    const result = await grabBestTvSeasonForRequest(request, season, existingEpisodes, requestedSeasonEpisodes);
+    seasonsNeedingSearch.push({ season, existingEpisodes, requestedSeasonEpisodes });
+  }
+  if (seasonsNeedingSearch.length === 0) {
+    await prisma.mediaRequest.update({ where: { id: request.id }, data: { status: "available" } }).catch(() => undefined);
+    await refreshMediaLibrary().catch(() => undefined);
+    return { grabbed: false, reason: "all requested episodes already available", seasons: [] };
+  }
+  const broadReleases = await runSearch({
+    kind: "tv",
+    query: request.title,
+    imdbId: request.imdbId ?? undefined,
+    tmdbId: request.tmdbId ?? undefined,
+    tvdbId: request.tvdbId ?? undefined
+  }).catch(() => []);
+  const results = [];
+  for (const { season, existingEpisodes, requestedSeasonEpisodes } of seasonsNeedingSearch) {
+    const result = await grabBestTvSeasonForRequest(request, season, existingEpisodes, requestedSeasonEpisodes, broadReleases);
     results.push({ season, result });
   }
 
@@ -720,7 +998,8 @@ async function grabBestTvSeasonForRequest(
   request: MediaRequest & { provider?: RequestProvider | null },
   season: number,
   existingEpisodes = new Set<number>(),
-  requestedEpisodes?: Set<number>
+  requestedEpisodes?: Set<number>,
+  releasePool?: Parameters<typeof scoreRelease>[0][]
 ) {
   if (await seasonSearchCoolingDown(request.id, season)) {
     return { grabbed: false, reason: "season search cooling down after recent unsuccessful attempt", queued: [], rejected: [] };
@@ -736,15 +1015,27 @@ async function grabBestTvSeasonForRequest(
     tvdbId: request.tvdbId,
     imdbId: request.imdbId
   }).catch(() => undefined);
-  const seasonEpisodeCount = seriesStructure?.seasons.find((item) => item.seasonNumber === season)?.episodeCount;
-  const releases = await runSearch({
-    kind: "season",
-    query: request.title,
-    imdbId: request.imdbId ?? undefined,
-    tmdbId: request.tmdbId ?? undefined,
-    tvdbId: request.tvdbId ?? undefined,
-    season
-  });
+  const episodeMetadata = seriesStructure?.tmdbId
+    ? await fetchSeasonEpisodes(settings, seriesStructure.tmdbId, season).catch(() => [])
+    : [];
+  const airedEpisodes = new Set(episodeMetadata.filter((episode) => isAiredDate(episode.airDate)).map((episode) => episode.episodeNumber).filter((episode) => episode > 0));
+  const eligibleRequestedEpisodes = requestedEpisodes && requestedEpisodes.size > 0
+    ? airedEpisodes.size > 0 ? intersectEpisodes(requestedEpisodes, airedEpisodes) : requestedEpisodes
+    : airedEpisodes.size > 0 ? airedEpisodes : undefined;
+  if (eligibleRequestedEpisodes && eligibleRequestedEpisodes.size === 0) {
+    return { grabbed: false, reason: "no aired monitored episodes need search", queued: [], rejected: [] };
+  }
+  const seasonEpisodeCount = eligibleRequestedEpisodes?.size ?? seriesStructure?.seasons.find((item) => item.seasonNumber === season)?.episodeCount;
+  const releases = releasePool?.length
+    ? releasePool.filter((release) => releaseBelongsToSeason(release.title, season))
+    : await runSearch({
+        kind: "season",
+        query: request.title,
+        imdbId: request.imdbId ?? undefined,
+        tmdbId: request.tmdbId ?? undefined,
+        tvdbId: request.tvdbId ?? undefined,
+        season
+      });
   const scored = await Promise.all(
     releases.map(async (release) => ({
       release,
@@ -770,8 +1061,8 @@ async function grabBestTvSeasonForRequest(
     rejected.push(`${candidate.release.title}: ${result.reason ?? "failed before queueing"}`);
   }
 
-  const episodeCandidates = bestEpisodeCandidates(accepted, season, existingEpisodes, requestedEpisodes);
-  const separatelySearchedEpisodes = episodeCandidates.length > 0 ? [] : await searchEpisodesForSeason(request, season, profile, existingEpisodes, requestedEpisodes, seasonEpisodeCount);
+  const episodeCandidates = bestEpisodeCandidates(accepted, season, existingEpisodes, eligibleRequestedEpisodes);
+  const separatelySearchedEpisodes = episodeCandidates.length > 0 ? [] : await searchEpisodesForSeason(request, season, profile, existingEpisodes, eligibleRequestedEpisodes, seasonEpisodeCount, releasePool);
   const fallbackEpisodeCandidates = episodeCandidates.length > 0 ? episodeCandidates : separatelySearchedEpisodes;
   for (const candidate of fallbackEpisodeCandidates) {
     const result = await queueReleaseForRequest(request.id, candidate);
@@ -819,24 +1110,35 @@ async function searchEpisodesForSeason(
   profile: Awaited<ReturnType<typeof resolveProfile>>,
   existingEpisodes = new Set<number>(),
   requestedEpisodes?: Set<number>,
-  seasonEpisodeCount?: number
+  seasonEpisodeCount?: number,
+  releasePool?: Parameters<typeof scoreRelease>[0][]
 ) {
   const targets = requestedEpisodes && requestedEpisodes.size > 0
     ? [...requestedEpisodes].filter((episode) => !existingEpisodes.has(episode))
     : Array.from({ length: Math.max(0, seasonEpisodeCount ?? 0) }, (_, index) => index + 1).filter((episode) => !existingEpisodes.has(episode));
   if (targets.length === 0) return [];
 
+  let networkSearches = 0;
+  let cacheHits = 0;
   const perEpisode = await Promise.all(
     targets.map(async (episode) => {
-      const releases = await runSearch({
-        kind: "episode",
-        query: request.title,
-        imdbId: request.imdbId ?? undefined,
-        tmdbId: request.tmdbId ?? undefined,
-        tvdbId: request.tvdbId ?? undefined,
-        season,
-        episode
-      });
+      const cachedEpisodeReleases = releasePool?.length
+        ? releasePool.filter((release) => releaseBelongsToEpisode(release.title, season, episode))
+        : [];
+      if (cachedEpisodeReleases.length > 0) cacheHits += 1;
+      else networkSearches += 1;
+      const releases = cachedEpisodeReleases.length > 0
+        ? cachedEpisodeReleases
+        : await runSearch({
+            kind: "episode",
+            query: request.title,
+            imdbId: request.imdbId ?? undefined,
+            tmdbId: request.tmdbId ?? undefined,
+            tvdbId: request.tvdbId ?? undefined,
+            season,
+            episode,
+            recordHistory: false
+          });
       const scored = await Promise.all(
         releases.map(async (release) => ({
           release,
@@ -851,7 +1153,18 @@ async function searchEpisodesForSeason(
     })
   );
 
-  return perEpisode.filter((item): item is NonNullable<(typeof perEpisode)[number]> => Boolean(item));
+  const found = perEpisode.filter((item): item is NonNullable<(typeof perEpisode)[number]> => Boolean(item));
+  await prisma.searchHistory.create({
+    data: {
+      type: "episode-grab",
+      query: { requestId: request.id, title: request.title, season, targets: targets.length, cacheHits, networkSearches },
+      resultCount: found.length,
+      status: "ok",
+      message: found.length > 0 ? "episode candidates found" : "no episode candidates"
+    }
+  }).catch(() => undefined);
+
+  return found;
 }
 
 function requestedEpisodesBySeason(value: Prisma.JsonValue | null | undefined) {
@@ -889,6 +1202,17 @@ function isSeasonPackTitle(title: string, season: number) {
   return new RegExp(`\\b${seasonToken}\\b`, "i").test(title) && !/\bS\d{1,2}E\d{1,3}\b/i.test(title);
 }
 
+function releaseBelongsToSeason(title: string, season: number) {
+  const seasonToken = `S${String(season).padStart(2, "0")}`;
+  return new RegExp(`\\b${seasonToken}(?:\\b|E\\d{1,3}\\b)`, "i").test(title);
+}
+
+function releaseBelongsToEpisode(title: string, season: number, episode: number) {
+  const seasonPart = String(season).padStart(2, "0");
+  const episodePart = String(episode).padStart(2, "0");
+  return new RegExp(`\\bS${seasonPart}E${episodePart}\\b`, "i").test(title);
+}
+
 function episodeNumberFromTitle(title: string, season: number) {
   const seasonPart = String(season).padStart(2, "0");
   const match = title.match(new RegExp(`\\bS${seasonPart}E(\\d{1,3})\\b`, "i"));
@@ -912,6 +1236,8 @@ async function queueReleaseForRequest(
   candidate: { release: Parameters<typeof scoreRelease>[0]; decision: ReturnType<typeof scoreRelease> }
 ) {
   const settings = await getSettings();
+  const reusable = await reuseExistingReleaseDownload(requestId, candidate.release);
+  if (reusable) return { grabbed: true, release: candidate.release, decision: candidate.decision, download: reusable, reused: true };
   let download: Awaited<ReturnType<typeof addNzbFromPath>>;
   try {
     const nzb = await downloadNzb(settings, candidate.release);
@@ -973,6 +1299,9 @@ export async function grabReleaseForRequest(id: string, release: unknown) {
     });
     return { grabbed: false, reason: "release rejected by quality profile", decision, release: typedRelease };
   }
+
+  const reusable = await reuseExistingReleaseDownload(id, typedRelease);
+  if (reusable) return { grabbed: true, release: typedRelease, decision, download: reusable, reused: true };
 
   const nzb = await downloadNzb(settings, typedRelease);
   const download = await addNzbFromPath(nzb.primaryPath, typedRelease.title, {

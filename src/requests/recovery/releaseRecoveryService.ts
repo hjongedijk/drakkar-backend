@@ -1,7 +1,9 @@
 import { prisma } from "../../db/prisma.js";
 import { createBlocklistItem, isReleaseBlocklisted } from "../../policies/policyService.js";
 import { toPublicRelease } from "../../releases/public.js";
-import { grabBestForRequest } from "../sync/service.js";
+import { grabBestForRequest, grabMissingTvForRequest } from "../sync/service.js";
+
+const inFlightRecoveryByRequest = new Map<string, Promise<unknown>>();
 
 type BlockReason =
   | "no_video_content"
@@ -55,9 +57,11 @@ async function resolveRequestForFailedDownload(input: { downloadId: string; requ
   return candidates.find((candidate) => needle.toLowerCase().includes(titleNeedle(candidate.title).toLowerCase())) ?? null;
 }
 
-export async function recoverFailedDownloadForRequest(input: { downloadId: string; requestId?: string; title?: string; error: string; source?: string }) {
+export async function recoverFailedDownloadForRequest(input: { downloadId: string; requestId?: string; title?: string; error: string; source?: string; blocklist?: boolean }) {
   const request = await resolveRequestForFailedDownload(input);
   if (!request) return { recovered: false, reason: "download is not attached to a request" };
+  const existingRecovery = inFlightRecoveryByRequest.get(request.id);
+  if (existingRecovery) return { recovered: false, requestId: request.id, reason: "replacement search already running" };
 
   const download = await prisma.download.findUnique({
     where: { id: input.downloadId },
@@ -69,7 +73,7 @@ export async function recoverFailedDownloadForRequest(input: { downloadId: strin
   const blocklistedRelease = release ?? { title: fallbackTitle, guid: fallbackGuid };
   const reason = classifyFailure(input.error);
 
-  if (!(await isReleaseBlocklisted(blocklistedRelease))) {
+  if (input.blocklist !== false && !(await isReleaseBlocklisted(blocklistedRelease))) {
     await createBlocklistItem({
       guid: blocklistedRelease.guid ? String(blocklistedRelease.guid) : undefined,
       title: blocklistedRelease.title,
@@ -87,18 +91,26 @@ export async function recoverFailedDownloadForRequest(input: { downloadId: strin
     }
   });
 
-  try {
-    const next = await grabBestForRequest(request.id);
-    const safeNext = "release" in next && next.release ? { ...next, release: toPublicRelease(next.release) } : next;
-    return {
-      recovered: next.grabbed,
-      requestId: request.id,
-      blocklisted: blocklistedRelease.title,
-      next: safeNext
-    };
-  } catch (error) {
-    const message = error instanceof Error ? error.message : "could not queue replacement release";
-    await prisma.mediaRequest.update({ where: { id: request.id }, data: { status: "no_release_found" } });
-    return { recovered: false, requestId: request.id, blocklisted: blocklistedRelease.title, reason: message };
-  }
+  const recovery = (async () => {
+    try {
+      const next = request.mediaType === "tv"
+        ? await grabMissingTvForRequest(request.id)
+        : await grabBestForRequest(request.id);
+      const safeNext = "release" in next && next.release ? { ...next, release: toPublicRelease(next.release) } : next;
+      return {
+        recovered: next.grabbed,
+        requestId: request.id,
+        blocklisted: blocklistedRelease.title,
+        next: safeNext
+      };
+    } catch (error) {
+      const message = error instanceof Error ? error.message : "could not queue replacement release";
+      await prisma.mediaRequest.update({ where: { id: request.id }, data: { status: "no_release_found" } });
+      return { recovered: false, requestId: request.id, blocklisted: blocklistedRelease.title, reason: message };
+    } finally {
+      inFlightRecoveryByRequest.delete(request.id);
+    }
+  })();
+  inFlightRecoveryByRequest.set(request.id, recovery);
+  return recovery;
 }

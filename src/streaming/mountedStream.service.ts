@@ -5,10 +5,11 @@ import { prisma } from "../db/prisma.js";
 import { redis } from "../db/redis.js";
 import { getPolicySettings } from "../policies/policyService.js";
 import { NntpClient } from "../usenet/nntpClient.js";
-import { decodeArticleBody, decodeYencLine } from "../usenet/yenc.js";
+import { decodeYencBufferLine } from "../usenet/yenc.js";
 import { markLibraryItemStreamedByPath } from "../media-library/libraryService.js";
 import { planMountedFileRange } from "./rangePlanner.service.js";
 import { getMountFileByPath } from "../vfs/mountedNzbService.js";
+import { buildDecodedYencSegments } from "./yencManifest.service.js";
 
 const sessionSetKey = "vfs:stream:sessions";
 const streamMetricsKey = "vfs:stream:metrics";
@@ -29,6 +30,16 @@ let metricsFlushTimer: NodeJS.Timeout | null = null;
 const SESSION_FLUSH_MS = 2000;
 const METRICS_FLUSH_MS = 1000;
 const STALE_ACTIVE_SESSION_MS = 15_000;
+
+async function collectDecodedArticleBody(client: NntpClient, articleId: string, signal?: AbortSignal) {
+  const chunks: Buffer[] = [];
+  let total = 0;
+  for await (const chunk of client.decodedBodyBufferChunks(articleId, decodeYencBufferLine, signal)) {
+    chunks.push(chunk);
+    total += chunk.length;
+  }
+  return Buffer.concat(chunks, total);
+}
 
 type MountedPoolSlot = {
   provider: UsenetServer;
@@ -83,10 +94,13 @@ type MountedFileManifest = {
   segments: MountedFileSegment[];
 };
 const mountedReadSessions = new Map<string, MountedReadSession>();
+const mountedPathReadWindows = new Map<string, MountedReadSession>();
 const MOUNTED_READ_SESSION_TTL_MS = 2 * 60 * 1000;
 const MOUNTED_READ_AHEAD_MAX_BYTES = 16 * 1024 * 1024;
 const MOUNTED_RANDOM_ACCESS_WINDOW_BYTES = 512 * 1024;
 const MOUNTED_SEQUENTIAL_WINDOW_BYTES = 4 * 1024 * 1024;
+// nzbdav keeps a deeper future-article pipeline; a single-segment window stalls too often at segment boundaries.
+const STREAM_PREFETCH_SEGMENTS = 4;
 
 class MountedNntpPool {
   private readonly slots: MountedPoolSlot[];
@@ -116,7 +130,7 @@ class MountedNntpPool {
     const errors: string[] = [];
     const permanentFailures = new Set<string>();
     const providerCount = new Set(this.slots.map((slot) => slot.provider.id)).size;
-    const maxAttempts = Math.max(providerCount, this.slots.length * 2);
+    const maxAttempts = Math.max(providerCount * 4, this.slots.length * 4);
     let includeBackups = this.primaryProviderCount === 0;
 
     for (let attempt = 1; attempt <= maxAttempts; attempt += 1) {
@@ -125,15 +139,19 @@ class MountedNntpPool {
       try {
         await this.ensureConnected(slot, signal);
         if (!slot.client) throw new Error("NNTP slot did not connect");
-        return await slot.client.body(articleId, signal);
+        return await collectDecodedArticleBody(slot.client, articleId, signal);
       } catch (error) {
         const message = error instanceof Error ? error.message : "unknown NNTP error";
         errors.push(`${slot.provider.name}: ${message}`);
         await slot.client?.quit().catch(() => undefined);
         slot.client = undefined;
         this.syncDebug();
-        permanentFailures.add(slot.provider.id);
-        if (!includeBackups && this.allPrimaryProvidersFailed(permanentFailures)) includeBackups = true;
+        if (isProviderConnectionLimit(message) || isTemporaryProviderError(message)) {
+          if (attempt < maxAttempts) await sleep(Math.min(10_000, attempt * 750));
+        } else {
+          permanentFailures.add(slot.provider.id);
+          if (!includeBackups && this.allPrimaryProvidersFailed(permanentFailures)) includeBackups = true;
+        }
       } finally {
         this.release(slot);
       }
@@ -146,7 +164,7 @@ class MountedNntpPool {
     const errors: string[] = [];
     const permanentFailures = new Set<string>();
     const providerCount = new Set(this.slots.map((slot) => slot.provider.id)).size;
-    const maxAttempts = Math.max(providerCount, this.slots.length * 2);
+    const maxAttempts = Math.max(providerCount * 4, this.slots.length * 4);
     let includeBackups = this.primaryProviderCount === 0;
 
     for (let attempt = 1; attempt <= maxAttempts; attempt += 1) {
@@ -155,7 +173,7 @@ class MountedNntpPool {
       try {
         await this.ensureConnected(slot, signal);
         if (!slot.client) throw new Error("NNTP slot did not connect");
-        const sliced = await slot.client.bodySlice(articleId, startOffset, length, decodeYencLine, signal);
+        const sliced = await slot.client.bodySlice(articleId, startOffset, length, decodeYencBufferLine, signal);
         slot.client = undefined;
         this.syncDebug();
         return sliced;
@@ -165,8 +183,12 @@ class MountedNntpPool {
         await slot.client?.quit().catch(() => undefined);
         slot.client = undefined;
         this.syncDebug();
-        permanentFailures.add(slot.provider.id);
-        if (!includeBackups && this.allPrimaryProvidersFailed(permanentFailures)) includeBackups = true;
+        if (isProviderConnectionLimit(message) || isTemporaryProviderError(message)) {
+          if (attempt < maxAttempts) await sleep(Math.min(10_000, attempt * 750));
+        } else {
+          permanentFailures.add(slot.provider.id);
+          if (!includeBackups && this.allPrimaryProvidersFailed(permanentFailures)) includeBackups = true;
+        }
       } finally {
         this.release(slot);
       }
@@ -179,7 +201,7 @@ class MountedNntpPool {
     const errors: string[] = [];
     const permanentFailures = new Set<string>();
     const providerCount = new Set(this.slots.map((slot) => slot.provider.id)).size;
-    const maxAttempts = Math.max(providerCount, this.slots.length * 2);
+    const maxAttempts = Math.max(providerCount * 4, this.slots.length * 4);
     let includeBackups = this.primaryProviderCount === 0;
 
     for (let attempt = 1; attempt <= maxAttempts; attempt += 1) {
@@ -188,7 +210,7 @@ class MountedNntpPool {
       try {
         await this.ensureConnected(slot, signal);
         if (!slot.client) throw new Error("NNTP slot did not connect");
-        for await (const chunk of slot.client.decodedBodyChunks(articleId, decodeYencLine, signal)) {
+        for await (const chunk of slot.client.decodedBodyBufferChunks(articleId, decodeYencBufferLine, signal)) {
           yield chunk;
         }
         return;
@@ -198,8 +220,12 @@ class MountedNntpPool {
         await slot.client?.quit().catch(() => undefined);
         slot.client = undefined;
         this.syncDebug();
-        permanentFailures.add(slot.provider.id);
-        if (!includeBackups && this.allPrimaryProvidersFailed(permanentFailures)) includeBackups = true;
+        if (isProviderConnectionLimit(message) || isTemporaryProviderError(message)) {
+          if (attempt < maxAttempts) await sleep(Math.min(10_000, attempt * 750));
+        } else {
+          permanentFailures.add(slot.provider.id);
+          if (!includeBackups && this.allPrimaryProvidersFailed(permanentFailures)) includeBackups = true;
+        }
       } finally {
         this.release(slot);
       }
@@ -214,16 +240,18 @@ class MountedNntpPool {
   }
 
   async ensureWarm(targetConnections: number, signal?: AbortSignal) {
+    const allowedConnections = await getAllowedStreamingConnections();
+    const warmTarget = Math.max(0, Math.min(targetConnections, allowedConnections, this.slots.length));
     const coldSlots = this.slots
       .filter((slot) => !slot.client)
       .sort((a, b) => Number(a.provider.isBackup) - Number(b.provider.isBackup))
-      .slice(0, Math.max(0, targetConnections - this.slots.filter((slot) => Boolean(slot.client)).length));
+      .slice(0, Math.max(0, warmTarget - this.slots.filter((slot) => Boolean(slot.client)).length));
     if (coldSlots.length === 0) return;
     await Promise.allSettled(coldSlots.map((slot) => this.ensureConnected(slot, signal)));
   }
 
-  private acquire(excludedProviders = new Set<string>(), includeBackups = true) {
-    const available = this.slots.find(
+  private async acquire(excludedProviders = new Set<string>(), includeBackups = true) {
+    const available = (await this.activeSlots()).find(
       (slot) => !slot.busy && !excludedProviders.has(slot.provider.id) && (includeBackups || !slot.provider.isBackup)
     );
     if (available) {
@@ -235,6 +263,11 @@ class MountedNntpPool {
     return new Promise<MountedPoolSlot>((resolve) => {
       this.waiters.push({ excludedProviders: new Set(excludedProviders), includeBackups, resolve });
     });
+  }
+
+  private async activeSlots() {
+    const limit = Math.max(1, Math.min(await getAllowedStreamingConnections(), this.slots.length));
+    return this.slots.slice(0, limit);
   }
 
   private release(slot: MountedPoolSlot) {
@@ -307,9 +340,8 @@ export function getMountedPoolDebugState() {
 }
 
 export async function primeMountedStreamPool() {
-  const policies = await getPolicySettings();
   const pool = await getMountedPool();
-  void pool.ensureWarm(Math.min(2, Math.max(1, policies.maxStreamingConnections)));
+  void pool.ensureWarm(1);
 }
 
 export type StreamSession = {
@@ -370,6 +402,31 @@ async function getMountedPool() {
     mountedPoolSignature = nextSignature;
   }
   return mountedPool;
+}
+
+function clamp(value: number, min: number, max: number) {
+  return Math.max(min, Math.min(max, value));
+}
+
+function sleep(ms: number) {
+  return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
+function isProviderConnectionLimit(message: string) {
+  return /too many connections/i.test(message);
+}
+
+function isTemporaryProviderError(message: string) {
+  return /too many connections|timeout|temporarily|try again|connection.*reset|econnreset|etimedout/i.test(message);
+}
+
+async function getAllowedStreamingConnections() {
+  const policies = await getPolicySettings();
+  const streams = await listActiveStreamSessions();
+  const activeStreamCount = streams.filter((stream) => stream.status === "active").length;
+  const streamingShare = activeStreamCount > 0 ? clamp(policies.streamingPriority / 100, 0, 1) : 0;
+  const reservedStreamingConnections = activeStreamCount > 0 ? Math.max(1, Math.floor(policies.maxTotalUsenetConnections * streamingShare)) : 0;
+  return clamp(Math.min(policies.maxStreamingConnections, reservedStreamingConnections || policies.maxStreamingConnections), 1, policies.maxStreamingConnections);
 }
 
 function createAbortError() {
@@ -433,24 +490,31 @@ async function getMountedFileManifest(path: string): Promise<MountedFileManifest
   if (!file) throw new Error("mounted NZB file not found");
 
   const segments: MountedFileSegment[] = [];
-  let cursor = 0;
-  for (const segment of file.segments) {
+  const decoded = await buildDecodedYencSegments(file, await getProviders());
+  let fallbackCursor = 0;
+  const sourceSegments = decoded?.segments ?? file.segments.map((segment) => {
     const bytes = Math.floor(segment.bytes);
+    const start = fallbackCursor;
+    fallbackCursor += bytes;
+    return { segment, bytes, start, end: start + bytes - 1 };
+  });
+  for (const item of sourceSegments) {
+    const segment = item.segment;
+    const bytes = Math.floor(item.bytes);
     segments.push({
       fileId: file.id,
       articleId: segment.articleId,
       segmentNumber: segment.number,
       bytes,
-      start: cursor,
-      end: cursor + bytes - 1
+      start: item.start,
+      end: item.end
     });
-    cursor += bytes;
   }
 
   return {
     path,
     fileId: file.id,
-    size: Math.max(0, Math.floor(file.size)),
+    size: Math.max(0, Math.floor(decoded?.size ?? file.size)),
     segments
   };
 }
@@ -525,7 +589,7 @@ async function downloadArticle(articleId: string, providers: UsenetServer[], sig
   const pool = await getMountedPool();
   const body = await pool.body(articleId, signal);
   await incrementMetric("providerHits");
-  return decodeArticleBody(body);
+  return body;
 }
 
 async function downloadArticleSlice(input: {
@@ -628,7 +692,7 @@ function warmManifestSegments(input: {
   count?: number;
 }) {
   const startIndex = findSegmentIndex(input.manifest.segments, input.start);
-  const count = input.count ?? 3;
+  const count = input.count ?? STREAM_PREFETCH_SEGMENTS;
   for (let index = startIndex; index < Math.min(input.manifest.segments.length, startIndex + count); index += 1) {
     const segment = input.manifest.segments[index];
     if (!segment) continue;
@@ -784,7 +848,7 @@ async function* streamPlannedRanges(input: {
   providers: UsenetServer[];
   signal: AbortSignal;
 }) {
-  const warmDistance = 3;
+  const warmDistance = STREAM_PREFETCH_SEGMENTS;
   const warmRange = (index: number) => {
     for (let offset = 1; offset <= warmDistance; offset += 1) {
       const next = input.ranges[index + offset];
@@ -908,10 +972,37 @@ function pruneMountedReadSessions() {
   for (const [sessionId, session] of mountedReadSessions) {
     if (session.updatedAt < cutoff) mountedReadSessions.delete(sessionId);
   }
+  for (const [path, session] of mountedPathReadWindows) {
+    if (session.updatedAt < cutoff) mountedPathReadWindows.delete(path);
+  }
 }
 
 export function closeMountedReadSession(sessionId: string) {
   mountedReadSessions.delete(sessionId);
+  void stopStreamSession(sessionId).catch(() => undefined);
+}
+
+function readFromMountedWindow(window: MountedReadSession | undefined, input: { path: string; start: number; length: number }) {
+  if (
+    window &&
+    window.path === input.path &&
+    input.start >= window.bufferStart &&
+    input.start + input.length <= window.bufferStart + window.buffer.length
+  ) {
+    const offset = input.start - window.bufferStart;
+    window.updatedAt = Date.now();
+    window.lastReadEnd = input.start + input.length;
+    return window.buffer.subarray(offset, offset + input.length);
+  }
+  return null;
+}
+
+function rememberMountedWindow(sessionId: string, session: MountedReadSession) {
+  mountedReadSessions.set(sessionId, session);
+  mountedPathReadWindows.set(session.path, {
+    ...session,
+    reader: undefined
+  });
 }
 
 function createSequentialReader(manifest: MountedFileManifest): MountedSequentialReader {
@@ -946,7 +1037,7 @@ async function nextSequentialChunk(reader: MountedSequentialReader, signal?: Abo
         start: segment.start,
         providers: [],
         signal,
-        count: 4
+        count: STREAM_PREFETCH_SEGMENTS
       });
       reader.iterator = streamSegmentProgressively({
         fileId: segment.fileId,
@@ -1023,7 +1114,7 @@ async function readMountedFileRangeRaw(input: {
   if (providers.length === 0) throw new Error("No enabled Usenet providers configured");
   if (input.length <= 0) return Buffer.alloc(0);
   await pool.ensureWarm(1);
-  void pool.ensureWarm(input.start === 0 ? Math.min(4, Math.max(1, policies.maxStreamingConnections)) : Math.min(2, Math.max(1, policies.maxStreamingConnections)));
+  void pool.ensureWarm(input.start === 0 ? Math.min(4, await getAllowedStreamingConnections()) : 2);
 
   const range = `bytes=${input.start}-${input.start + input.length - 1}`;
   const plan = await planMountedFileRange(input.path, range);
@@ -1117,24 +1208,48 @@ export async function readMountedFileRange(input: {
     return readMountedFileRangeRaw(input);
   }
 
+  const range = `bytes=${input.start}-${input.start + input.length - 1}`;
+  const streamSession = await getOrCreateStreamSession({
+    path: input.path,
+    range,
+    userAgent: input.userAgent,
+    source: "fuse",
+    sessionId: input.sessionId
+  });
+  if (!sessionControllers.has(streamSession.id)) sessionControllers.set(streamSession.id, streamSession.controller);
+  markStreamedOnce(streamSession.id, input.path);
+
   pruneMountedReadSessions();
   const cached = mountedReadSessions.get(input.sessionId);
-  if (
-    cached &&
-    cached.path === input.path &&
-    input.start >= cached.bufferStart &&
-    input.start + input.length <= cached.bufferStart + cached.buffer.length
-  ) {
-    const offset = input.start - cached.bufferStart;
-    cached.updatedAt = Date.now();
-    cached.lastReadEnd = input.start + input.length;
-    return cached.buffer.subarray(offset, offset + input.length);
+  const sharedCached = mountedPathReadWindows.get(input.path);
+  const cachedOut = readFromMountedWindow(cached, input) ?? readFromMountedWindow(sharedCached, input);
+  if (cachedOut) {
+    const out = cachedOut;
+    await incrementMetric("bytesServed", out.length);
+    await updateSession(streamSession.id, {
+      range,
+      path: input.path,
+      source: "fuse",
+      bytesSent: Number(sessionField(streamSession.id, "bytesSent") ?? 0) + out.length,
+      currentOffset: input.start + out.length
+    });
+    return out;
   }
 
   const policies = await getPolicySettings();
   const providers = await getProviders();
   const manifest = cached?.path === input.path ? cached.manifest : await getMountedFileManifest(input.path);
-  const cachedEnd = cached ? cached.bufferStart + cached.buffer.length : -1;
+  await updateSession(streamSession.id, {
+    fileId: manifest.fileId,
+    size: manifest.size,
+    start: input.start,
+    end: Math.min(manifest.size - 1, input.start + input.length - 1),
+    currentOffset: input.start,
+    range,
+    source: "fuse",
+    path: input.path,
+    status: "active"
+  });
   const sequentialRead = Boolean(cached && cached.path === input.path && input.start >= cached.lastReadEnd && input.start - cached.lastReadEnd <= 256 * 1024);
   const reader = cached?.path === input.path && cached.reader ? cached.reader : createSequentialReader(manifest);
   const signal: AbortSignal | undefined = undefined;
@@ -1142,7 +1257,7 @@ export async function readMountedFileRange(input: {
   if (sequentialRead || (cached?.reader && input.start === cached.lastReadEnd)) {
     await seekSequentialReader(reader, input.start, signal);
     const out = await readSequentialBytes(reader, input.length, signal);
-    mountedReadSessions.set(input.sessionId, {
+    rememberMountedWindow(input.sessionId, {
       path: input.path,
       manifest,
       bufferStart: input.start,
@@ -1152,6 +1267,10 @@ export async function readMountedFileRange(input: {
       reader
     });
     await incrementMetric("bytesServed", out.length);
+    await updateSession(streamSession.id, {
+      bytesSent: Number(sessionField(streamSession.id, "bytesSent") ?? 0) + out.length,
+      currentOffset: input.start + out.length
+    });
     return out;
   }
 
@@ -1169,7 +1288,7 @@ export async function readMountedFileRange(input: {
     start: input.start,
     providers,
     signal,
-    count: sequentialRead ? 4 : 2
+    count: STREAM_PREFETCH_SEGMENTS
   });
   const window = await readManifestWindow({
     manifest,
@@ -1178,7 +1297,7 @@ export async function readMountedFileRange(input: {
     providers,
     signal
   });
-  mountedReadSessions.set(input.sessionId, {
+  rememberMountedWindow(input.sessionId, {
     path: input.path,
     manifest,
     bufferStart: input.start,
@@ -1189,16 +1308,19 @@ export async function readMountedFileRange(input: {
   });
   const out = window.subarray(0, Math.min(input.length, window.length));
   await incrementMetric("bytesServed", out.length);
+  await updateSession(streamSession.id, {
+    bytesSent: Number(sessionField(streamSession.id, "bytesSent") ?? 0) + out.length,
+    currentOffset: input.start + out.length
+  });
   return out;
 }
 
 export async function streamMountedFile(path: string, range?: string, options?: { userAgent?: string; source?: "http" | "fuse" | "api" }) {
   const providers = await getProviders();
-  const policies = await getPolicySettings();
   const pool = await getMountedPool();
   if (providers.length === 0) throw new Error("No enabled Usenet providers configured");
   await pool.ensureWarm(1);
-  void pool.ensureWarm(Math.min(4, Math.max(1, policies.maxStreamingConnections)));
+  void pool.ensureWarm(Math.min(2, await getAllowedStreamingConnections()));
 
   const plan = await planMountedFileRange(path, range);
   const session = await getOrCreateStreamSession({

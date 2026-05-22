@@ -13,6 +13,11 @@ import { fetchNzbUrl } from "../usenet/nzbUrlFetch.js";
 import { makeMountedDownloadAvailable } from "../import/importService.js";
 import { humanizeDownloadError, statusLabelForDownload } from "./presentation.js";
 
+const DOWNLOAD_QUEUE_CACHE_MS = 2_000;
+const DOWNLOAD_HISTORY_CACHE_MS = 5_000;
+let cachedQueue: { value: Awaited<ReturnType<typeof buildQueue>>; expiresAt: number } | null = null;
+let cachedHistory: { value: Awaited<ReturnType<typeof buildHistory>>; expiresAt: number } | null = null;
+
 function safeNzbName(name: string) {
   const cleaned = name.replace(/[^a-z0-9._-]+/gi, "_") || randomUUID();
   return extname(cleaned).toLowerCase() === ".nzb" ? cleaned : `${cleaned}.nzb`;
@@ -37,6 +42,19 @@ async function existingDownloadForGuid(guid?: string | null) {
   if (!download) return null;
   if (["failed", "cancelled"].includes(download.status)) return null;
   return download;
+}
+
+export async function findReusableDownload(input: { guid?: string | null; title?: string | null }) {
+  const byGuid = await existingDownloadForGuid(input.guid);
+  if (byGuid) return byGuid;
+  if (!input.title) return null;
+  return prisma.download.findFirst({
+    where: {
+      title: { equals: input.title, mode: "insensitive" },
+      status: { notIn: ["failed", "cancelled", "replaced"] }
+    },
+    orderBy: { createdAt: "desc" }
+  });
 }
 
 async function attachExistingDownloadToRequest(requestId: string | undefined, downloadId: string, title?: string) {
@@ -91,6 +109,11 @@ function isQueueRecoveryMessage(error: string | null) {
     || error === "Recovered queued download with missing worker job"
     || error === "Recovered interrupted download; existing queue job retained"
     || error === "Recovered interrupted download; queued to continue";
+}
+
+export function invalidateDownloadViewCache() {
+  cachedQueue = null;
+  cachedHistory = null;
 }
 
 export async function storeNzbForDownload(input: {
@@ -191,12 +214,14 @@ export async function storeNzbForDownload(input: {
   return nzbDocument;
 }
 
-export async function addNzbUpload(input: { filename?: string; content: string | Buffer; title?: string; queueDownload?: boolean }) {
+export async function addNzbUpload(input: { filename?: string; content: string | Buffer; title?: string; queueDownload?: boolean; category?: string }) {
   const queueDownload = input.queueDownload ?? true;
+  const policies = await getPolicySettings();
+  const category = input.category?.trim() || policies.manualUploadCategory;
   const download = await prisma.download.create({
     data: {
       title: input.title ?? input.filename ?? "NZB upload",
-      source: "nzb",
+      source: `manual:${category}`,
       status: queueDownload ? "queued" : "mounted"
     }
   });
@@ -229,6 +254,11 @@ export async function addNzbFromPath(path: string, title?: string, options?: { q
   if (existingByGuid && policies.duplicateNzbBehavior !== "replace_existing" && policies.duplicateNzbBehavior !== "download_again_with_suffix") {
     await attachExistingDownloadToRequest(options?.requestId, existingByGuid.id, title);
     return existingByGuid;
+  }
+  const existingByTitle = await findReusableDownload({ title });
+  if (existingByTitle && policies.duplicateNzbBehavior !== "replace_existing" && policies.duplicateNzbBehavior !== "download_again_with_suffix") {
+    await attachExistingDownloadToRequest(options?.requestId, existingByTitle.id, title);
+    return existingByTitle;
   }
 
   const content = await readFile(path);
@@ -310,7 +340,7 @@ export async function addUrl(url: string, title?: string) {
   }
 }
 
-export async function getQueue() {
+async function buildQueue() {
   const [downloads, activeJobs, waitingJobs, delayedJobs, prioritizedJobs] = await Promise.all([
     prisma.download.findMany({
       where: {
@@ -362,7 +392,8 @@ export async function getQueue() {
         if ((liveJob.state === "waiting" || liveJob.state === "delayed" || liveJob.state === "prioritized") && download.status !== "paused") nextStatus = "queued";
       } else if (download.status === "queued" || download.status === "downloading" || download.status === "fetching_nzb" || download.status === "verifying" || download.status === "waiting_for_provider" || download.status === "waiting_for_nzb") {
         nextStatus = "queued";
-        nextJobId = nextJobId && nextStatus === "queued" ? nextJobId : null;
+        nextJobId = null;
+        nextError = "Queue entry has no active worker job yet";
       }
 
       if (nextStatus !== download.status || nextJobId !== (download.jobId ? String(download.jobId) : null) || nextError !== download.error) {
@@ -387,6 +418,21 @@ export async function getQueue() {
   );
 
   return normalized.sort((a, b) => {
+    const statusRank: Record<string, number> = {
+      downloading: 0,
+      verifying: 1,
+      fetching_nzb: 2,
+      prepared: 3,
+      waiting_for_provider: 4,
+      waiting_for_nzb: 5,
+      queued: 6,
+      paused: 7,
+      mounted: 8
+    };
+    const aRank = statusRank[a.status] ?? 50;
+    const bRank = statusRank[b.status] ?? 50;
+    if (aRank !== bRank) return aRank - bRank;
+    if ((b.speedBytesSec ?? 0) !== (a.speedBytesSec ?? 0)) return (b.speedBytesSec ?? 0) - (a.speedBytesSec ?? 0);
     const aLive = liveOrder.get(a.id);
     const bLive = liveOrder.get(b.id);
     if (aLive !== undefined || bLive !== undefined) {
@@ -399,7 +445,33 @@ export async function getQueue() {
   });
 }
 
-export function getHistory() {
+export async function getQueue() {
+  if (cachedQueue && cachedQueue.expiresAt > Date.now()) return cachedQueue.value;
+  const value = await buildQueue();
+  cachedQueue = { value, expiresAt: Date.now() + DOWNLOAD_QUEUE_CACHE_MS };
+  return value;
+}
+
+function paginateDownloads<T>(items: T[], page = 1, limit = 25) {
+  const safeLimit = Math.max(1, Math.min(100, limit));
+  const total = items.length;
+  const totalPages = Math.max(1, Math.ceil(total / safeLimit));
+  const safePage = Math.max(1, Math.min(page, totalPages));
+  const offset = (safePage - 1) * safeLimit;
+  return {
+    items: items.slice(offset, offset + safeLimit),
+    page: safePage,
+    limit: safeLimit,
+    total,
+    totalPages
+  };
+}
+
+export async function getQueuePage(input?: { page?: number; limit?: number }) {
+  return paginateDownloads(await getQueue(), input?.page, input?.limit);
+}
+
+async function buildHistory() {
   return prisma.download.findMany({
     where: { status: { in: ["available", "completed", "failed", "cancelled"] } },
     orderBy: { updatedAt: "desc" },
@@ -414,17 +486,20 @@ export function getHistory() {
   );
 }
 
+export async function getHistory() {
+  if (cachedHistory && cachedHistory.expiresAt > Date.now()) return cachedHistory.value;
+  const value = await buildHistory();
+  cachedHistory = { value, expiresAt: Date.now() + DOWNLOAD_HISTORY_CACHE_MS };
+  return value;
+}
+
+export async function getHistoryPage(input?: { page?: number; limit?: number }) {
+  return paginateDownloads(await getHistory(), input?.page, input?.limit);
+}
+
 export async function cleanupDownloadHistory(input?: { keepFailed?: number; keepCancelled?: number }) {
   const keepFailed = input?.keepFailed ?? 0;
   const keepCancelled = input?.keepCancelled ?? 0;
-  const attachedDownloadIds = new Set(
-    (
-      await prisma.mediaRequest.findMany({
-        where: { downloadId: { not: null } },
-        select: { downloadId: true }
-      })
-    ).flatMap((request) => (request.downloadId ? [request.downloadId] : []))
-  );
   const terminalDownloads = await prisma.download.findMany({
     where: {
       OR: [
@@ -437,7 +512,6 @@ export async function cleanupDownloadHistory(input?: { keepFailed?: number; keep
   });
   const seen: Record<string, number> = { failed: 0, cancelled: 0 };
   const toDelete = terminalDownloads.filter((download) => {
-    if (attachedDownloadIds.has(download.id)) return false;
     if (/duplicate nzb already exists|unique constraint failed on the fields: \(`guid`\)/i.test(download.error ?? "")) return true;
     const count = (seen[download.status] ?? 0) + 1;
     seen[download.status] = count;
@@ -455,11 +529,16 @@ export async function cleanupDownloadHistory(input?: { keepFailed?: number; keep
   }
 
   const documentIds = toDelete.flatMap((download) => (download.nzbDocumentId ? [download.nzbDocumentId] : []));
-  await prisma.download.deleteMany({ where: { id: { in: toDelete.map((download) => download.id) } } });
+  const deleteIds = toDelete.map((download) => download.id);
+  await prisma.mediaRequest.updateMany({
+    where: { downloadId: { in: deleteIds } },
+    data: { downloadId: null }
+  }).catch(() => undefined);
+  await prisma.download.deleteMany({ where: { id: { in: deleteIds } } });
   if (documentIds.length > 0) {
     await prisma.nzbDocument.deleteMany({ where: { id: { in: documentIds } } }).catch(() => undefined);
   }
-  await prisma.failedRelease.deleteMany({ where: { downloadId: { in: toDelete.map((download) => download.id) } } }).catch(() => undefined);
+  await prisma.failedRelease.deleteMany({ where: { downloadId: { in: deleteIds } } }).catch(() => undefined);
   return {
     deleted: toDelete.length,
     cleanedFailedJobs: cleanedFailedJobs.length,

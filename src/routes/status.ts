@@ -2,7 +2,7 @@ import type { FastifyInstance } from "fastify";
 import { statfs } from "node:fs/promises";
 import { env } from "../config/env.js";
 import { prisma } from "../db/prisma.js";
-import { testNzbhydraConnection } from "../indexers/nzbhydra/client.js";
+import { getNzbhydraSearchMetrics, testNzbhydraConnection } from "../indexers/nzbhydra/client.js";
 import { nzbDownloadQueue, pipelineQueues } from "../queues/downloadQueue.js";
 import { testRequestProvider } from "../requests/sync/service.js";
 import { getSettings } from "../settings/settingsStore.js";
@@ -10,6 +10,7 @@ import { getBandwidthStatus } from "../bandwidth/bandwidthScheduler.js";
 import { getDownloadPoolDebugState } from "../usenet/downloadEngine.js";
 import { getMountedPoolDebugState } from "../streaming/mountedStream.service.js";
 import { getFuseMountStatus } from "../vfs/fuseMountService.js";
+import { getPolicyUsageReport } from "../policies/policyService.js";
 import { healthRoutes } from "./health.js";
 
 const SERVICE_STATUS_CACHE_TTL_MS = 30_000;
@@ -83,7 +84,12 @@ export async function statusRoutes(app: FastifyInstance): Promise<void> {
         return { ok: results.length > 0 && results.every((result) => result.ok) };
       }, requestProviders.length > 0)
     ]);
-    const [bandwidth, fuse, storage] = await Promise.all([getBandwidthStatus(), Promise.resolve(getFuseMountStatus()), storageUsage()]);
+    const [bandwidth, fuse, storage, nzbhydraSearch] = await Promise.all([
+      getBandwidthStatus(),
+      Promise.resolve(getFuseMountStatus()),
+      storageUsage(),
+      getNzbhydraSearchMetrics()
+    ]);
 
     return {
       appName: "Drakkar",
@@ -97,6 +103,7 @@ export async function statusRoutes(app: FastifyInstance): Promise<void> {
       queueSize,
       storageUsage: storage,
       queues: counts,
+      nzbhydraSearch,
       bandwidth,
       fuse
     };
@@ -113,11 +120,17 @@ export async function statusRoutes(app: FastifyInstance): Promise<void> {
         counts: await queue.getJobCounts("waiting", "active", "completed", "failed", "delayed", "paused")
       }))
     );
+    const [policyUsage, nzbhydraSearch] = await Promise.all([
+      Promise.resolve(getPolicyUsageReport()),
+      getNzbhydraSearchMetrics()
+    ]);
 
     return {
       usenetProvidersEnabled: providers,
       downloadsByStatus: Object.fromEntries(queuedDownloads.map((row) => [row.status, row._count.status])),
-      queues
+      queues,
+      nzbhydraSearch,
+      policyUsage
     };
   });
 

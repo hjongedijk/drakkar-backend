@@ -21,8 +21,13 @@ import { policyRoutes } from "./routes/policies.js";
 import { libraryRoutes } from "./routes/library.js";
 import { logRoutes } from "./routes/logs.js";
 import { calendarRoutes } from "./routes/calendar.js";
+import { taskRoutes } from "./routes/tasks.js";
+import { plexRoutes } from "./routes/plex.js";
+import { setupRoutes } from "./routes/setup.js";
+import { registerCoreTasks } from "./tasks/coreTasks.js";
 
 export function buildApp() {
+  registerCoreTasks();
   const app = Fastify({
     logger: {
       level: process.env.NODE_ENV === "production" ? "info" : "debug"
@@ -51,6 +56,7 @@ export function buildApp() {
     if (request.method === "OPTIONS") return;
     if (!request.url.startsWith("/api/")) return;
     if (request.url.startsWith("/api/auth/login")) return;
+    if (request.url.startsWith("/api/setup/status")) return;
 
     const authorization = request.headers.authorization;
     const bearerToken = authorization?.startsWith("Bearer ") ? authorization.slice("Bearer ".length).trim() : undefined;
@@ -102,6 +108,9 @@ export function buildApp() {
   void app.register(libraryRoutes);
   void app.register(logRoutes);
   void app.register(calendarRoutes);
+  void app.register(taskRoutes);
+  void app.register(plexRoutes);
+  void app.register(setupRoutes);
 
   return app;
 }

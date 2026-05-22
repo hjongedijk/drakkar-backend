@@ -44,7 +44,7 @@ export function parseReleaseTitle(title: string): ParsedQuality {
     audio: title.match(/\b(TrueHD|Atmos|DTS-?HD|DTS|DDP?5\.1|AAC|FLAC)\b/i)?.[1],
     hdr: /\b(HDR10\+?|HDR)\b/i.test(title),
     dv: /\b(DV|Dolby Vision)\b/i.test(title),
-    language: title.match(/\b(MULTI|DUAL|GERMAN|FRENCH|SPANISH|JAPANESE|ENGLISH)\b/i)?.[1]?.toLowerCase(),
+    language: normalizeLanguage(title.match(/\b(MULTI|DUAL|GERMAN|DEUTSCH|FRENCH|SPANISH|JAPANESE|ENGLISH|DUTCH|NEDERLANDS|NL)\b/i)?.[1]),
     season: seasonEpisode?.groups?.season ? Number(seasonEpisode.groups.season) : undefined,
     episode: seasonEpisode?.groups?.episode ? Number(seasonEpisode.groups.episode) : undefined,
     year: year ? Number(year) : undefined,
@@ -55,6 +55,14 @@ export function parseReleaseTitle(title: string): ParsedQuality {
     suspicious: /\b(fake|sample|subpack|readnfo)\b/i.test(title),
     passworded: /\b(password|encrypted)\b/i.test(title)
   };
+}
+
+function normalizeLanguage(value?: string) {
+  if (!value) return undefined;
+  const normalized = value.toLowerCase();
+  if (normalized === "deutsch") return "german";
+  if (normalized === "nederlands" || normalized === "nl") return "dutch";
+  return normalized;
 }
 
 export function enrichRelease(release: Omit<Release, "hdr" | "dv" | "isRepack" | "isProper" | "isRemux" | "rawAttributes"> & { rawAttributes?: Record<string, unknown> }): Release {

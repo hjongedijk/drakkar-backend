@@ -1,6 +1,9 @@
 import "dotenv/config";
 import { join } from "node:path";
 import { z } from "zod";
+import { ensureRuntimeSettings } from "./runtimeSettings.js";
+
+const runtimeSettings = ensureRuntimeSettings(process.env.CONFIG_DIR || "/data/config");
 
 const envBoolean = z.preprocess((value) => {
   if (typeof value === "string") {
@@ -33,9 +36,13 @@ const envSchema = z.object({
   FUSE_ALLOW_OTHER: envBoolean.default(true),
   FUSE_FORCE_MOUNT: envBoolean.default(true),
   FUSE_DEBUG: envBoolean.default(false),
-  FRONTEND_API_TOKEN: z.string().default("dev-frontend-token"),
+  FRONTEND_API_TOKEN: z.string().default(runtimeSettings.frontendApiToken),
   AUTH_SESSION_TTL_DAYS: z.coerce.number().int().positive().default(30),
-  REQUEST_SYNC_ENABLED: envBoolean.default(true)
+  REQUEST_SYNC_ENABLED: envBoolean.default(true),
+  BACKGROUND_REPAIR_ENABLED: envBoolean.default(true),
+  STARTUP_RECOVERY_ENABLED: envBoolean.default(true),
+  DOWNLOAD_WORKERS_ENABLED: envBoolean.default(true),
+  STREAM_POOL_PRIME_ENABLED: envBoolean.default(true)
 });
 
 const parsedEnv = envSchema.parse(process.env);

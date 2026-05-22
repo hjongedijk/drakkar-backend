@@ -6,14 +6,20 @@ export const settingsSchema = z.object({
   nzbhydraApiKey: z.string().optional(),
   nzbhydraCategories: z.array(z.string()).default(["2000", "5000"]),
   nzbhydraTimeoutMs: z.number().int().positive().default(15000),
-  nzbhydraCacheTtlSeconds: z.number().int().positive().default(300),
+  nzbhydraCacheTtlSeconds: z.number().int().positive().default(3600),
+  nzbhydraFeedCacheTtlSeconds: z.number().int().positive().default(900),
   backupNzbFiles: z.boolean().default(false),
   tmdbApiKey: z.string().optional(),
   tvdbApiKey: z.string().optional(),
   metadataLanguage: z.string().default("en-US"),
   metadataCacheTtlHours: z.number().int().positive().default(168),
   defaultMovieProfile: z.string().default("Movie Standard"),
-  defaultTvProfile: z.string().default("TV Standard")
+  defaultTvProfile: z.string().default("TV Standard"),
+  plexServerUrl: z.string().url().optional().or(z.literal("")),
+  plexToken: z.string().optional(),
+  plexLibraryPath: z.string().default("/mnt/media"),
+  plexSectionId: z.string().optional(),
+  plexClientIdentifier: z.string().default("drakkar")
 });
 
 export type AppSettings = z.infer<typeof settingsSchema>;
@@ -23,14 +29,20 @@ const DEFAULT_SETTINGS: AppSettings = {
   nzbhydraApiKey: "",
   nzbhydraCategories: ["2000", "5000"],
   nzbhydraTimeoutMs: 15000,
-  nzbhydraCacheTtlSeconds: 300,
+  nzbhydraCacheTtlSeconds: 3600,
+  nzbhydraFeedCacheTtlSeconds: 900,
   backupNzbFiles: false,
   tmdbApiKey: "",
   tvdbApiKey: "",
   metadataLanguage: "en-US",
   metadataCacheTtlHours: 168,
   defaultMovieProfile: "Movie Standard",
-  defaultTvProfile: "TV Standard"
+  defaultTvProfile: "TV Standard",
+  plexServerUrl: "",
+  plexToken: "",
+  plexLibraryPath: "/mnt/media",
+  plexSectionId: "",
+  plexClientIdentifier: "drakkar"
 };
 
 const SETTINGS_KEY = "app";

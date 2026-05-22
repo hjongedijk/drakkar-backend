@@ -5,6 +5,7 @@ import type { Release } from "../releases/types.js";
 const qualityScore: Record<string, number> = { "480p": 10, "720p": 40, "1080p": 70, "2160p": 100 };
 const sourceScore: Record<string, number> = { cam: -100, telesync: -90, screener: -50, hdtv: 5, webrip: 15, webdl: 25, bluray: 35 };
 const codecScore: Record<string, number> = { x264: 5, h264: 5, x265: 12, h265: 12, hevc: 12, av1: 10 };
+const neutralMultiLanguages = new Set(["multi", "dual"]);
 
 export type ReleaseScore = {
   accepted: boolean;
@@ -16,6 +17,13 @@ export type ReleaseScore = {
 function includesWord(words: string[], title: string) {
   const lower = title.toLowerCase();
   return words.filter((word) => lower.includes(word.toLowerCase()));
+}
+
+function languageAllowed(language: string | undefined, allowed: string[]) {
+  if (allowed.length === 0) return true;
+  if (!language) return true;
+  const normalized = allowed.map((item) => item.toLowerCase());
+  return normalized.includes(language) || neutralMultiLanguages.has(language);
 }
 
 export function scoreRelease(release: Release, profile: QualityProfile): ReleaseScore {
@@ -53,13 +61,19 @@ export function scoreRelease(release: Release, profile: QualityProfile): Release
     if (!release.title.toLowerCase().includes(word.toLowerCase())) reasons.push(`missing required word: ${word}`);
   }
   for (const lang of profile.requiredLanguages) {
-    if (language !== lang.toLowerCase()) reasons.push(`missing required language: ${lang}`);
+    if (!languageAllowed(language, profile.requiredLanguages)) {
+      reasons.push(`missing required language: ${lang}`);
+      break;
+    }
+  }
+  if (profile.preferredLanguages.length > 0 && !languageAllowed(language, profile.preferredLanguages)) {
+    reasons.push(`language ${language} is not preferred`);
   }
 
   score += resolution ? qualityScore[resolution] ?? 0 : 0;
   score += source ? sourceScore[source] ?? 0 : 0;
   score += codec ? codecScore[codec] ?? 0 : 0;
-  score += language && profile.preferredLanguages.includes(language) ? 15 : 0;
+  score += language && languageAllowed(language, profile.preferredLanguages) ? 20 : 0;
   score += includesWord(profile.preferredWords, release.title).length * 10;
   if (profile.preferProper && (release.isProper || parsed.isProper)) score += 8;
   if (profile.preferRepack && (release.isRepack || parsed.isRepack)) score += 8;

@@ -364,8 +364,6 @@ export async function importMountedDownloadByExtraction(input: { downloadId: str
     .map((file) => ({ file, kind: detectArchive(file.name) }))
     .filter((entry): entry is { file: typeof mountedFiles[number]; kind: "rar" | "rar-part" | "zip" | "7z" } => entry.kind !== "none")
     .sort((a, b) => a.file.name.localeCompare(b.file.name, undefined, { numeric: true, sensitivity: "base" }));
-  const archiveFiles = materializeFiles
-    .filter((entry) => entry.kind === "zip" || entry.kind === "7z" || entry.kind === "rar-part" || !/\.part\d+\.rar$/i.test(entry.file.name));
   const tempExtractPath = join(env.VFS_TMP_DIR, "mounted-extract", download.id);
   const tempArchivePath = join(tempExtractPath, ".archives");
   await rm(tempExtractPath, { recursive: true, force: true }).catch(() => undefined);

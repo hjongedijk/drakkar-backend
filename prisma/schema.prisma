@@ -118,6 +118,8 @@ model SearchHistory {
   status    String
   message   String?
   createdAt DateTime @default(now())
+
+  @@index([createdAt])
 }
 
 model UsenetServer {
@@ -135,6 +137,8 @@ model UsenetServer {
   retentionDays Int?
   createdAt     DateTime @default(now())
   updatedAt     DateTime @updatedAt
+
+  @@index([enabled, isBackup, priority])
 }
 
 model NzbDocument {
@@ -166,6 +170,8 @@ model NzbFile {
   groups        String[]
   size          Float        @default(0)
   segments      NzbSegment[]
+
+  @@index([nzbDocumentId])
 }
 
 model NzbSegment {
@@ -175,6 +181,8 @@ model NzbSegment {
   number    Int
   bytes     Float
   articleId String
+
+  @@index([nzbFileId, number])
 }
 
 model VfsMount {
@@ -187,6 +195,8 @@ model VfsMount {
   streamable    Boolean     @default(false)
   createdAt     DateTime    @default(now())
   updatedAt     DateTime    @updatedAt
+
+  @@index([createdAt])
 }
 
 model Download {
@@ -209,6 +219,9 @@ model Download {
   completedAt   DateTime?
   repairJobs     RepairJob[]
   imports        ImportItem[]
+
+  @@index([status, updatedAt])
+  @@index([createdAt])
 }
 
 model RequestProvider {
@@ -226,6 +239,8 @@ model RequestProvider {
   requests            MediaRequest[]
   createdAt           DateTime       @default(now())
   updatedAt           DateTime       @updatedAt
+
+  @@index([enabled, name])
 }
 
 model MediaRequest {
@@ -253,6 +268,8 @@ model MediaRequest {
   updatedAt         DateTime         @updatedAt
 
   @@unique([providerId, externalId])
+  @@index([downloadId])
+  @@index([status, createdAt])
 }
 
 model RepairJob {
@@ -267,6 +284,8 @@ model RepairJob {
   completedAt DateTime?
   createdAt   DateTime @default(now())
   updatedAt   DateTime @updatedAt
+
+  @@index([downloadId, createdAt])
 }
 
 model FailedRelease {
@@ -288,6 +307,9 @@ model BlocklistItem {
   expiresAt   DateTime?
   createdAt   DateTime @default(now())
   updatedAt   DateTime @updatedAt
+
+  @@index([createdAt])
+  @@index([guid])
 }
 
 model ImportItem {
@@ -309,6 +331,11 @@ model ImportItem {
   symlinks      Symlink[]
   createdAt     DateTime     @default(now())
   updatedAt     DateTime     @updatedAt
+
+  @@index([downloadId])
+  @@index([requestId])
+  @@index([mediaType, title, year, season, episode])
+  @@index([createdAt])
 }
 
 model Symlink {
@@ -320,6 +347,9 @@ model Symlink {
   status      String     @default("ok")
   createdAt   DateTime   @default(now())
   updatedAt   DateTime   @updatedAt
+
+  @@index([importId])
+  @@index([status, updatedAt])
 }
 
 model MediaLibraryItem {
@@ -371,4 +401,10 @@ model MediaLibraryItem {
   streamCount       Int      @default(0)
   createdAt         DateTime @default(now())
   updatedAt         DateTime @updatedAt
+
+  @@index([libraryStatus, sortTitle, createdAt])
+  @@index([requestId])
+  @@index([downloadId])
+  @@index([filePath])
+  @@index([lastStreamedAt])
 }

@@ -2,7 +2,7 @@ import { dirname } from "node:path";
 import { unlink } from "node:fs/promises";
 import type { MediaLibraryItem } from "@prisma/client";
 import { prisma } from "../db/prisma.js";
-import { addNzbFromPath } from "../downloads/downloadService.js";
+import { addNzbFromPath, findReusableDownload } from "../downloads/downloadService.js";
 import { downloadNzb } from "../indexers/nzbhydra/client.js";
 import { fetchMediaMetadata } from "../metadata/metadataService.js";
 import { createBlocklistItem, isReleaseBlocklisted } from "../policies/policyService.js";
@@ -133,8 +133,15 @@ export async function replaceLibraryItemWithRelease(id: string, release: unknown
   const settings = await getSettings();
   const typedRelease = release as Release;
   if (await isReleaseBlocklisted(typedRelease)) throw new Error("selected release is blocklisted");
-  const nzb = await downloadNzb(settings, typedRelease);
-  const download = await addNzbFromPath(nzb.primaryPath, typedRelease.title, { guid: typedRelease.guid ? String(typedRelease.guid) : undefined });
+  const reusable = await findReusableDownload({
+    guid: typedRelease.guid ? String(typedRelease.guid) : undefined,
+    title: typedRelease.title
+  });
+  const download = reusable
+    ?? await (async () => {
+      const nzb = await downloadNzb(settings, typedRelease);
+      return addNzbFromPath(nzb.primaryPath, typedRelease.title, { guid: typedRelease.guid ? String(typedRelease.guid) : undefined });
+    })();
   if (item.requestId) {
     await prisma.mediaRequest.update({
       where: { id: item.requestId },

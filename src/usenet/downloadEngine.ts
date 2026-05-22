@@ -3,12 +3,11 @@ import { join } from "node:path";
 import type { FastifyBaseLogger } from "fastify";
 import { prisma } from "../db/prisma.js";
 import { env } from "../config/env.js";
-import { decodeArticleBody } from "./yenc.js";
+import { decodeYencBufferLine } from "./yenc.js";
 import { NntpClient } from "./nntpClient.js";
-import { getPolicySettings } from "../policies/policyService.js";
 import { getAllowedDownloadConnections } from "../bandwidth/bandwidthScheduler.js";
 import { filenameFromSubject } from "./filename.js";
-import { classifyNzbImportMode, type NzbImportMode } from "./importMode.js";
+import { classifyNzbImportMode, classifyNzbImportPlan, type NzbImportMode, type NzbImportPlan } from "./importMode.js";
 import { humanizeDownloadError } from "../downloads/presentation.js";
 import { getUsenetRuntimeVersion } from "./settings.js";
 
@@ -37,10 +36,14 @@ function sleep(ms: number) {
   return new Promise((resolve) => setTimeout(resolve, ms));
 }
 
-async function waitForQueueCapacity(workerIndex: number) {
-  while (workerIndex >= (await getAllowedDownloadConnections())) {
-    await sleep(1000);
+async function collectDecodedArticleBody(client: NntpClient, articleId: string, signal?: AbortSignal) {
+  const chunks: Buffer[] = [];
+  let total = 0;
+  for await (const chunk of client.decodedBodyBufferChunks(articleId, decodeYencBufferLine, signal)) {
+    chunks.push(chunk);
+    total += chunk.length;
   }
+  return Buffer.concat(chunks, total);
 }
 
 function isTemporaryProviderError(message: string) {
@@ -199,8 +202,7 @@ class NntpPool {
           await slot.client.connect();
           this.syncDebug();
         }
-        const body = await slot.client.body(articleId);
-        return decodeArticleBody(body);
+        return await collectDecodedArticleBody(slot.client, articleId);
       } catch (error) {
         const message = error instanceof Error ? error.message : "unknown NNTP error";
         errors.push(`${slot.provider.name}: ${message}`);
@@ -274,13 +276,66 @@ class NntpPool {
     throw new Error(`all providers failed STAT for ${articleId}: ${errors.join("; ")}`);
   }
 
+  async *stream(articleId: string) {
+    this.assertRuntimeVersion();
+    const errors: string[] = [];
+    const permanentFailures = new Set<string>();
+    const providerCount = new Set(this.slots.map((slot) => slot.provider.id)).size;
+    const maxAttempts = Math.max(providerCount, this.slots.length * 2);
+    let includeBackups = this.primaryProviderCount === 0;
+
+    for (let attempt = 1; attempt <= maxAttempts; attempt += 1) {
+      if (permanentFailures.size >= providerCount) break;
+      const slot = await this.acquire(permanentFailures, includeBackups);
+      let success = false;
+      try {
+        if (!slot.client) {
+          slot.client = new NntpClient(slot.provider);
+          await slot.client.connect();
+          this.syncDebug();
+        }
+        for await (const chunk of slot.client.decodedBodyBufferChunks(articleId, decodeYencBufferLine)) {
+          yield chunk;
+        }
+        success = true;
+        return;
+      } catch (error) {
+        const message = error instanceof Error ? error.message : "unknown NNTP error";
+        errors.push(`${slot.provider.name}: ${message}`);
+        this.logger.warn({ provider: slot.provider.name, articleId, attempt, err: error }, "segment stream failed");
+        await slot.client?.quit().catch(() => undefined);
+        slot.client = undefined;
+        this.syncDebug();
+        if (isProviderConnectionLimit(message)) {
+          permanentFailures.add(slot.provider.id);
+          if (!includeBackups && this.allPrimaryProvidersFailed(permanentFailures)) includeBackups = true;
+          if (permanentFailures.size >= providerCount) throw new Error(`too many connections from all configured providers`);
+        } else if (isTemporaryProviderError(message)) {
+          if (attempt < maxAttempts) await sleep(Math.min(15000, attempt * 2000));
+        } else {
+          permanentFailures.add(slot.provider.id);
+          if (!includeBackups && this.allPrimaryProvidersFailed(permanentFailures)) includeBackups = true;
+        }
+      } finally {
+        if (!success) this.release(slot);
+        else this.release(slot);
+      }
+    }
+
+    throw new Error(`all providers failed for ${articleId}: ${errors.join("; ")}`);
+  }
+
   async close() {
     await Promise.all(this.slots.map((slot) => slot.client?.quit().catch(() => undefined)));
     clearPoolDebugState(this.ownerId);
   }
 
-  private acquire(excludedProviders = new Set<string>(), includeBackups = true) {
-    const available = this.slots.find(
+  private async acquire(excludedProviders = new Set<string>(), includeBackups = true): Promise<PoolSlot> {
+    if ((await getAllowedDownloadConnections()) <= 0) {
+      await sleep(1000);
+      return this.acquire(excludedProviders, includeBackups);
+    }
+    const available = (await this.activeSlots()).find(
       (slot) => !slot.busy && !excludedProviders.has(slot.provider.id) && (includeBackups || !slot.provider.isBackup)
     );
     if (available) {
@@ -292,6 +347,11 @@ class NntpPool {
     return new Promise<PoolSlot>((resolve) => {
       this.waiters.push({ excludedProviders: new Set(excludedProviders), includeBackups, resolve });
     });
+  }
+
+  private async activeSlots() {
+    const limit = Math.max(1, Math.min(await getAllowedDownloadConnections(), this.slots.length));
+    return this.slots.slice(0, limit);
   }
 
   private release(slot: PoolSlot) {
@@ -345,7 +405,6 @@ async function reconstructFile(input: {
   startedAt: number;
 }) {
   let downloaded = input.downloadedBefore;
-  let aborted = false;
   let lastProgressUpdateAt = 0;
   let lastProgressPersistedBytes = input.downloadedBefore;
   let progressWrite = Promise.resolve();
@@ -355,14 +414,10 @@ async function reconstructFile(input: {
   const filename = filenameFromSubject(input.file.subject, input.fileIndex);
   const outputPath = join(outputDir, filename);
   const handle = await open(outputPath, "w");
-
-  let nextSegmentIndex = 0;
-  let nextWriteIndex = 0;
   let writeOffset = 0;
-  let writeChain = Promise.resolve();
-  const pendingChunks = new Map<number, Buffer>();
-  const maxBufferedChunks = Math.max(8, input.pool.size * 2);
   let pendingProgressSnapshot: number | null = null;
+  let pendingWriteBytes = 0;
+  let pendingWriteBuffers: Buffer[] = [];
 
   function progressData(downloadedSnapshot: number) {
     const elapsedSeconds = Math.max(1, (Date.now() - input.startedAt) / 1000);
@@ -406,60 +461,74 @@ async function reconstructFile(input: {
     if (force) await progressWrite;
   }
 
-  function drainWrites() {
-    writeChain = writeChain
-      .catch(() => undefined)
-      .then(async () => {
-        while (pendingChunks.has(nextWriteIndex)) {
-          const chunks: Buffer[] = [];
-          let batchedBytes = 0;
-          while (pendingChunks.has(nextWriteIndex)) {
-            const chunk = pendingChunks.get(nextWriteIndex);
-            pendingChunks.delete(nextWriteIndex);
-            if (!chunk) {
-              nextWriteIndex += 1;
-              continue;
-            }
-            chunks.push(chunk);
-            batchedBytes += chunk.length;
-            nextWriteIndex += 1;
-            if (batchedBytes >= DOWNLOAD_WRITE_BATCH_BYTES) break;
-          }
-          if (chunks.length === 0) continue;
-          await handle.writev(chunks, writeOffset);
-          writeOffset += batchedBytes;
-          await updateProgress(batchedBytes);
-        }
-      });
-    return writeChain;
+  async function flushPendingWrites(force = false) {
+    if (!force && pendingWriteBytes < DOWNLOAD_WRITE_BATCH_BYTES) return;
+    if (pendingWriteBytes === 0 || pendingWriteBuffers.length === 0) return;
+    const bytes = pendingWriteBytes;
+    const buffers = pendingWriteBuffers;
+    pendingWriteBytes = 0;
+    pendingWriteBuffers = [];
+    await handle.writev(buffers, writeOffset);
+    writeOffset += bytes;
+    await updateProgress(bytes);
   }
 
-  async function worker(workerIndex: number) {
-    while (!aborted) {
-      await waitForQueueCapacity(workerIndex);
-      while (!aborted && pendingChunks.size >= maxBufferedChunks) {
-        await writeChain;
-      }
-      const segmentIndex = nextSegmentIndex;
-      const segment = input.file.segments[segmentIndex];
-      nextSegmentIndex += 1;
-      if (!segment) return;
+  type PrimedSegment = {
+    first: Promise<{ ok: true; step: IteratorResult<Buffer> } | { ok: false; error: unknown }>;
+    iterator: AsyncIterator<Buffer>;
+  };
+  const prefetchCount = Math.max(1, Math.min(input.pool.size, 24, input.file.segments.length));
+  const primed = new Map<number, PrimedSegment>();
+  let nextPrimeIndex = 0;
 
-      const chunk = await input.pool.article(segment.articleId);
-      pendingChunks.set(segmentIndex, chunk);
-      void drainWrites();
+  function primeSegment(index: number) {
+    const segment = input.file.segments[index];
+    if (!segment || primed.has(index)) return;
+    const iterator = input.pool.stream(segment.articleId)[Symbol.asyncIterator]();
+    primed.set(index, {
+      iterator,
+      first: iterator.next()
+        .then((step) => ({ ok: true as const, step }))
+        .catch((error) => ({ ok: false as const, error }))
+    });
+  }
+
+  function topUpPrefetch() {
+    while (primed.size < prefetchCount && nextPrimeIndex < input.file.segments.length) {
+      primeSegment(nextPrimeIndex);
+      nextPrimeIndex += 1;
     }
   }
 
   try {
-    const concurrency = Math.max(1, Math.min(input.pool.size, input.file.segments.length));
-    await Promise.all(Array.from({ length: concurrency }, (_, workerIndex) => worker(workerIndex)));
-    await writeChain;
+    topUpPrefetch();
+    for (let segmentIndex = 0; segmentIndex < input.file.segments.length; segmentIndex += 1) {
+      const current = primed.get(segmentIndex);
+      if (!current) throw new Error(`segment stream was not primed for index ${segmentIndex}`);
+      primed.delete(segmentIndex);
+      topUpPrefetch();
+
+      const first = await current.first;
+      if (!first.ok) throw first.error;
+      let step = first.step;
+      while (!step.done) {
+        const chunk = step.value;
+        if (chunk.length > 0) {
+          pendingWriteBuffers.push(chunk);
+          pendingWriteBytes += chunk.length;
+          await flushPendingWrites();
+        }
+        step = await current.iterator.next();
+      }
+      await flushPendingWrites(true);
+    }
+    await flushPendingWrites(true);
     await updateProgress(0, true);
-  } catch (error) {
-    aborted = true;
-    throw error;
   } finally {
+    await Promise.all(
+      [...primed.values()].map((segment) => segment.iterator.return?.().catch(() => undefined))
+    );
+    await flushPendingWrites(true);
     await handle.close();
   }
 
@@ -476,7 +545,6 @@ export async function prepareNzbDocumentForStreaming(input: {
   if (!nzb) throw new Error("NZB document not found");
 
   const providers = await getProviders();
-  const policies = await getPolicySettings();
   if (providers.length === 0) {
     await prisma.download.update({
       where: { id: input.downloadId },
@@ -586,12 +654,17 @@ export async function getNzbImportMode(nzbDocumentId: string): Promise<NzbImport
   return classifyNzbImportMode(nzb);
 }
 
+export async function getNzbImportPlan(nzbDocumentId: string): Promise<NzbImportPlan> {
+  const nzb = await loadNzbDocument(nzbDocumentId);
+  if (!nzb) throw new Error("NZB document not found");
+  return classifyNzbImportPlan(nzb);
+}
+
 export async function downloadNzbDocument(input: { downloadId: string; nzbDocumentId: string; logger: FastifyBaseLogger }) {
   const nzb = await loadNzbDocument(input.nzbDocumentId);
   if (!nzb) throw new Error("NZB document not found");
 
   const providers = await getProviders();
-  const policies = await getPolicySettings();
   if (providers.length === 0) {
     await prisma.download.update({
       where: { id: input.downloadId },

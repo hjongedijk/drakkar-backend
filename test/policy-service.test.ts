@@ -1,6 +1,6 @@
 import { describe, it } from "node:test";
 import assert from "node:assert/strict";
-import { matchesIgnoredPattern } from "../src/policies/policyService.js";
+import { matchesIgnoredPattern, normalizePolicyConnectionBudgets } from "../src/policies/policyService.js";
 
 describe("matchesIgnoredPattern", () => {
   it("matches extension and substring ignore patterns", () => {
@@ -17,5 +17,20 @@ describe("matchesIgnoredPattern", () => {
     assert.equal(matchesIgnoredPattern("/vfs/downloads/BDMV/STREAM/file.m2ts", patterns), true);
     assert.equal(matchesIgnoredPattern("/vfs/downloads/VIDEO_TS/VTS_01_1.VOB", patterns), true);
     assert.equal(matchesIgnoredPattern("/vfs/downloads/movie/VIDEO/file.mkv", patterns), false);
+  });
+
+  it("does not permanently reserve streaming connections away from downloads", () => {
+    assert.deepEqual(
+      normalizePolicyConnectionBudgets({
+        totalEnabledConnections: 30,
+        maxStreamingConnections: 10,
+        maxDownloadConnections: 20
+      }),
+      {
+        maxStreamingConnections: 10,
+        maxDownloadConnections: 20,
+        maxTotalUsenetConnections: 30
+      }
+    );
   });
 });

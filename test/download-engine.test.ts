@@ -51,7 +51,7 @@ describe("classifyNzbImportMode", () => {
     assert.equal(mode, "mounted");
   });
 
-  it("uses materialized mode for archive payloads", () => {
+  it("rejects archive payloads instead of downloading them to disk", () => {
     const mode = classifyNzbImportMode({
       files: [
         { subject: '[1/57] "Movie.2026.part01.rar" yEnc (1/200)' },
@@ -59,6 +59,6 @@ describe("classifyNzbImportMode", () => {
       ]
     });
 
-    assert.equal(mode, "materialized");
+    assert.equal(mode, "unsupported");
   });
 });

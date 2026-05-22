@@ -3,16 +3,19 @@ import type { FastifyInstance } from "fastify";
 import { toPublicRelease } from "../releases/public.js";
 import {
   createProvider,
+  createManualRequest,
   deleteProvider,
   getRequest,
   getRequestMonitor,
   grabBestForRequest,
   grabMissingTvForRequest,
+  grabTvEpisodeForRequest,
   grabReleaseForRequest,
   listProviders,
   listRequests,
   markRequestAvailable,
   rankReleasesForRequest,
+  rankTvEpisodeForRequest,
   recoverFailedRequestDownloads,
   ensureMonitoredRequests,
   refreshRequest,
@@ -35,6 +38,21 @@ const providerSchema = z.object({
 
 const releaseGrabSchema = z.object({
   release: z.any()
+});
+
+const manualRequestSchema = z.object({
+  mediaType: z.enum(["movie", "tv"]),
+  title: z.string().min(1),
+  year: z.number().int().positive().optional(),
+  tmdbId: z.string().optional(),
+  tvdbId: z.string().optional(),
+  imdbId: z.string().optional()
+});
+
+const episodeParamsSchema = z.object({
+  id: z.string(),
+  season: z.coerce.number().int().positive(),
+  episode: z.coerce.number().int().positive()
 });
 
 function idParam(request: { params: unknown }) {
@@ -80,16 +98,23 @@ export async function requestRoutes(app: FastifyInstance): Promise<void> {
   app.post("/api/request-providers/:id/test", async (request) => testRequestProvider(idParam(request)));
 
   app.get("/api/requests", async () => (await listRequests()).map(publicRequest));
+  app.post("/api/requests", async (request) => publicResult(await createManualRequest(manualRequestSchema.parse(request.body))));
   app.get("/api/requests/:id", async (request) => publicRequest(await getRequest(idParam(request))));
   app.get("/api/requests/:id/monitor", async (request) => publicResult(await getRequestMonitor(idParam(request))));
   app.post("/api/requests/sync", async (request) => {
     const result = await syncRequests((request.body as { providerId?: string } | undefined)?.providerId);
-    const recovery = await recoverFailedRequestDownloads();
-    const monitored = await ensureMonitoredRequests();
+    void (async () => {
+      try {
+        await recoverFailedRequestDownloads();
+        await ensureMonitoredRequests();
+      } catch (error) {
+        request.log.warn({ err: error }, "post-sync recovery/monitor refresh failed");
+      }
+    })();
     return publicResult({
       ...result,
-      recovery: { recovered: recovery.recovered },
-      monitored: { retried: monitored.retried },
+      recovery: { recovered: 0, deferred: true },
+      monitored: { retried: 0, deferred: true },
       requests: result.requests.map(publicRequest)
     });
   });
@@ -102,6 +127,20 @@ export async function requestRoutes(app: FastifyInstance): Promise<void> {
       request: publicRequest(result.request),
       releases: result.releases.map((item) => ({ ...item, release: toPublicRelease(item.release) }))
     };
+  });
+  app.post("/api/requests/:id/episodes/:season/:episode/search", async (request) => {
+    const params = episodeParamsSchema.parse(request.params);
+    const result = await rankTvEpisodeForRequest(params.id, params.season, params.episode);
+    return {
+      ...result,
+      request: publicRequest(result.request),
+      releases: result.releases.map((item) => ({ ...item, release: toPublicRelease(item.release) }))
+    };
+  });
+  app.post("/api/requests/:id/episodes/:season/:episode/download", async (request) => {
+    const params = episodeParamsSchema.parse(request.params);
+    const result = await grabTvEpisodeForRequest(params.id, params.season, params.episode);
+    return result;
   });
   app.post("/api/requests/:id/grab", async (request) => {
     const mediaRequest = await getRequest(idParam(request));

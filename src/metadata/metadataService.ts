@@ -1,4 +1,6 @@
+import { createHash } from "node:crypto";
 import type { AppSettings } from "../settings/settingsStore.js";
+import { redis } from "../db/redis.js";
 
 export type MediaMetadataLookup = {
   mediaType: string;
@@ -65,6 +67,34 @@ export type DiscoverListResponse = {
   items: DiscoverMediaItem[];
 };
 
+export type DiscoverSearchResponse = {
+  query: string;
+  movies: DiscoverMediaItem[];
+  tv: DiscoverMediaItem[];
+};
+
+export type MediaDetailsResponse = DiscoverMediaItem & {
+  runtimeMinutes?: number;
+  status?: string;
+  tagline?: string;
+  genres: string[];
+  voteAverage?: number;
+  voteCount?: number;
+  popularity?: number;
+  originalLanguage?: string;
+  budget?: number;
+  revenue?: number;
+  productionCompanies: string[];
+  cast: Array<{
+    id?: string;
+    name: string;
+    character?: string;
+    profileUrl?: string;
+  }>;
+  recommendations: DiscoverMediaItem[];
+  similar: DiscoverMediaItem[];
+};
+
 export type CalendarMediaInfo = {
   mediaType: "movie" | "tv";
   title?: string;
@@ -89,6 +119,14 @@ type TmdbSearchResult = {
   number_of_seasons?: number;
   number_of_episodes?: number;
   seasons?: Array<{ season_number?: number; name?: string; episode_count?: number; air_date?: string }>;
+  media_type?: string;
+};
+
+type TmdbPerson = {
+  id?: number;
+  name?: string;
+  character?: string;
+  profile_path?: string | null;
 };
 
 type TmdbEpisode = {
@@ -105,6 +143,46 @@ type TvdbToken = {
 };
 
 let tvdbToken: TvdbToken | null = null;
+const metadataCache = new Map<string, { expiresAt: number; value: unknown }>();
+
+function cacheTtlMs(settings: AppSettings) {
+  return Math.max(1, settings.metadataCacheTtlHours) * 60 * 60 * 1000;
+}
+
+function pruneMetadataCache() {
+  const now = Date.now();
+  for (const [key, entry] of metadataCache) {
+    if (entry.expiresAt <= now) metadataCache.delete(key);
+  }
+}
+
+function metadataCacheKey(kind: string, input: Record<string, unknown>) {
+  const normalized = Object.entries(input)
+    .filter(([, value]) => value !== undefined && value !== null && value !== "")
+    .sort(([left], [right]) => left.localeCompare(right));
+  const digest = createHash("sha1").update(JSON.stringify(normalized)).digest("hex");
+  return `metadata:${kind}:${digest}`;
+}
+
+async function withMetadataCache<T>(settings: AppSettings, kind: string, input: Record<string, unknown>, loader: () => Promise<T>): Promise<T> {
+  pruneMetadataCache();
+  const key = metadataCacheKey(kind, input);
+  const cached = metadataCache.get(key);
+  if (cached && cached.expiresAt > Date.now()) return cached.value as T;
+  const redisCached = await redis.get(key).catch(() => null);
+  if (redisCached) {
+    const value = JSON.parse(redisCached) as T;
+    metadataCache.set(key, { value, expiresAt: Date.now() + cacheTtlMs(settings) });
+    return value;
+  }
+  const value = await loader();
+  if (value !== undefined) {
+    const ttlSeconds = Math.max(60, Math.floor(cacheTtlMs(settings) / 1000));
+    metadataCache.set(key, { value, expiresAt: Date.now() + cacheTtlMs(settings) });
+    await redis.set(key, JSON.stringify(value), "EX", ttlSeconds).catch(() => undefined);
+  }
+  return value;
+}
 
 function imageUrl(path?: string | null, size = "w500") {
   return path ? `https://image.tmdb.org/t/p/${size}${path}` : undefined;
@@ -130,6 +208,7 @@ async function tmdbFetch<T>(settings: AppSettings, path: string, params: Record<
 
 async function resolveTmdb(settings: AppSettings, input: MediaMetadataLookup) {
   if (input.tmdbId) return input.tmdbId;
+  if (!input.title.trim()) return undefined;
   const type = input.mediaType === "tv" ? "tv" : "movie";
   const data = await tmdbFetch<{ results: TmdbSearchResult[] }>(settings, `search/${type}`, {
     query: input.title,
@@ -243,67 +322,73 @@ async function getTvdbMetadata(settings: AppSettings, input: MediaMetadataLookup
 }
 
 export async function fetchMediaMetadata(settings: AppSettings, input: MediaMetadataLookup): Promise<MediaMetadata | undefined> {
-  const results = await Promise.allSettled([getTmdbMetadata(settings, input), getTvdbMetadata(settings, input)]);
-  const tmdb = results[0].status === "fulfilled" ? results[0].value : undefined;
-  const tvdb = results[1].status === "fulfilled" ? results[1].value : undefined;
-  if (!tmdb && !tvdb) return undefined;
-  return { ...tvdb, ...tmdb, tvdbId: tmdb?.tvdbId ?? tvdb?.tvdbId ?? input.tvdbId ?? undefined };
+  return withMetadataCache(settings, "media", input, async () => {
+    const results = await Promise.allSettled([getTmdbMetadata(settings, input), getTvdbMetadata(settings, input)]);
+    const tmdb = results[0].status === "fulfilled" ? results[0].value : undefined;
+    const tvdb = results[1].status === "fulfilled" ? results[1].value : undefined;
+    if (!tmdb && !tvdb) return undefined;
+    return { ...tvdb, ...tmdb, tvdbId: tmdb?.tvdbId ?? tvdb?.tvdbId ?? input.tvdbId ?? undefined };
+  });
 }
 
 export async function fetchSeriesStructure(settings: AppSettings, input: MediaMetadataLookup): Promise<SeriesStructure | undefined> {
   if (input.mediaType !== "tv") return undefined;
-  const tmdbId = await resolveTmdb(settings, input);
-  if (tmdbId) {
-    const details = await tmdbFetch<TmdbSearchResult & { external_ids?: { tvdb_id?: number } }>(settings, `tv/${tmdbId}`, {
-      append_to_response: "external_ids"
-    });
-    if (details) {
-      return {
-        tmdbId,
-        tvdbId: details.external_ids?.tvdb_id ? String(details.external_ids.tvdb_id) : input.tvdbId ?? undefined,
-        title: details.name,
-        posterUrl: imageUrl(details.poster_path),
-        backdropUrl: imageUrl(details.backdrop_path, "w1280"),
-        overview: details.overview,
-        status: details.status,
-        numberOfSeasons: details.number_of_seasons ?? 0,
-        numberOfEpisodes: details.number_of_episodes ?? 0,
-        seasons: (details.seasons ?? [])
-          .filter((season) => (season.season_number ?? 0) > 0)
-          .map((season) => ({
-            seasonNumber: season.season_number ?? 0,
-            name: season.name,
-            episodeCount: season.episode_count ?? 0,
-            airDate: season.air_date
-          }))
-      };
+  return withMetadataCache(settings, "series-structure", input, async () => {
+    const tmdbId = await resolveTmdb(settings, input);
+    if (tmdbId) {
+      const details = await tmdbFetch<TmdbSearchResult & { external_ids?: { tvdb_id?: number } }>(settings, `tv/${tmdbId}`, {
+        append_to_response: "external_ids"
+      });
+      if (details) {
+        return {
+          tmdbId,
+          tvdbId: details.external_ids?.tvdb_id ? String(details.external_ids.tvdb_id) : input.tvdbId ?? undefined,
+          title: details.name,
+          posterUrl: imageUrl(details.poster_path),
+          backdropUrl: imageUrl(details.backdrop_path, "w1280"),
+          overview: details.overview,
+          status: details.status,
+          numberOfSeasons: details.number_of_seasons ?? 0,
+          numberOfEpisodes: details.number_of_episodes ?? 0,
+          seasons: (details.seasons ?? [])
+            .filter((season) => (season.season_number ?? 0) > 0)
+            .map((season) => ({
+              seasonNumber: season.season_number ?? 0,
+              name: season.name,
+              episodeCount: season.episode_count ?? 0,
+              airDate: season.air_date
+            }))
+        };
+      }
     }
-  }
 
-  const tvdb = input.tvdbId ? await getTvdbMetadata(settings, input) : undefined;
-  if (!tvdb) return undefined;
-  return {
-    tvdbId: input.tvdbId ?? undefined,
-    title: tvdb.title,
-    posterUrl: tvdb.posterUrl,
-    backdropUrl: tvdb.backdropUrl,
-    overview: tvdb.overview,
-    status: undefined,
-    numberOfSeasons: 0,
-    numberOfEpisodes: 0,
-    seasons: []
-  };
+    const tvdb = input.tvdbId ? await getTvdbMetadata(settings, input) : undefined;
+    if (!tvdb) return undefined;
+    return {
+      tvdbId: input.tvdbId ?? undefined,
+      title: tvdb.title,
+      posterUrl: tvdb.posterUrl,
+      backdropUrl: tvdb.backdropUrl,
+      overview: tvdb.overview,
+      status: undefined,
+      numberOfSeasons: 0,
+      numberOfEpisodes: 0,
+      seasons: []
+    };
+  });
 }
 
 export async function fetchSeasonEpisodes(settings: AppSettings, tmdbId: string, seasonNumber: number) {
-  const season = await tmdbFetch<{ episodes?: TmdbEpisode[] }>(settings, `tv/${tmdbId}/season/${seasonNumber}`);
-  return (season?.episodes ?? []).map((episode) => ({
-    episodeNumber: episode.episode_number ?? 0,
-    name: episode.name,
-    overview: episode.overview,
-    airDate: episode.air_date,
-    stillUrl: imageUrl(episode.still_path, "w780")
-  }));
+  return withMetadataCache(settings, "season-episodes", { tmdbId, seasonNumber }, async () => {
+    const season = await tmdbFetch<{ episodes?: TmdbEpisode[] }>(settings, `tv/${tmdbId}/season/${seasonNumber}`);
+    return (season?.episodes ?? []).map((episode) => ({
+      episodeNumber: episode.episode_number ?? 0,
+      name: episode.name,
+      overview: episode.overview,
+      airDate: episode.air_date,
+      stillUrl: imageUrl(episode.still_path, "w780")
+    }));
+  });
 }
 
 export async function fetchCalendarMediaInfo(settings: AppSettings, input: MediaMetadataLookup): Promise<CalendarMediaInfo | undefined> {
@@ -356,6 +441,10 @@ function discoverItemFromTmdb(result: TmdbSearchResult, mediaType: "movie" | "tv
   };
 }
 
+function discoverItemsFromTmdb(results: TmdbSearchResult[] | undefined, mediaType: "movie" | "tv") {
+  return (results ?? []).slice(0, 18).map((item) => discoverItemFromTmdb(item, mediaType));
+}
+
 export async function fetchDiscoverHome(settings: AppSettings) {
   const [movies, tv] = await Promise.all([
     tmdbFetch<{ results: TmdbSearchResult[] }>(settings, "trending/movie/day"),
@@ -392,6 +481,74 @@ export async function fetchDiscoverList(settings: AppSettings, mediaType: "movie
     totalPages: Math.max(1, results?.total_pages ?? 1),
     items: items.map((item, index) => discoverItemFromTmdb(item, mediaType, externalIds[index]))
   };
+}
+
+export async function searchDiscoverMedia(settings: AppSettings, query: string): Promise<DiscoverSearchResponse> {
+  const data = await tmdbFetch<{ results: TmdbSearchResult[] }>(settings, "search/multi", { query });
+  const movieItems = (data?.results ?? []).filter((item) => item.media_type === "movie").slice(0, 18);
+  const tvItems = (data?.results ?? []).filter((item) => item.media_type === "tv").slice(0, 18);
+  const [movieIds, tvIds] = await Promise.all([
+    Promise.all(movieItems.map((item) => tmdbExternalIds(settings, "movie", String(item.id)).catch(() => undefined))),
+    Promise.all(tvItems.map((item) => tmdbExternalIds(settings, "tv", String(item.id)).catch(() => undefined)))
+  ]);
+  return {
+    query,
+    movies: movieItems.map((item, index) => discoverItemFromTmdb(item, "movie", movieIds[index])),
+    tv: tvItems.map((item, index) => discoverItemFromTmdb(item, "tv", tvIds[index]))
+  };
+}
+
+export async function fetchMediaDetails(settings: AppSettings, input: MediaMetadataLookup): Promise<MediaDetailsResponse | undefined> {
+  return withMetadataCache(settings, "details", input, async () => {
+    const tmdbId = await resolveTmdb(settings, input);
+    if (!tmdbId) return undefined;
+    const mediaType = input.mediaType === "tv" ? "tv" : "movie";
+    const details = await tmdbFetch<TmdbSearchResult & {
+      imdb_id?: string;
+      runtime?: number;
+      episode_run_time?: number[];
+      tagline?: string;
+      genres?: Array<{ name?: string }>;
+      vote_average?: number;
+      vote_count?: number;
+      popularity?: number;
+      original_language?: string;
+      budget?: number;
+      revenue?: number;
+      production_companies?: Array<{ name?: string }>;
+      external_ids?: { imdb_id?: string; tvdb_id?: number };
+      credits?: { cast?: TmdbPerson[] };
+      recommendations?: { results?: TmdbSearchResult[] };
+      similar?: { results?: TmdbSearchResult[] };
+    }>(settings, `${mediaType}/${tmdbId}`, {
+      append_to_response: mediaType === "tv" ? "external_ids,credits,recommendations,similar" : "credits,recommendations,similar"
+    });
+    if (!details) return undefined;
+    const externalIds = details.external_ids;
+    return {
+      ...discoverItemFromTmdb(details, mediaType, externalIds),
+      imdbId: details.imdb_id ?? externalIds?.imdb_id ?? input.imdbId ?? undefined,
+      runtimeMinutes: details.runtime ?? details.episode_run_time?.[0],
+      status: details.status,
+      tagline: details.tagline,
+      genres: (details.genres ?? []).map((genre) => genre.name).filter((name): name is string => Boolean(name)),
+      voteAverage: details.vote_average,
+      voteCount: details.vote_count,
+      popularity: details.popularity,
+      originalLanguage: details.original_language,
+      budget: details.budget,
+      revenue: details.revenue,
+      productionCompanies: (details.production_companies ?? []).map((company) => company.name).filter((name): name is string => Boolean(name)),
+      cast: (details.credits?.cast ?? []).slice(0, 12).map((person) => ({
+        id: person.id ? String(person.id) : undefined,
+        name: person.name ?? "Unknown",
+        character: person.character,
+        profileUrl: imageUrl(person.profile_path, "w185")
+      })),
+      recommendations: discoverItemsFromTmdb(details.recommendations?.results, mediaType),
+      similar: discoverItemsFromTmdb(details.similar?.results, mediaType)
+    };
+  });
 }
 
 export async function writeImportMetadata(_input: {

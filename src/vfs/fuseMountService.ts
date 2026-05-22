@@ -69,8 +69,9 @@ function asyncFuse<T>(
   void task()
     .then((value) => process.nextTick(onSuccess, value))
     .catch((error) => {
-      loggerRef?.debug({ err: error }, "native FUSE operation failed");
-      process.nextTick(onError, errorToFuseCode(error, fallbackCode));
+      const code = errorToFuseCode(error, fallbackCode);
+      if (code !== Fuse.ENOENT) loggerRef?.debug({ err: error }, "native FUSE operation failed");
+      process.nextTick(onError, code);
     });
 }
 

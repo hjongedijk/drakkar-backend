@@ -3,10 +3,15 @@ import tls from "node:tls";
 import type { UsenetServer } from "@prisma/client";
 
 type Socket = net.Socket | tls.TLSSocket;
+const CRLF = Buffer.from("\r\n", "ascii");
+
+function startsWithAscii(buffer: Buffer, value: string) {
+  return buffer.subarray(0, value.length).equals(Buffer.from(value, "ascii"));
+}
 
 export class NntpClient {
   private socket?: Socket;
-  private buffer = "";
+  private buffer = Buffer.alloc(0);
   private socketError: Error | null = null;
 
   constructor(private readonly server: UsenetServer) {}
@@ -19,9 +24,9 @@ export class NntpClient {
     this.socket.setKeepAlive(true, 30_000);
     this.socket.setNoDelay(true);
     this.socket.setTimeout(120000);
-    this.socket.setEncoding("binary");
     this.socket.on("data", (chunk) => {
-      this.buffer += chunk.toString();
+      const data = Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk);
+      this.buffer = this.buffer.length === 0 ? data : Buffer.concat([this.buffer, data]);
     });
     this.socket.on("error", (error) => {
       this.socketError = error;
@@ -55,7 +60,40 @@ export class NntpClient {
     return this.readMultiline(signal);
   }
 
+  async yencPartHeader(articleId: string, signal?: AbortSignal) {
+    const normalized = articleId.startsWith("<") ? articleId : `<${articleId}>`;
+    let ybegin: string | undefined;
+    let ypart: string | undefined;
+    let yend: string | undefined;
+
+    await this.write(`BODY ${normalized}\r\n`, signal);
+    const status = await this.readLine(signal);
+    if (!status.startsWith("222")) throw new Error(`BODY failed: ${status}`);
+
+    while (true) {
+      const line = await this.readLineBuffer(signal);
+      if (line.length === 1 && line[0] === 46) break;
+      const text = line.toString("latin1");
+      if (text.startsWith("=ybegin")) ybegin = text;
+      else if (text.startsWith("=ypart")) {
+        ypart = text;
+        break;
+      } else if (text.startsWith("=yend")) {
+        yend = text;
+        break;
+      }
+    }
+
+    this.socket?.destroy();
+    this.socket = undefined;
+    return { ybegin, ypart, yend };
+  }
+
   async *decodedBodyChunks(articleId: string, decodeLine: (line: string) => Buffer, signal?: AbortSignal): AsyncGenerator<Buffer> {
+    yield* this.decodedBodyBufferChunks(articleId, (line) => decodeLine(line.toString("latin1")), signal);
+  }
+
+  async *decodedBodyBufferChunks(articleId: string, decodeLine: (line: Buffer) => Buffer, signal?: AbortSignal): AsyncGenerator<Buffer> {
     const normalized = articleId.startsWith("<") ? articleId : `<${articleId}>`;
     let yenc = false;
 
@@ -64,19 +102,19 @@ export class NntpClient {
     if (!status.startsWith("222")) throw new Error(`BODY failed: ${status}`);
 
     while (true) {
-      const line = await this.readLine(signal);
-      if (line === ".") break;
-      if (line.startsWith("=ybegin")) {
+      const line = await this.readLineBuffer(signal);
+      if (line.length === 1 && line[0] === 46) break;
+      if (startsWithAscii(line, "=ybegin")) {
         yenc = true;
         continue;
       }
-      if (yenc && (line.startsWith("=ypart") || line.startsWith("=yend"))) continue;
-      const normalizedLine = line.startsWith("..") ? line.slice(1) : line;
-      yield yenc ? decodeLine(normalizedLine) : Buffer.from(normalizedLine, "binary");
+      if (yenc && (startsWithAscii(line, "=ypart") || startsWithAscii(line, "=yend"))) continue;
+      const normalizedLine = line.length > 1 && line[0] === 46 && line[1] === 46 ? line.subarray(1) : line;
+      yield yenc ? decodeLine(normalizedLine) : normalizedLine;
     }
   }
 
-  async bodySlice(articleId: string, startOffset: number, length: number, decodeLine: (line: string) => Buffer, signal?: AbortSignal) {
+  async bodySlice(articleId: string, startOffset: number, length: number, decodeLine: (line: Buffer) => Buffer, signal?: AbortSignal) {
     const normalized = articleId.startsWith("<") ? articleId : `<${articleId}>`;
     const targetEnd = startOffset + length;
     const chunks: Buffer[] = [];
@@ -89,15 +127,16 @@ export class NntpClient {
     if (!status.startsWith("222")) throw new Error(`BODY failed: ${status}`);
 
     while (true) {
-      const line = await this.readLine(signal);
-      if (line === ".") break;
-      if (line.startsWith("=ybegin")) {
+      const line = await this.readLineBuffer(signal);
+      if (line.length === 1 && line[0] === 46) break;
+      if (startsWithAscii(line, "=ybegin")) {
         yenc = true;
         continue;
       }
-      if (yenc && (line.startsWith("=ypart") || line.startsWith("=yend"))) continue;
+      if (yenc && (startsWithAscii(line, "=ypart") || startsWithAscii(line, "=yend"))) continue;
 
-      const decoded = yenc ? decodeLine(line) : Buffer.from(line, "binary");
+      const normalizedLine = line.length > 1 && line[0] === 46 && line[1] === 46 ? line.subarray(1) : line;
+      const decoded = yenc ? decodeLine(normalizedLine) : normalizedLine;
       const lineStart = decodedOffset;
       const lineEnd = decodedOffset + decoded.length;
       decodedOffset = lineEnd;
@@ -230,13 +269,18 @@ export class NntpClient {
   }
 
   private async readLine(signal?: AbortSignal): Promise<string> {
-    while (!this.buffer.includes("\r\n")) {
+    return (await this.readLineBuffer(signal)).toString("latin1");
+  }
+
+  private async readLineBuffer(signal?: AbortSignal): Promise<Buffer> {
+    let index = this.buffer.indexOf(CRLF);
+    while (index === -1) {
       if (!this.socket) throw new Error("NNTP socket is not connected");
       await this.waitForSocket("data", signal);
+      index = this.buffer.indexOf(CRLF);
     }
-    const index = this.buffer.indexOf("\r\n");
-    const line = this.buffer.slice(0, index);
-    this.buffer = this.buffer.slice(index + 2);
+    const line = this.buffer.subarray(0, index);
+    this.buffer = this.buffer.subarray(index + CRLF.length);
     return line;
   }
 

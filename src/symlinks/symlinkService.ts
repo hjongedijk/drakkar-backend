@@ -6,6 +6,7 @@ import { prisma } from "../db/prisma.js";
 import { fetchMediaMetadata } from "../metadata/metadataService.js";
 import { completedPathToVfsPath, getNamingSettings, libraryPathFor } from "../naming/namingService.js";
 import { getPolicySettings } from "../policies/policyService.js";
+import { refreshPlexPath } from "../plex/plexService.js";
 import { getSettings } from "../settings/settingsStore.js";
 
 function fallbackMediaTitle(value?: string | null) {
@@ -109,10 +110,15 @@ function sourcePathForImport(item: ImportItem) {
   return item.completedPath.startsWith("/mounted/") ? `${env.FUSE_MOUNT_PATH}${item.completedPath}` : item.completedPath;
 }
 
+function effectiveImportStrategy(configuredStrategy: string, item: ImportItem) {
+  if (item.completedPath.startsWith("/mounted/") && !env.FUSE_MOUNT_ENABLED) return "strm";
+  return configuredStrategy;
+}
+
 export async function createLibraryEntryForImport(item: ImportItem) {
   const policies = await getPolicySettings();
   const naming = await getNamingSettings();
-  const strategy = policies.importStrategy;
+  const strategy = effectiveImportStrategy(policies.importStrategy, item);
   const media = await mediaFromImport(item);
   const linkPath = libraryPathFor({ media, completedPath: item.completedPath, naming, strategy });
   await mkdir(dirname(linkPath), { recursive: true });
@@ -149,11 +155,18 @@ export async function createLibraryEntryForImport(item: ImportItem) {
     }
   }
 
-  return prisma.symlink.upsert({
+  const link = await prisma.symlink.upsert({
     where: { linkPath },
     update: { sourcePath: sourcePathForImport(item), importId: item.id, status: strategy },
     create: { sourcePath: sourcePathForImport(item), linkPath, importId: item.id, status: strategy }
   });
+  void refreshPlexPath(link.linkPath)
+    .then((result) => {
+      if (!result.skipped) console.info("[plex] targeted refresh triggered", result);
+      else if (result.reason !== "not_configured" && result.reason !== "deduped") console.warn("[plex] targeted refresh skipped", result);
+    })
+    .catch((error) => console.warn("[plex] targeted refresh failed", error instanceof Error ? error.message : error));
+  return link;
 }
 
 export const createSymlinkForImport = createLibraryEntryForImport;

@@ -1,9 +1,9 @@
 import { z } from "zod";
 import type { FastifyInstance } from "fastify";
-import { addNzbFromPath } from "../downloads/downloadService.js";
+import { addNzbFromPath, findReusableDownload } from "../downloads/downloadService.js";
 import { getSettings } from "../settings/settingsStore.js";
 import { downloadNzb, fetchNzbForRelease, testDownloadNzb, testNzbhydraConnection } from "../indexers/nzbhydra/client.js";
-import { fetchDiscoverHome, fetchDiscoverList } from "../metadata/metadataService.js";
+import { fetchDiscoverHome, fetchDiscoverList, fetchMediaDetails, searchDiscoverMedia } from "../metadata/metadataService.js";
 import { getSearchHistory, runSearch } from "../search/searchService.js";
 import { toPublicReleases } from "../releases/public.js";
 
@@ -24,6 +24,10 @@ const downloadSchema = z.object({
 export async function searchRoutes(app: FastifyInstance): Promise<void> {
   app.post("/api/indexers/nzbhydra/test", async () => testNzbhydraConnection(await getSettings()));
   app.get("/api/discover/home", async () => fetchDiscoverHome(await getSettings()));
+  app.get("/api/discover/search", async (request) => {
+    const query = z.object({ query: z.string().min(1) }).parse(request.query);
+    return searchDiscoverMedia(await getSettings(), query.query);
+  });
   app.get("/api/discover/:mediaType", async (request) => {
     const params = z.object({
       mediaType: z.enum(["movie", "tv"])
@@ -32,6 +36,21 @@ export async function searchRoutes(app: FastifyInstance): Promise<void> {
       page: z.coerce.number().int().positive().optional()
     }).parse(request.query);
     return fetchDiscoverList(await getSettings(), params.mediaType, query.page ?? 1);
+  });
+  app.get("/api/discover/details/:mediaType", async (request, reply) => {
+    const params = z.object({
+      mediaType: z.enum(["movie", "tv"])
+    }).parse(request.params);
+    const query = z.object({
+      title: z.string().optional(),
+      year: z.coerce.number().int().positive().optional(),
+      tmdbId: z.string().optional(),
+      tvdbId: z.string().optional(),
+      imdbId: z.string().optional()
+    }).parse(request.query);
+    const details = await fetchMediaDetails(await getSettings(), { ...query, title: query.title ?? "", mediaType: params.mediaType });
+    if (!details) return reply.status(404).send({ message: "Media details not found." });
+    return details;
   });
 
   app.post("/api/search/movie", async (request) => toPublicReleases(await runSearch({ ...baseSearchSchema.parse(request.body), kind: "movie" })));
@@ -43,6 +62,11 @@ export async function searchRoutes(app: FastifyInstance): Promise<void> {
 
   app.post("/api/search/download", async (request) => {
     const body = downloadSchema.parse(request.body);
+    const reusable = await findReusableDownload({
+      guid: body.release?.guid ? String(body.release.guid) : undefined,
+      title: body.release?.title
+    });
+    if (reusable) return reusable;
     const nzb = await downloadNzb(await getSettings(), body.release);
     return addNzbFromPath(nzb.primaryPath, body.release.title, { guid: body.release.guid ? String(body.release.guid) : undefined });
   });

@@ -1,6 +1,10 @@
 import { filenameFromSubject } from "./filename.js";
 
-export type NzbImportMode = "mounted" | "materialized";
+export type NzbImportMode = "mounted" | "materialized" | "unsupported";
+export type NzbImportPlan = {
+  mode: NzbImportMode;
+  reason?: "archive_payload" | "no_direct_video";
+};
 
 function isLikelyMediaSubject(subject: string) {
   return /\.(mkv|mp4|avi|mov|m4v|ts)(?:["_\s).]|$)/i.test(subject);
@@ -10,7 +14,7 @@ function isArchiveSubject(subject: string) {
   return /\.(zip|7z(?:\.\d+)?|rar|part\d+\.rar)(?:["_\s).]|$)/i.test(subject);
 }
 
-export function classifyNzbImportMode(nzb: { files: Array<{ subject: string }> }): NzbImportMode {
+export function classifyNzbImportPlan(nzb: { files: Array<{ subject: string }> }): NzbImportPlan {
   let hasDirectVideo = false;
   let hasArchivePayload = false;
 
@@ -20,6 +24,11 @@ export function classifyNzbImportMode(nzb: { files: Array<{ subject: string }> }
     else if (isArchiveSubject(filename)) hasArchivePayload = true;
   }
 
-  if (hasArchivePayload || !hasDirectVideo) return "materialized";
-  return "mounted";
+  if (hasArchivePayload) return { mode: "unsupported", reason: "archive_payload" };
+  if (!hasDirectVideo) return { mode: "unsupported", reason: "no_direct_video" };
+  return { mode: "mounted" };
+}
+
+export function classifyNzbImportMode(nzb: { files: Array<{ subject: string }> }): NzbImportMode {
+  return classifyNzbImportPlan(nzb).mode;
 }

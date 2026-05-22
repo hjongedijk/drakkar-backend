@@ -9,6 +9,8 @@ import { importCompletedPath } from "../import/importService.js";
 import { verifyAndRepairPar2 } from "./par2Service.js";
 import { listMountedFiles } from "../vfs/mountedNzbService.js";
 import { readMountedFileRange } from "../streaming/mountedStream.service.js";
+import { BACKGROUND_REPAIR_INTERVAL_MS, BACKGROUND_REPAIR_TASK_ID, registerCoreTasks } from "../tasks/coreTasks.js";
+import { runTrackedTask, setTaskNextRun } from "../tasks/taskRegistry.js";
 
 async function toolAvailable(name: string) {
   const paths = (process.env.PATH ?? "").split(":").map((path) => join(path, name));
@@ -155,10 +157,10 @@ async function assessMountedDownload(downloadId: string) {
 }
 
 let repairTimer: NodeJS.Timeout | undefined;
+let initialRepairTimer: NodeJS.Timeout | undefined;
 
-export function startBackgroundRepairSchedule(logger: { warn: (...args: unknown[]) => void }) {
-  if (repairTimer) return;
-  const tick = async () => {
+export async function runBackgroundRepairSweep(logger: { warn: (...args: unknown[]) => void }) {
+  await runTrackedTask(BACKGROUND_REPAIR_TASK_ID, async () => {
     const downloads = await prisma.download.findMany({
       where: {
         status: { in: ["available", "completed"] }
@@ -168,16 +170,30 @@ export function startBackgroundRepairSchedule(logger: { warn: (...args: unknown[
     for (const download of downloads) {
       await assessMountedDownload(download.id);
     }
-  };
+    return { checked: downloads.length };
+  }).catch((error) => {
+    logger.warn({ err: error }, "background repair sweep failed");
+  });
+  setTaskNextRun(BACKGROUND_REPAIR_TASK_ID, new Date(Date.now() + BACKGROUND_REPAIR_INTERVAL_MS));
+}
 
-  void tick().catch((error) => logger.warn({ err: error }, "initial background repair sweep failed"));
+export function startBackgroundRepairSchedule(logger: { warn: (...args: unknown[]) => void }) {
+  if (repairTimer || initialRepairTimer) return;
+  registerCoreTasks();
+  setTaskNextRun(BACKGROUND_REPAIR_TASK_ID, new Date(Date.now() + 30_000));
+  initialRepairTimer = setTimeout(() => {
+    initialRepairTimer = undefined;
+    void runBackgroundRepairSweep(logger);
+  }, 30_000);
   repairTimer = setInterval(() => {
-    tick().catch((error) => logger.warn({ err: error }, "background repair sweep failed"));
-  }, 10 * 60 * 1000);
+    void runBackgroundRepairSweep(logger);
+  }, BACKGROUND_REPAIR_INTERVAL_MS);
 }
 
 export function stopBackgroundRepairSchedule() {
+  if (initialRepairTimer) clearTimeout(initialRepairTimer);
   if (repairTimer) clearInterval(repairTimer);
+  initialRepairTimer = undefined;
   repairTimer = undefined;
 }
 

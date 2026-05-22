@@ -20,6 +20,12 @@ type NewznabItem = {
   attr?: NewznabAttr[];
 };
 
+export type NewznabResponse = {
+  releases: Release[];
+  total?: number;
+  offset?: number;
+};
+
 function attrMap(attrs?: NewznabAttr[]) {
   return Object.fromEntries((attrs ?? []).filter((attr) => attr.name).map((attr) => [attr.name!, attr.value ?? ""]));
 }
@@ -45,35 +51,44 @@ function normalizeGuid(guid: NewznabItem["guid"], fallback: string) {
   return fallback;
 }
 
-export function parseNewznabXml(xml: string, indexer = "NZBHydra2"): Release[] {
-  const parsed = parser.parse(xml) as { rss?: { channel?: { item?: NewznabItem[] } } };
+export function parseNewznabResponse(xml: string, indexer = "NZBHydra2"): NewznabResponse {
+  const parsed = parser.parse(xml) as { rss?: { channel?: { item?: NewznabItem[]; "newznab:response"?: { total?: string; offset?: string } } } };
+  const response = parsed.rss?.channel?.["newznab:response"];
   const items = parsed.rss?.channel?.item ?? [];
 
-  return items.map((item) => {
-    const attributes = attrMap(item.attr);
-    const title = item.title ?? "Untitled release";
-    const downloadUrl = item.enclosure?.url ?? item.link;
+  return {
+    releases: items.map((item) => {
+      const attributes = attrMap(item.attr);
+      const title = item.title ?? "Untitled release";
+      const downloadUrl = item.enclosure?.url ?? item.link;
 
-    return enrichRelease({
-      title,
-      guid: normalizeGuid(item.guid, downloadUrl ?? title),
-      detailsUrl: item.comments ?? item.link,
-      downloadUrl,
-      indexer,
-      category: item.category ?? stringAttr(attributes, "category"),
-      size: Number(item.enclosure?.length ?? attributes.size) || undefined,
-      age: numberAttr(attributes, "age"),
-      grabs: numberAttr(attributes, "grabs"),
-      seeders: numberAttr(attributes, "seeders"),
-      publishDate: item.pubDate,
-      imdbId: stringAttr(attributes, "imdb"),
-      tmdbId: stringAttr(attributes, "tmdbid"),
-      tvdbId: stringAttr(attributes, "tvdbid"),
-      season: numberAttr(attributes, "season"),
-      episode: numberAttr(attributes, "episode"),
-      rawAttributes: attributes
-    });
-  });
+      return enrichRelease({
+        title,
+        guid: normalizeGuid(item.guid, downloadUrl ?? title),
+        detailsUrl: item.comments ?? item.link,
+        downloadUrl,
+        indexer,
+        category: item.category ?? stringAttr(attributes, "category"),
+        size: Number(item.enclosure?.length ?? attributes.size) || undefined,
+        age: numberAttr(attributes, "age"),
+        grabs: numberAttr(attributes, "grabs"),
+        seeders: numberAttr(attributes, "seeders"),
+        publishDate: item.pubDate,
+        imdbId: stringAttr(attributes, "imdb"),
+        tmdbId: stringAttr(attributes, "tmdbid"),
+        tvdbId: stringAttr(attributes, "tvdbid"),
+        season: numberAttr(attributes, "season"),
+        episode: numberAttr(attributes, "episode"),
+        rawAttributes: attributes
+      });
+    }),
+    total: response?.total ? Number(response.total) : undefined,
+    offset: response?.offset ? Number(response.offset) : undefined
+  };
+}
+
+export function parseNewznabXml(xml: string, indexer = "NZBHydra2"): Release[] {
+  return parseNewznabResponse(xml, indexer).releases;
 }
 
 export function normalizeNewznabJson(input: unknown, indexer = "NZBHydra2"): Release[] {

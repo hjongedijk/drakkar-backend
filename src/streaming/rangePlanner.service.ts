@@ -1,4 +1,6 @@
 import { getMountFileByPath } from "../vfs/mountedNzbService.js";
+import { prisma } from "../db/prisma.js";
+import { buildDecodedYencSegments } from "./yencManifest.service.js";
 
 export type PlannedArticleRange = {
   fileId: string;
@@ -52,16 +54,26 @@ export async function planMountedFileRange(path: string, range?: string): Promis
   const file = mount.nzbDocument.files[0];
   if (!file) throw new Error("mounted NZB file not found");
 
-  const size = Math.max(0, Math.floor(file.size));
+  const providers = await prisma.usenetServer.findMany({
+    where: { enabled: true },
+    orderBy: [{ isBackup: "asc" }, { priority: "asc" }]
+  });
+  const decoded = await buildDecodedYencSegments(file, providers);
+  const size = Math.max(0, Math.floor(decoded?.size ?? file.size));
   const { start, end } = normalizeRange(range, size);
   const ranges: PlannedArticleRange[] = [];
   let cursor = 0;
-
-  for (const segment of file.segments) {
+  const sourceSegments = decoded?.segments ?? file.segments.map((segment) => {
+    const bytes = Math.floor(segment.bytes);
     const segmentStart = cursor;
-    const segmentEnd = cursor + Math.floor(segment.bytes) - 1;
+    const segmentEnd = cursor + bytes - 1;
     cursor = segmentEnd + 1;
+    return { segment, bytes, start: segmentStart, end: segmentEnd };
+  });
 
+  for (const item of sourceSegments) {
+    const segmentStart = item.start;
+    const segmentEnd = item.end;
     if (segmentEnd < start) continue;
     if (segmentStart > end) break;
 
@@ -69,12 +81,12 @@ export async function planMountedFileRange(path: string, range?: string): Promis
     const readEnd = Math.min(end, segmentEnd);
     ranges.push({
       fileId: file.id,
-      articleId: segment.articleId,
-      segmentNumber: segment.number,
+      articleId: item.segment.articleId,
+      segmentNumber: item.segment.number,
       segmentOffset: readStart - segmentStart,
       readOffset: readStart,
       length: readEnd - readStart + 1,
-      bytes: segment.bytes
+      bytes: item.bytes
     });
   }
 

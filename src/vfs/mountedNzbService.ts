@@ -17,9 +17,29 @@ type MountSummary = Awaited<ReturnType<typeof loadMountSummaryByDocumentId>>;
 type MountWithFileSegments = Awaited<ReturnType<typeof loadMountWithFileSegments>>;
 
 const MOUNT_CACHE_TTL_MS = 30_000;
+const MOUNT_NOT_FOUND_TTL_MS = 15_000;
 const mountSummaryCache = new Map<string, { value: NonNullable<MountSummary>; expiresAt: number }>();
 const mountFileCache = new Map<string, { value: NonNullable<MountWithFileSegments>; expiresAt: number }>();
+const missingMountedPathCache = new Map<string, number>();
 let mountsEnsuredAt = 0;
+
+function isCachedMissingMountedPath(path: string) {
+  const expiresAt = missingMountedPathCache.get(path);
+  if (!expiresAt) return false;
+  if (expiresAt <= Date.now()) {
+    missingMountedPathCache.delete(path);
+    return false;
+  }
+  return true;
+}
+
+function cacheMissingMountedPath(path: string) {
+  missingMountedPathCache.set(path, Date.now() + MOUNT_NOT_FOUND_TTL_MS);
+}
+
+function clearMissingMountedPath(path: string) {
+  missingMountedPathCache.delete(path);
+}
 
 function safeFileName(value: string, index: number) {
   const extracted = filenameFromSubject(value, index);
@@ -241,6 +261,7 @@ export async function listMountedFiles(path: string): Promise<MountedVfsNode[]> 
 }
 
 export async function statMountedPath(path: string) {
+  if (isCachedMissingMountedPath(path)) throw new Error("mounted NZB file not found");
   if (path === "/mounted/releases") {
     const mounts = await listMounts("/mounted/releases");
     return { path, type: "folder", size: mounts.length, modifiedAt: new Date().toISOString(), isDirectory: true };
@@ -249,8 +270,12 @@ export async function statMountedPath(path: string) {
   const parts = path.split("/").filter(Boolean);
   const mountPath = parts[1] === "releases" ? `/mounted/releases/${parts[2]}` : `/${parts.slice(0, 2).join("/")}`;
   const mount = await getMountByPath(mountPath);
-  if (!mount) throw new Error("mounted VFS path not found");
+  if (!mount) {
+    cacheMissingMountedPath(path);
+    throw new Error("mounted VFS path not found");
+  }
   if (path === mount.path || path === `/mounted/${mount.nzbDocumentId}` || path === `/mounted/${mount.id}` || path === `/mounted/releases/${mount.nzbDocumentId}` || path === `/mounted/releases/${mount.id}`) {
+    clearMissingMountedPath(path);
     return {
       path,
       type: "virtual-release",
@@ -261,7 +286,11 @@ export async function statMountedPath(path: string) {
   }
 
   const { file, index: subjectIndex } = mountedFileForPath(mount, path);
-  if (!file) throw new Error("mounted NZB file not found");
+  if (!file) {
+    cacheMissingMountedPath(path);
+    throw new Error("mounted NZB file not found");
+  }
+  clearMissingMountedPath(path);
   const name = safeFileName(file.subject, subjectIndex);
   const archive = detectArchive(name) !== "none" || isPar2File(name);
   return {

@@ -20,16 +20,17 @@ export async function getBandwidthStatus() {
     0,
     maxTotalConnections
   );
-  const remainingAfterStreams = Math.max(0, maxTotalConnections - allocatedStreamingConnections);
-  const unusedStreamingAllowance = Math.max(0, maxStreamingConnections - allocatedStreamingConnections);
-  const effectiveDownloadCap = Math.min(maxTotalConnections, maxDownloadConnections + unusedStreamingAllowance);
-  const maintenanceFloor = maxDownloadConnections > 0 ? 1 : 0;
+  const reservedStreamingCapacity = activeStreamCount > 0
+    ? clamp(reservedStreamingConnections, allocatedStreamingConnections, maxTotalConnections)
+    : 0;
+  const remainingAfterStreamingReservation = Math.max(0, maxTotalConnections - reservedStreamingCapacity);
+  const effectiveDownloadCap = activeStreamCount > 0
+    ? Math.min(maxDownloadConnections, remainingAfterStreamingReservation)
+    : Math.min(maxTotalConnections, maxDownloadConnections + Math.max(0, maxStreamingConnections - allocatedStreamingConnections));
+  const maintenanceFloor = activeStreamCount > 0 ? 0 : maxDownloadConnections > 0 ? 1 : 0;
   const allocatedDownloadConnections = activeStreamCount > 0
     ? clamp(
-        Math.min(
-          effectiveDownloadCap,
-          Math.max(maintenanceFloor, Math.floor(remainingAfterStreams * Math.max(0.1, 1 - streamingShare)))
-        ),
+        Math.min(effectiveDownloadCap, Math.max(maintenanceFloor, remainingAfterStreamingReservation)),
         0,
         effectiveDownloadCap
       )
@@ -58,5 +59,5 @@ export async function getBandwidthStatus() {
 
 export async function getAllowedDownloadConnections() {
   const status = await getBandwidthStatus();
-  return Math.max(1, status.allocation.downloads);
+  return Math.max(0, status.allocation.downloads);
 }

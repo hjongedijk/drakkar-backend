@@ -31,6 +31,7 @@ export async function validateRequiredFolders(logger: FastifyBaseLogger): Promis
   const resolvedPaths: string[] = [];
 
   for (const directory of requiredDirectories) {
+    if (directory === env.FUSE_MOUNT_PATH && !env.FUSE_MOUNT_ENABLED) continue;
     try {
       await mkdir(directory, { recursive: true });
       await access(directory, constants.R_OK | constants.W_OK);
