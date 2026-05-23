@@ -31,6 +31,11 @@ type YencPartInfo = {
 const yencHeaderCache = new Map<string, { value: YencPartInfo | null; expiresAt: number }>();
 const loggedCorrections = new Set<string>();
 const HEADER_CACHE_TTL_MS = 6 * 60 * 60 * 1000;
+const LOG_YENC_SIZE_CORRECTIONS = process.env.LOG_YENC_SIZE_CORRECTIONS === "true";
+
+function oneLine(value: string) {
+  return value.replace(/\s+/g, " ").trim();
+}
 
 function parseAttributes(line?: string) {
   const attrs: Record<string, string> = {};
@@ -78,7 +83,7 @@ async function fetchYencPartInfo(articleId: string, providers: UsenetServer[], s
       await client.quit().catch(() => undefined);
     }
   }
-  if (errors.length > 0) console.warn(`[stream] yEnc header probe failed for ${articleId}: ${errors.join("; ")}`);
+  if (errors.length > 0) console.warn(oneLine(`[stream] yEnc header probe failed for ${articleId}: ${errors.join("; ")}`));
   return null;
 }
 
@@ -132,11 +137,10 @@ export async function buildDecodedYencSegments<TSegment extends SegmentLike>(
   }
 
   if (segments.length === 0) return null;
-  if (!loggedCorrections.has(file.id) && Math.floor(file.size) !== size) {
+  if (LOG_YENC_SIZE_CORRECTIONS && !loggedCorrections.has(file.id) && Math.floor(file.size) !== size) {
     loggedCorrections.add(file.id);
     console.info(`[stream] yEnc decoded size corrected for ${file.id}: nzbBytes=${Math.floor(file.size)} decodedBytes=${size}`);
   }
   void persistDecodedSize(file, size);
   return { size, segments };
 }
-

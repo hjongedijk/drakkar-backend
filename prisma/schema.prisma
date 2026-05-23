@@ -156,6 +156,7 @@ model NzbDocument {
   errors      String[]
   files       NzbFile[]
   mounts      VfsMount[]
+  archiveEntries ArchiveEntry[]
   download    Download?
   createdAt   DateTime  @default(now())
 }
@@ -197,6 +198,40 @@ model VfsMount {
   updatedAt     DateTime    @updatedAt
 
   @@index([createdAt])
+}
+
+model ArchiveEntry {
+  id            String           @id @default(cuid())
+  nzbDocumentId String
+  nzbDocument   NzbDocument      @relation(fields: [nzbDocumentId], references: [id], onDelete: Cascade)
+  name          String
+  path          String
+  format        String
+  compression   String
+  size          Float
+  modifiedAt    DateTime
+  status        String           @default("streamable")
+  segments      ArchiveSegment[]
+  createdAt     DateTime         @default(now())
+  updatedAt     DateTime         @updatedAt
+
+  @@unique([nzbDocumentId, path])
+  @@index([nzbDocumentId])
+}
+
+model ArchiveSegment {
+  id             String       @id @default(cuid())
+  archiveEntryId String
+  archiveEntry   ArchiveEntry @relation(fields: [archiveEntryId], references: [id], onDelete: Cascade)
+  nzbFileId      String
+  articleId      String
+  segmentNumber  Int
+  bytes          Float
+  start          Float
+  end            Float
+  sourceOffset   Float
+
+  @@index([archiveEntryId, start])
 }
 
 model Download {

@@ -17,6 +17,20 @@ const DOWNLOAD_QUEUE_CACHE_MS = 2_000;
 const DOWNLOAD_HISTORY_CACHE_MS = 5_000;
 let cachedQueue: { value: Awaited<ReturnType<typeof buildQueue>>; expiresAt: number } | null = null;
 let cachedHistory: { value: Awaited<ReturnType<typeof buildHistory>>; expiresAt: number } | null = null;
+const activeNzbGuidLocks = new Map<string, Promise<void>>();
+
+async function acquireNzbGuidLock(guid: string) {
+  while (activeNzbGuidLocks.has(guid)) await activeNzbGuidLocks.get(guid);
+  let release!: () => void;
+  const lock = new Promise<void>((resolve) => {
+    release = resolve;
+  });
+  activeNzbGuidLocks.set(guid, lock);
+  return () => {
+    if (activeNzbGuidLocks.get(guid) === lock) activeNzbGuidLocks.delete(guid);
+    release();
+  };
+}
 
 function safeNzbName(name: string) {
   const cleaned = name.replace(/[^a-z0-9._-]+/gi, "_") || randomUUID();
@@ -128,6 +142,9 @@ export async function storeNzbForDownload(input: {
   const content = Buffer.isBuffer(input.content) ? input.content : Buffer.from(input.content);
   const parsed = parseNzbXml(content.toString("utf8"), input.title ?? input.filename ?? "NZB upload");
   const duplicateKey = input.guid ?? contentHash(content);
+  const releaseGuidLock = await acquireNzbGuidLock(duplicateKey);
+
+  try {
 
   if (policies.failNzbWithoutVideo && !hasPotentialVideoPayload(parsed)) {
     const reason = "NZB appears empty or contains no usable file segments";
@@ -212,6 +229,9 @@ export async function storeNzbForDownload(input: {
     }
   });
   return nzbDocument;
+  } finally {
+    releaseGuidLock();
+  }
 }
 
 export async function addNzbUpload(input: { filename?: string; content: string | Buffer; title?: string; queueDownload?: boolean; category?: string }) {
@@ -394,6 +414,23 @@ async function buildQueue() {
         nextStatus = "queued";
         nextJobId = null;
         nextError = "Queue entry has no active worker job yet";
+        if (download.nzbDocumentId) {
+          const linkedRequest = await prisma.mediaRequest.findFirst({
+            where: { downloadId: download.id },
+            select: { id: true }
+          }).catch(() => null);
+          const job = await queueDownloadJob(download, "queue-view-recovery", {
+            downloadId: download.id,
+            nzbDocumentId: download.nzbDocumentId,
+            title: download.title,
+            requestId: linkedRequest?.id
+          }).catch(() => null);
+          if (job) {
+            nextJobId = String(job.id);
+            nextError = "Recovered queued download with missing worker job";
+            jobStateByDownloadId.set(download.id, { id: String(job.id), state: "waiting" });
+          }
+        }
       }
 
       if (nextStatus !== download.status || nextJobId !== (download.jobId ? String(download.jobId) : null) || nextError !== download.error) {

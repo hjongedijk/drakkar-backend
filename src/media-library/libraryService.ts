@@ -10,6 +10,7 @@ import { toPublicReleases } from "../releases/public.js";
 import type { Release } from "../releases/types.js";
 import { runSearch } from "../search/searchService.js";
 import { getSettings } from "../settings/settingsStore.js";
+import { mediaIdentityKey } from "./identity.js";
 
 function sortTitle(title: string) {
   return title.replace(/^(the|a|an)\s+/i, "").toLowerCase();
@@ -18,6 +19,7 @@ function sortTitle(title: string) {
 function statusFromRequest(status: string, hasFilesystemEntry = false) {
   if (status === "grabbed") return "grabbed";
   if (status === "available") return hasFilesystemEntry ? "available" : "grabbed";
+  if (status === "no_release_found") return "missing";
   if (status.includes("failed") || status.includes("rejected") || status.includes("blocklisted")) return "failed";
   if (status === "approved") return "searching";
   return "requested";
@@ -328,7 +330,37 @@ export async function refreshMediaLibrary() {
     }
   });
 
+  await dedupeEpisodeLibraryItems();
+
   return { refreshed: touched.size, items: await listLibraryItems() };
+}
+
+async function dedupeEpisodeLibraryItems() {
+  const episodes = await prisma.mediaLibraryItem.findMany({
+    where: { mediaType: "tv", season: { not: null }, episode: { not: null } },
+    orderBy: [{ updatedAt: "desc" }, { createdAt: "desc" }]
+  });
+  const seen = new Set<string>();
+  const duplicateIds: string[] = [];
+  for (const item of episodes) {
+    const key = mediaIdentityKey({
+      mediaType: item.mediaType,
+      title: item.title,
+      year: item.year,
+      tmdbId: item.tmdbId,
+      tvdbId: item.tvdbId,
+      imdbId: item.imdbId,
+      season: item.season,
+      episode: item.episode
+    });
+    if (seen.has(key)) {
+      duplicateIds.push(item.id);
+      continue;
+    }
+    seen.add(key);
+  }
+  if (duplicateIds.length === 0) return;
+  await prisma.mediaLibraryItem.deleteMany({ where: { id: { in: duplicateIds } } });
 }
 
 async function enrichLibraryItem(item: MediaLibraryItem, settings: Awaited<ReturnType<typeof getSettings>>) {
@@ -347,9 +379,7 @@ async function enrichLibraryItem(item: MediaLibraryItem, settings: Awaited<Retur
   });
   if (!metadata) return item;
 
-  return prisma.mediaLibraryItem.update({
-    where: { id: item.id },
-    data: {
+  const data = {
       tmdbId: metadata.tmdbId ?? item.tmdbId,
       tvdbId: metadata.tvdbId ?? item.tvdbId,
       imdbId: metadata.imdbId ?? item.imdbId,
@@ -364,8 +394,14 @@ async function enrichLibraryItem(item: MediaLibraryItem, settings: Awaited<Retur
       episodeTitle: metadata.episodeTitle ?? item.episodeTitle,
       episodeOverview: metadata.episodeOverview ?? item.episodeOverview,
       episodeAirDate: metadata.episodeAirDate ?? item.episodeAirDate
-    }
+    };
+
+  const updated = await prisma.mediaLibraryItem.updateMany({
+    where: { id: item.id },
+    data
   });
+  if (updated.count === 0) return item;
+  return (await prisma.mediaLibraryItem.findUnique({ where: { id: item.id } })) ?? item;
 }
 
 function shouldRefreshMetadata(item: MediaLibraryItem, ttlHours: number) {

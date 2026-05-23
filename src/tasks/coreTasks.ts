@@ -12,7 +12,7 @@ export const LOG_PRUNE_TASK_ID = "log-prune";
 
 export const REQUEST_SYNC_INTERVAL_MS = 60_000;
 export const NZBHYDRA_RSS_SYNC_INTERVAL_MS = 15 * 60_000;
-export const BACKGROUND_REPAIR_INTERVAL_MS = 10 * 60_000;
+export const BACKGROUND_REPAIR_INTERVAL_MS = 30 * 60_000;
 export const LOG_PRUNE_INTERVAL_MS = 6 * 60 * 60_000;
 
 export function registerCoreTasks() {

@@ -24,7 +24,7 @@ export function classifyNzbImportPlan(nzb: { files: Array<{ subject: string }> }
     else if (isArchiveSubject(filename)) hasArchivePayload = true;
   }
 
-  if (hasArchivePayload) return { mode: "unsupported", reason: "archive_payload" };
+  if (hasArchivePayload) return { mode: "mounted", reason: "archive_payload" };
   if (!hasDirectVideo) return { mode: "unsupported", reason: "no_direct_video" };
   return { mode: "mounted" };
 }

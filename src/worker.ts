@@ -12,8 +12,8 @@ import {
   stopDownloadWorkers
 } from "./usenet/workers.js";
 import { startBackgroundRepairSchedule, stopBackgroundRepairSchedule } from "./repair/repairService.js";
-import { ensureDefaultAdminUser } from "./auth/service.js";
 import { bootstrapDevelopmentTestConnectionData } from "./dev/testConnectionData.js";
+import { bootstrapRuntimeConfiguredServices } from "./config/runtimeConfigBootstrap.js";
 import { env } from "./config/env.js";
 
 const app = buildApp();
@@ -37,7 +37,7 @@ for (const signal of ["SIGINT", "SIGTERM"]) {
 
 try {
   await validateRequiredFolders(app.log);
-  await ensureDefaultAdminUser();
+  await bootstrapRuntimeConfiguredServices(app.log);
   await bootstrapDevelopmentTestConnectionData(app.log);
 
   if (env.STARTUP_RECOVERY_ENABLED) {

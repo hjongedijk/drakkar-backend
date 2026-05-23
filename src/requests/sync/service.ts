@@ -7,7 +7,7 @@ import { fetchSeasonEpisodes, fetchSeriesStructure } from "../../metadata/metada
 import { runSearch } from "../../search/searchService.js";
 import { getSettings } from "../../settings/settingsStore.js";
 import { addNzbFromPath, findReusableDownload } from "../../downloads/downloadService.js";
-import { mediaIdentityKey } from "../../media-library/identity.js";
+import { mediaIdentityKey, normalizeTitleForIdentity } from "../../media-library/identity.js";
 import { scoreRelease } from "../../quality/scoring.js";
 import { ensureDefaultProfiles } from "../../quality/profileService.js";
 import { createBlocklistItem, isReleaseBlocklisted } from "../../policies/policyService.js";
@@ -17,6 +17,19 @@ import type { ExternalMediaRequest } from "../types.js";
 const TV_ACTIVE_DOWNLOAD_STATUSES = ["queued", "fetching_nzb", "verifying", "prepared", "waiting_for_provider", "waiting_for_nzb", "downloading", "paused"];
 const SEARCH_COOLDOWN_SECONDS = 300;
 const REQUEST_RELEASE_CACHE_SECONDS = 6 * 60 * 60;
+const MONITOR_QUEUE_SEED_STATUSES = ["queued", "fetching_nzb", "verifying", "waiting_for_provider", "waiting_for_nzb", "downloading", "paused"];
+const TV_SEASONS_PER_MONITOR_PASS = 8;
+const TV_EPISODE_DOWNLOADS_PER_REQUEST_PASS = 4;
+
+function blockReasonFromFailure(message?: string | null) {
+  const normalized = (message ?? "").toLowerCase();
+  if (/duplicate|already exists/.test(normalized)) return "duplicate_nzb";
+  if (/430 no such article|no such article|article.*not found|missing article|missing segment|segment download failed|required usenet articles|provider.*missing/.test(normalized)) return "missing_articles";
+  if (/password|encrypted/.test(normalized)) return "passworded_archive";
+  if (/unsupported archive|rar nzb would require|full disk materialization|archive.*refus|archive extraction|materialization/.test(normalized)) return "unsupported_archive";
+  if (/no streamable video|no eligible files|no importable media|contains no streamable video/.test(normalized)) return "no_video_content";
+  return "import_failed";
+}
 
 function isAiredDate(value?: string | null) {
   if (!value) return true;
@@ -288,21 +301,38 @@ async function grabForRequestMediaType(id: string, mediaType: string) {
   return mediaType === "tv" ? grabMissingTvForRequest(id) : grabBestForRequest(id);
 }
 
+async function monitoredQueuePendingCount() {
+  return prisma.download.count({
+    where: {
+      status: { in: MONITOR_QUEUE_SEED_STATUSES }
+    }
+  });
+}
+
 export async function ensureMonitoredRequests() {
+  const settings = await getSettings();
+  const queueSeedTarget = Math.max(1, settings.monitorQueueSeedTarget);
+  let pendingQueueItems = await monitoredQueuePendingCount();
   const requests = await prisma.mediaRequest.findMany({
     where: {
       status: { in: ["approved", "grabbed", "available", "release_failed", "no_release_found", "auto_grab_failed"] }
-    }
+    },
+    orderBy: [{ status: "asc" }, { updatedAt: "asc" }]
   });
 
   const retried = [];
+  let skippedBecauseQueueFull = 0;
   for (const request of requests) {
     if (request.mediaType === "tv") {
-      const monitor = await getRequestMonitor(request.id).catch(() => null);
-      if (!monitor) continue;
-      const hasMissingEpisodes = monitor.seasons.some((season) => season.missingCount > 0);
-      const hasAvailableEpisodes = monitor.seasons.some((season) => season.availableCount > 0);
+      const availability = await tvRequestAvailabilitySummary(request).catch(() => null);
+      if (!availability) continue;
+      const hasMissingEpisodes = availability.hasMissingEpisodes;
+      const hasAvailableEpisodes = availability.hasAvailableEpisodes;
       const activeDownload = await existingActiveDownload(request.downloadId).catch(() => null);
+      const linkedDownload = request.downloadId
+        ? await prisma.download.findUnique({ where: { id: request.downloadId }, select: { status: true } }).catch(() => null)
+        : null;
+      const clearDeadDownloadId = Boolean(linkedDownload && ["failed", "cancelled", "replaced"].includes(linkedDownload.status));
       const desiredStatus = hasMissingEpisodes
         ? activeDownload
           ? "grabbed"
@@ -310,30 +340,81 @@ export async function ensureMonitoredRequests() {
         : hasAvailableEpisodes
           ? "available"
           : request.status;
-      if (desiredStatus !== request.status) {
+      if (desiredStatus !== request.status || clearDeadDownloadId) {
         await prisma.mediaRequest.update({
           where: { id: request.id },
           data: {
             status: desiredStatus,
-            ...(activeDownload ? {} : { downloadId: hasMissingEpisodes ? null : request.downloadId })
+            ...(activeDownload ? {} : { downloadId: hasMissingEpisodes || clearDeadDownloadId ? null : request.downloadId })
           }
         }).catch(() => undefined);
       }
       if (!hasMissingEpisodes) continue;
+      if (pendingQueueItems >= queueSeedTarget) {
+        skippedBecauseQueueFull += 1;
+        continue;
+      }
       const result = await grabMissingTvForRequest(request.id).catch(() => null);
-      if (result) retried.push({ requestId: request.id, result });
+      if (result) {
+        retried.push({ requestId: request.id, result });
+        await prisma.mediaRequest.update({ where: { id: request.id }, data: { updatedAt: new Date() } }).catch(() => undefined);
+      }
+      pendingQueueItems = await monitoredQueuePendingCount();
       continue;
     }
 
     const workingImport = await findWorkingImportForRequest(request).catch(() => null);
     const activeDownload = await existingActiveDownload(request.downloadId).catch(() => null);
     if (workingImport || activeDownload) continue;
+    if (pendingQueueItems >= queueSeedTarget) {
+      skippedBecauseQueueFull += 1;
+      continue;
+    }
     const result = await grabBestForRequest(request.id).catch(() => null);
-    if (result) retried.push({ requestId: request.id, result });
+    if (result) {
+      retried.push({ requestId: request.id, result });
+      await prisma.mediaRequest.update({ where: { id: request.id }, data: { updatedAt: new Date() } }).catch(() => undefined);
+    }
+    pendingQueueItems = await monitoredQueuePendingCount();
   }
 
   if (retried.length > 0) await refreshMediaLibrary().catch(() => undefined);
-  return { retried: retried.length, results: retried };
+  return { retried: retried.length, queueSeedTarget, pendingQueueItems, skippedBecauseQueueFull, results: retried };
+}
+
+async function tvRequestAvailabilitySummary(request: MediaRequest) {
+  const seasons = requestedSeasons(request.seasons);
+  if (seasons.length === 0) {
+    const available = await prisma.importItem.count({ where: { requestId: request.id, mediaType: "tv" } });
+    return { hasMissingEpisodes: available === 0, hasAvailableEpisodes: available > 0 };
+  }
+  const requestedEpisodes = requestedEpisodesBySeason(request.episodes);
+  const seasonEpisodeCounts = new Map(
+    Array.isArray(request.seasons)
+      ? request.seasons.flatMap((item) => {
+          if (!item || typeof item !== "object") return [];
+          const record = item as Record<string, unknown>;
+          const seasonNumber = numberField(record.seasonNumber ?? record.season ?? record.number);
+          const episodeCount = numberField(record.episodeCount ?? record.episodesCount ?? record.totalEpisodes);
+          return seasonNumber ? [[seasonNumber, episodeCount ?? 0] as const] : [];
+        })
+      : []
+  );
+
+  let hasMissingEpisodes = false;
+  let hasAvailableEpisodes = false;
+  for (const season of seasons) {
+    const existingEpisodes = await existingEpisodesForSeason(request.id, request.title, season);
+    hasAvailableEpisodes ||= existingEpisodes.size > 0;
+    const requestedSeasonEpisodes = requestedEpisodes.get(season);
+    if (requestedSeasonEpisodes && requestedSeasonEpisodes.size > 0) {
+      if ([...requestedSeasonEpisodes].some((episode) => !existingEpisodes.has(episode))) hasMissingEpisodes = true;
+      continue;
+    }
+    const knownEpisodeCount = seasonEpisodeCounts.get(season) ?? 0;
+    if (knownEpisodeCount === 0 || existingEpisodes.size < knownEpisodeCount) hasMissingEpisodes = true;
+  }
+  return { hasMissingEpisodes, hasAvailableEpisodes };
 }
 
 function statusFromExternal(externalStatus?: string | null, mediaType?: string) {
@@ -558,22 +639,7 @@ export async function getRequestMonitor(id: string) {
   const availableBySeason = new Map<number, Set<number>>();
   for (const item of availableImports) {
     const sameRequest = item.requestId === request.id;
-    const sameTitle = mediaIdentityKey({
-      mediaType: "tv",
-      title: item.title,
-      year: item.year,
-      season: item.season,
-      episode: item.episode
-    }) === mediaIdentityKey({
-      mediaType: "tv",
-      title: request.title,
-      year: request.year,
-      season: item.season,
-      episode: item.episode,
-      tmdbId: request.tmdbId,
-      tvdbId: request.tvdbId,
-      imdbId: request.imdbId
-    });
+    const sameTitle = normalizeTitleForIdentity(item.title) === normalizeTitleForIdentity(request.title);
     if ((!sameRequest && !sameTitle) || item.season == null || item.episode == null) continue;
     const set = availableBySeason.get(item.season) ?? new Set<number>();
     set.add(item.episode);
@@ -823,7 +889,7 @@ export async function grabBestForRequest(id: string) {
       await createBlocklistItem({
         guid: candidate.release.guid ? String(candidate.release.guid) : undefined,
         title: candidate.release.title,
-        reason: /duplicate/i.test(message) ? "duplicate_nzb" : "import_failed",
+        reason: blockReasonFromFailure(message),
         source: "grab-validation",
         release: candidate.release
       }).catch(() => undefined);
@@ -834,7 +900,7 @@ export async function grabBestForRequest(id: string) {
       await createBlocklistItem({
         guid: candidate.release.guid ? String(candidate.release.guid) : undefined,
         title: candidate.release.title,
-        reason: /duplicate/i.test(download.error ?? "") ? "duplicate_nzb" : "import_failed",
+        reason: blockReasonFromFailure(download.error),
         source: "grab-validation",
         release: candidate.release
       }).catch(() => undefined);
@@ -886,6 +952,7 @@ export async function grabMissingTvForRequest(id: string) {
     await refreshMediaLibrary().catch(() => undefined);
     return { grabbed: false, reason: "all requested episodes already available", seasons: [] };
   }
+  const seasonsForThisPass = seasonsNeedingSearch.slice(0, TV_SEASONS_PER_MONITOR_PASS);
   const broadReleases = await runSearch({
     kind: "tv",
     query: request.title,
@@ -894,36 +961,59 @@ export async function grabMissingTvForRequest(id: string) {
     tvdbId: request.tvdbId ?? undefined
   }).catch(() => []);
   const results = [];
-  for (const { season, existingEpisodes, requestedSeasonEpisodes } of seasonsNeedingSearch) {
+  for (const { season, existingEpisodes, requestedSeasonEpisodes } of seasonsForThisPass) {
     const result = await grabBestTvSeasonForRequest(request, season, existingEpisodes, requestedSeasonEpisodes, broadReleases);
     results.push({ season, result });
   }
 
+  const grabbedResults = results.filter((item) => item.result.grabbed);
+  const grabbedDownloadId = downloadIdFromTvGrabResults(grabbedResults);
   const availableCount = await prisma.importItem.count({ where: { requestId: request.id } });
-  const activeCount = await prisma.download.count({
+  const activeDownloads = await prisma.download.findMany({
     where: {
       title: { contains: request.title.split(":")[0], mode: "insensitive" },
       status: { in: TV_ACTIVE_DOWNLOAD_STATUSES }
-    }
+    },
+    select: { id: true },
+    orderBy: [{ priority: "desc" }, { createdAt: "asc" }],
+    take: 1
   });
+  const activeDownloadId = activeDownloads[0]?.id ?? grabbedDownloadId ?? null;
   const refreshedMonitor = await getRequestMonitor(request.id).catch(() => null);
   const hasMissingEpisodes = refreshedMonitor?.seasons.some((season) => season.missingCount > 0) ?? false;
   await prisma.mediaRequest.update({
     where: { id: request.id },
     data: {
       status: hasMissingEpisodes
-        ? activeCount > 0 || results.length > 0
+        ? activeDownloadId
           ? "grabbed"
           : "approved"
         : availableCount > 0
           ? "available"
-          : activeCount > 0 || results.length > 0
+          : activeDownloadId
             ? "grabbed"
-            : "no_release_found"
+            : grabbedResults.length > 0
+              ? "grabbed"
+              : "no_release_found",
+      downloadId: activeDownloadId
     }
   });
   await refreshMediaLibrary().catch(() => undefined);
-  return { grabbed: results.some((item) => item.result.grabbed), seasons: results };
+  return {
+    grabbed: grabbedResults.length > 0,
+    seasons: results,
+    remainingSeasonSearches: Math.max(0, seasonsNeedingSearch.length - seasonsForThisPass.length)
+  };
+}
+
+function downloadIdFromTvGrabResults(results: Array<{ result: { queued?: Array<{ download?: { id?: string } }>; download?: { id?: string } } }>) {
+  for (const item of results) {
+    if (item.result.download?.id) return item.result.download.id;
+    for (const queued of item.result.queued ?? []) {
+      if (queued.download?.id) return queued.download.id;
+    }
+  }
+  return null;
 }
 
 async function hasActiveSeasonPackDownload(title: string, season: number) {
@@ -962,7 +1052,7 @@ async function existingEpisodesForSeason(requestId: string, title: string, seaso
   const episodes = new Set<number>();
   for (const item of imports) {
     const sameRequest = item.requestId === requestId;
-    const sameTitle = mediaIdentityKey(item) === mediaIdentityKey({ mediaType: "tv", title, year: item.year, season, episode: item.episode });
+    const sameTitle = normalizeTitleForIdentity(item.title) === normalizeTitleForIdentity(title);
     if ((sameRequest || sameTitle) && typeof item.episode === "number") episodes.add(item.episode);
   }
   for (const download of downloads) {
@@ -1026,8 +1116,11 @@ async function grabBestTvSeasonForRequest(
     return { grabbed: false, reason: "no aired monitored episodes need search", queued: [], rejected: [] };
   }
   const seasonEpisodeCount = eligibleRequestedEpisodes?.size ?? seriesStructure?.seasons.find((item) => item.seasonNumber === season)?.episodeCount;
-  const releases = releasePool?.length
+  const pooledSeasonReleases = releasePool?.length
     ? releasePool.filter((release) => releaseBelongsToSeason(release.title, season))
+    : [];
+  const releases = pooledSeasonReleases.length > 0
+    ? pooledSeasonReleases
     : await runSearch({
         kind: "season",
         query: request.title,
@@ -1044,11 +1137,8 @@ async function grabBestTvSeasonForRequest(
         : scoreRelease(release, profile)
     }))
   );
-  const seasonToken = `S${String(season).padStart(2, "0")}`;
   const accepted = scored.filter((item) => item.decision.accepted).sort((a, b) => b.decision.score - a.decision.score);
-  const seasonPacks = existingEpisodes.size === 0 && (!requestedEpisodes || requestedEpisodes.size === 0)
-    ? accepted.filter((item) => new RegExp(`\\b${seasonToken}\\b`, "i").test(item.release.title) && isSeasonPackTitle(item.release.title, season))
-    : [];
+  const seasonPacks = accepted.filter((item) => isSeasonPackTitle(item.release.title, season));
   const queued = [];
   const rejected: string[] = [];
 
@@ -1062,9 +1152,23 @@ async function grabBestTvSeasonForRequest(
   }
 
   const episodeCandidates = bestEpisodeCandidates(accepted, season, existingEpisodes, eligibleRequestedEpisodes);
-  const separatelySearchedEpisodes = episodeCandidates.length > 0 ? [] : await searchEpisodesForSeason(request, season, profile, existingEpisodes, eligibleRequestedEpisodes, seasonEpisodeCount, releasePool);
-  const fallbackEpisodeCandidates = episodeCandidates.length > 0 ? episodeCandidates : separatelySearchedEpisodes;
+  const coveredEpisodes = episodesFromCandidates(episodeCandidates, season);
+  const remainingExistingEpisodes = new Set([...existingEpisodes, ...coveredEpisodes]);
+  const separatelySearchedEpisodes = await searchEpisodesForSeason(
+    request,
+    season,
+    profile,
+    remainingExistingEpisodes,
+    eligibleRequestedEpisodes,
+    seasonEpisodeCount,
+    releases
+  );
+  const fallbackEpisodeCandidates = [...episodeCandidates, ...separatelySearchedEpisodes];
   for (const candidate of fallbackEpisodeCandidates) {
+    if (queued.length >= TV_EPISODE_DOWNLOADS_PER_REQUEST_PASS) {
+      rejected.push(`stopped after ${TV_EPISODE_DOWNLOADS_PER_REQUEST_PASS} queued episode candidates; remaining episodes rotate next monitor pass`);
+      break;
+    }
     const result = await queueReleaseForRequest(request.id, candidate);
     if (result.grabbed) queued.push(result);
     else rejected.push(`${candidate.release.title}: ${result.reason ?? "failed before queueing"}`);
@@ -1089,11 +1193,9 @@ function bestEpisodeCandidates<T extends { release: { title: string }; decision:
   requestedEpisodes?: Set<number>
 ) {
   const byEpisode = new Map<number, T>();
-  const seasonPart = String(season).padStart(2, "0");
   for (const item of items) {
-    const match = item.release.title.match(new RegExp(`\\bS${seasonPart}E(\\d{1,3})\\b`, "i"));
-    if (!match) continue;
-    const episode = Number(match[1]);
+    const episode = episodeNumberFromTitle(item.release.title, season);
+    if (!episode) continue;
     if (existingEpisodes.has(episode)) continue;
     if (requestedEpisodes && requestedEpisodes.size > 0 && !requestedEpisodes.has(episode)) continue;
     const existing = byEpisode.get(episode);
@@ -1102,6 +1204,15 @@ function bestEpisodeCandidates<T extends { release: { title: string }; decision:
   return [...byEpisode.entries()]
     .sort(([episodeA], [episodeB]) => episodeA - episodeB)
     .map(([, item]) => item);
+}
+
+function episodesFromCandidates<T extends { release: { title: string } }>(items: T[], season: number) {
+  const episodes = new Set<number>();
+  for (const item of items) {
+    const episode = episodeNumberFromTitle(item.release.title, season);
+    if (episode) episodes.add(episode);
+  }
+  return episodes;
 }
 
 async function searchEpisodesForSeason(
@@ -1120,9 +1231,16 @@ async function searchEpisodesForSeason(
 
   let networkSearches = 0;
   let cacheHits = 0;
-  const perEpisode = await Promise.all(
-    targets.map(async (episode) => {
-      const cachedEpisodeReleases = releasePool?.length
+  const hasReleasePool = Array.isArray(releasePool);
+  const perEpisode: Array<{
+    release: Parameters<typeof scoreRelease>[0];
+    decision: ReturnType<typeof scoreRelease>;
+  } | undefined> = [];
+  const batchSize = 4;
+  for (let index = 0; index < targets.length; index += batchSize) {
+    const batch = targets.slice(index, index + batchSize);
+    const batchResults = await Promise.all(batch.map(async (episode) => {
+      const cachedEpisodeReleases = hasReleasePool
         ? releasePool.filter((release) => releaseBelongsToEpisode(release.title, season, episode))
         : [];
       if (cachedEpisodeReleases.length > 0) cacheHits += 1;
@@ -1150,19 +1268,22 @@ async function searchEpisodesForSeason(
       return scored
         .filter((item) => item.decision.accepted)
         .sort((a, b) => b.decision.score - a.decision.score)[0];
-    })
-  );
+    }));
+    perEpisode.push(...batchResults);
+  }
 
   const found = perEpisode.filter((item): item is NonNullable<(typeof perEpisode)[number]> => Boolean(item));
-  await prisma.searchHistory.create({
-    data: {
-      type: "episode-grab",
-      query: { requestId: request.id, title: request.title, season, targets: targets.length, cacheHits, networkSearches },
-      resultCount: found.length,
-      status: "ok",
-      message: found.length > 0 ? "episode candidates found" : "no episode candidates"
-    }
-  }).catch(() => undefined);
+  if (found.length > 0 || networkSearches > 0) {
+    await prisma.searchHistory.create({
+      data: {
+        type: "episode-grab",
+        query: { requestId: request.id, title: request.title, season, targets: targets.length, cacheHits, networkSearches },
+        resultCount: found.length,
+        status: "ok",
+        message: found.length > 0 ? "episode candidates found" : "no episode candidates after network search"
+      }
+    }).catch(() => undefined);
+  }
 
   return found;
 }
@@ -1198,25 +1319,63 @@ function titleSearchClauses(title: string) {
 }
 
 function isSeasonPackTitle(title: string, season: number) {
-  const seasonToken = `S${String(season).padStart(2, "0")}`;
-  return new RegExp(`\\b${seasonToken}\\b`, "i").test(title) && !/\bS\d{1,2}E\d{1,3}\b/i.test(title);
+  return titleCoversSeason(title, season) && !episodePattern(season).test(title);
 }
 
 function releaseBelongsToSeason(title: string, season: number) {
-  const seasonToken = `S${String(season).padStart(2, "0")}`;
-  return new RegExp(`\\b${seasonToken}(?:\\b|E\\d{1,3}\\b)`, "i").test(title);
+  return titleCoversSeason(title, season) || episodePattern(season).test(title);
 }
 
 function releaseBelongsToEpisode(title: string, season: number, episode: number) {
-  const seasonPart = String(season).padStart(2, "0");
-  const episodePart = String(episode).padStart(2, "0");
-  return new RegExp(`\\bS${seasonPart}E${episodePart}\\b`, "i").test(title);
+  return episodesCoveredByTitle(title, season).has(episode);
 }
 
 function episodeNumberFromTitle(title: string, season: number) {
-  const seasonPart = String(season).padStart(2, "0");
-  const match = title.match(new RegExp(`\\bS${seasonPart}E(\\d{1,3})\\b`, "i"));
-  return match ? Number(match[1]) : undefined;
+  return [...episodesCoveredByTitle(title, season)].sort((a, b) => a - b)[0];
+}
+
+function seasonPattern(season: number) {
+  return new RegExp(`\\bS0?${season}\\b`, "i");
+}
+
+function titleCoversSeason(title: string, season: number) {
+  if (seasonPattern(season).test(title)) return true;
+  const range = title.match(/\bS(?<start>\d{1,2})(?:-|to|–)(?<end>\d{1,2})\b/i);
+  if (!range?.groups) return false;
+  const start = Number(range.groups.start);
+  const end = Number(range.groups.end);
+  return Number.isFinite(start) && Number.isFinite(end) && season >= Math.min(start, end) && season <= Math.max(start, end);
+}
+
+function episodePattern(season: number, episode?: number) {
+  const episodePart = episode ? `0?${episode}` : "\\d{1,3}";
+  return new RegExp(`(?:\\bS0?${season}E(?<episode>${episodePart})(?:\\b|E\\d{1,3}|[- .]?E?\\d{1,3}\\b)|\\b0?${season}x(?<episode_x>${episodePart})\\b)`, "i");
+}
+
+function episodesCoveredByTitle(title: string, season: number) {
+  const episodes = new Set<number>();
+  const single = title.match(new RegExp(`\\bS0?${season}E(?<episode>\\d{1,3})\\b`, "i"));
+  if (single?.groups?.episode) episodes.add(Number(single.groups.episode));
+
+  const oneBy = title.match(new RegExp(`\\b0?${season}x(?<episode>\\d{1,3})\\b`, "i"));
+  if (oneBy?.groups?.episode) episodes.add(Number(oneBy.groups.episode));
+
+  const multi = title.match(new RegExp(`\\bS0?${season}E(?<first>\\d{1,3})(?<rest>(?:E\\d{1,3})+)\\b`, "i"));
+  if (multi?.groups?.first && multi.groups.rest) {
+    episodes.add(Number(multi.groups.first));
+    for (const match of multi.groups.rest.matchAll(/E(\d{1,3})/gi)) episodes.add(Number(match[1]));
+  }
+
+  const range = title.match(new RegExp(`\\bS0?${season}E(?<start>\\d{1,3})[- .]?E?(?<end>\\d{1,3})\\b`, "i"));
+  if (range?.groups?.start && range.groups.end) {
+    const start = Number(range.groups.start);
+    const end = Number(range.groups.end);
+    const low = Math.min(start, end);
+    const high = Math.max(start, end);
+    for (let episode = low; episode <= high && episode - low <= 50; episode += 1) episodes.add(episode);
+  }
+
+  return episodes;
 }
 
 function seasonCooldownKey(requestId: string, season: number) {
@@ -1250,7 +1409,7 @@ async function queueReleaseForRequest(
     await createBlocklistItem({
       guid: candidate.release.guid ? String(candidate.release.guid) : undefined,
       title: candidate.release.title,
-      reason: /duplicate/i.test(message) ? "duplicate_nzb" : "import_failed",
+      reason: blockReasonFromFailure(message),
       source: "grab-validation",
       release: candidate.release
     }).catch(() => undefined);
@@ -1260,7 +1419,7 @@ async function queueReleaseForRequest(
     await createBlocklistItem({
       guid: candidate.release.guid ? String(candidate.release.guid) : undefined,
       title: candidate.release.title,
-      reason: /duplicate/i.test(download.error ?? "") ? "duplicate_nzb" : "import_failed",
+      reason: blockReasonFromFailure(download.error),
       source: "grab-validation",
       release: candidate.release
     }).catch(() => undefined);
@@ -1312,7 +1471,7 @@ export async function grabReleaseForRequest(id: string, release: unknown) {
     await createBlocklistItem({
       guid: typedRelease.guid ? String(typedRelease.guid) : undefined,
       title: typedRelease.title,
-      reason: /duplicate/i.test(download.error ?? "") ? "duplicate_nzb" : "import_failed",
+      reason: blockReasonFromFailure(download.error),
       source: "manual-grab-validation",
       release: typedRelease
     }).catch(() => undefined);
@@ -1344,7 +1503,7 @@ async function blocklistSelectedRelease(request: MediaRequest, reason: string, s
   await createBlocklistItem({
     guid,
     title,
-    reason: /duplicate/i.test(reason) ? "duplicate_nzb" : /missing|article|stat/i.test(reason) ? "missing_articles" : "import_failed",
+    reason: blockReasonFromFailure(reason),
     source,
     release: request.selectedRelease
   }).catch(() => undefined);

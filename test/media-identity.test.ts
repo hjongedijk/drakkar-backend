@@ -12,6 +12,23 @@ describe("inferMediaIdentity", () => {
     });
   });
 
+  it("detects TV episodes from 1x03 titles", () => {
+    assert.deepEqual(inferMediaIdentity("Example.Show.1x03.1080p.WEB-DL-GROUP"), {
+      mediaType: "tv",
+      title: "Example Show",
+      season: 1,
+      episode: 3
+    });
+  });
+
+  it("detects season packs without pretending they are one episode", () => {
+    assert.deepEqual(inferMediaIdentity("Example.Show.S04.1080p.WEB-DL-GROUP"), {
+      mediaType: "tv",
+      title: "Example Show",
+      season: 4
+    });
+  });
+
   it("detects movies and release years", () => {
     assert.deepEqual(inferMediaIdentity("Example.Movie.2026.2160p.BluRay.x265-GROUP"), {
       mediaType: "movie",

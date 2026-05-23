@@ -6,6 +6,7 @@ process.env.REDIS_URL ??= "redis://localhost:6379";
 
 const { filenameFromSubject } = await import("../src/usenet/filename.js");
 const { classifyNzbImportMode } = await import("../src/usenet/importMode.js");
+const { parseStoredRarHeaders } = await import("../src/archive/rarStoredIndex.js");
 
 describe("filenameFromSubject", () => {
   it("uses quoted media filenames from NZB subjects", () => {
@@ -51,7 +52,7 @@ describe("classifyNzbImportMode", () => {
     assert.equal(mode, "mounted");
   });
 
-  it("rejects archive payloads instead of downloading them to disk", () => {
+  it("uses mounted mode for archive payloads so stored archive entries can stream", () => {
     const mode = classifyNzbImportMode({
       files: [
         { subject: '[1/57] "Movie.2026.part01.rar" yEnc (1/200)' },
@@ -59,6 +60,31 @@ describe("classifyNzbImportMode", () => {
       ]
     });
 
-    assert.equal(mode, "unsupported");
+    assert.equal(mode, "mounted");
+  });
+});
+
+describe("parseStoredRarHeaders", () => {
+  it("detects stored RAR media entries and byte offsets", () => {
+    const name = Buffer.from("Movie.2026.1080p.mkv", "utf8");
+    const headSize = 7 + 25 + name.length;
+    const buffer = Buffer.alloc(7 + headSize);
+    Buffer.from([0x52, 0x61, 0x72, 0x21, 0x1a, 0x07, 0x00]).copy(buffer, 0);
+    buffer.writeUInt8(0x74, 9);
+    buffer.writeUInt16LE(0x8000, 10);
+    buffer.writeUInt16LE(headSize, 12);
+    buffer.writeUInt32LE(1234, 14);
+    buffer.writeUInt32LE(1234, 18);
+    buffer.writeUInt8(0x30, 32);
+    buffer.writeUInt16LE(name.length, 33);
+    name.copy(buffer, 39);
+
+    const headers = parseStoredRarHeaders(buffer);
+
+    assert.equal(headers.length, 1);
+    assert.equal(headers[0]?.name, "Movie.2026.1080p.mkv");
+    assert.equal(headers[0]?.method, 0x30);
+    assert.equal(headers[0]?.dataStart, 7 + headSize);
+    assert.equal(headers[0]?.packedSize, 1234);
   });
 });

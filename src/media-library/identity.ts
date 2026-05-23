@@ -78,6 +78,34 @@ export function inferMediaIdentity(rawTitle: string) {
     };
   }
 
+  const alternateEpisode = normalized.match(/\b(\d{1,2})x(\d{1,3})\b/i);
+  if (alternateEpisode) {
+    return {
+      mediaType: "tv",
+      title: trimAtQuality(normalized.slice(0, alternateEpisode.index)).trim() || normalized,
+      season: Number(alternateEpisode[1]),
+      episode: Number(alternateEpisode[2])
+    };
+  }
+
+  const seasonPack = normalized.match(/\bS(\d{1,2})(?!\s*E\d{1,3})\b/i);
+  if (seasonPack) {
+    return {
+      mediaType: "tv",
+      title: trimAtQuality(normalized.slice(0, seasonPack.index)).trim() || normalized,
+      season: Number(seasonPack[1])
+    };
+  }
+
+  const dailyEpisode = normalized.match(/\b(19\d{2}|20\d{2})[ .-](0[1-9]|1[0-2])[ .-](0[1-9]|[12]\d|3[01])\b/);
+  if (dailyEpisode) {
+    return {
+      mediaType: "tv",
+      title: trimAtQuality(normalized.slice(0, dailyEpisode.index)).trim() || normalized,
+      year: Number(dailyEpisode[1])
+    };
+  }
+
   const year = normalized.match(/\b(19\d{2}|20\d{2})\b/);
   if (year?.index != null) {
     return {

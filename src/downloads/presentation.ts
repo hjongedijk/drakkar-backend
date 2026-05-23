@@ -30,7 +30,7 @@ export function statusLabelForDownload(status: string, error?: string | null) {
     fetching_nzb: "Fetching NZB",
     verifying: "Validating release",
     downloading: "Downloading release",
-    prepared: "Validated and ready",
+    prepared: "Validated; finalizing library link",
     mounted: "Mounted",
     waiting_for_provider: "Waiting for provider capacity",
     waiting_for_nzb: "Waiting for NZB",

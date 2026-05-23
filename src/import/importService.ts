@@ -5,7 +5,7 @@ import { prisma } from "../db/prisma.js";
 import { detectArchive, isJunkFile, isMediaFile } from "../extract/detect.js";
 import { extractArchiveFiles, extractArchivesInPath } from "../extract/extractService.js";
 import { writeImportMetadata } from "../metadata/metadataService.js";
-import { mediaIdentityKey } from "../media-library/identity.js";
+import { inferMediaIdentity, mediaIdentityKey } from "../media-library/identity.js";
 import { refreshMediaLibrary } from "../media-library/libraryService.js";
 import { completedPathFor, getNamingSettings } from "../naming/namingService.js";
 import { getIgnoredPatterns, matchesIgnoredPattern } from "../policies/policyService.js";
@@ -39,6 +39,8 @@ function cleanTitle(value: string) {
     .replace(/^"+|"+$/g, "")
     .replace(/[._]+/g, " ")
     .replace(/\s+/g, " ")
+    .replace(/\s*[\[(]\s*$/, "")
+    .replace(/^\s*[\])]\s*/, "")
     .trim();
 }
 
@@ -60,11 +62,31 @@ function normalizeMountedFilename(value: string) {
     .trim();
 }
 
+function decodeMountedName(value: string) {
+  try {
+    return decodeURIComponent(value);
+  } catch {
+    return value;
+  }
+}
+
+function bestMountedMediaFilename(input: { selectedName: string; subjectName: string; requestMediaType?: string }) {
+  const selectedName = normalizeMountedFilename(decodeMountedName(input.selectedName).replace(/^[-_\s]+|[_\s]+$/g, ""));
+  const selectedIdentity = inferMediaIdentity(selectedName);
+  if (input.requestMediaType === "tv" || selectedIdentity.mediaType === "tv") {
+    if (selectedIdentity.mediaType === "tv" && selectedIdentity.title && !suspiciousImportTitle(selectedIdentity.title)) return selectedName;
+  }
+  return input.subjectName;
+}
+
 function suspiciousImportTitle(value: string) {
+  const compact = value.trim();
   return !value
     || value.includes("&quot;")
     || /^\s*\d+\]\s*/.test(value)
     || /^[a-z0-9]{20,}$/i.test(value)
+    || (/^[a-z0-9]{8,19}$/i.test(compact) && /[a-z]/.test(compact) && /[A-Z]/.test(compact) && /\d/.test(compact))
+    || (/\bS\d{1,2}\s*-\s*\d{1,2}\b/i.test(value) && /\b(2160p|1080p|720p|web-?dl|webrip|bluray|h\.?264|x264|x265|hevc)\b/i.test(value))
     || /^[a-z0-9]+-[a-z0-9-]+$/i.test(value);
 }
 
@@ -99,6 +121,20 @@ async function requestMetadata(requestId?: string): Promise<Partial<ImportMedia>
     year: request.year ?? undefined,
     tmdbId: request.tmdbId ?? undefined,
     tvdbId: request.tvdbId ?? undefined
+  };
+}
+
+function enrichMountedTvMedia(media: ImportMedia, downloadTitle: string, requestInfo: Partial<ImportMedia>): ImportMedia {
+  if (requestInfo.mediaType !== "tv" && media.mediaType !== "tv") return media;
+  if (media.season && media.episode) return media;
+  const fromDownload = inferMedia(downloadTitle);
+  return {
+    ...media,
+    mediaType: "tv",
+    title: requestInfo.title ?? media.title,
+    year: requestInfo.year ?? media.year,
+    season: media.season ?? fromDownload.season,
+    episode: media.episode ?? fromDownload.episode
   };
 }
 
@@ -143,12 +179,6 @@ export async function reconcileRequestStatusAfterImport(requestId?: string, down
         : downloadId ?? request.downloadId
     }
   }).catch(() => undefined);
-}
-
-function suspiciousMountedTitle(value: string) {
-  return !value
-    || /^[a-z0-9]+-[a-z0-9-]+$/i.test(value)
-    || /^[a-z0-9-]{3,}$/i.test(value.replace(/\bS\d{1,2}E\d{1,3}\b/i, "").replace(/\b(19\d{2}|20\d{2})\b/g, "").trim());
 }
 
 function fallbackMediaTitle(value?: string | null) {
@@ -252,7 +282,13 @@ function mediaVideoFiles(files: Awaited<ReturnType<typeof listMountedFiles>>, ig
     .filter((file) => file.type === "streamable-file")
     .filter((file) => /\.(mkv|mp4|avi|mov|m4v|ts)(?:[_\s)]|$)/i.test(file.name))
     .filter((file) => !isJunkFile(file.name) && !matchesIgnoredPattern(file.path, ignoredPatterns))
+    .filter((file) => file.size > 50 * 1024 * 1024)
     .sort((a, b) => a.name.localeCompare(b.name));
+}
+
+function looksLikeMountedTvPack(downloadTitle: string, files: Awaited<ReturnType<typeof listMountedFiles>>) {
+  if (/\bS\d{1,2}\s*-\s*\d{1,2}\b/i.test(downloadTitle)) return true;
+  return files.some((file) => file.type === "streamable-file" && /\bS\d{1,2}E\d{1,3}\b/i.test(file.name));
 }
 
 export async function makeMountedDownloadAvailable(input: { downloadId: string; requestId?: string }) {
@@ -267,7 +303,7 @@ export async function makeMountedDownloadAvailable(input: { downloadId: string; 
   const mountedFiles = await listMountedFiles(`/mounted/releases/${download.nzbDocumentId}`);
   const ignoredPatterns = await getIgnoredPatterns();
   const requestInfo = await requestMetadata(input.requestId);
-  const selectedFiles = requestInfo.mediaType === "tv"
+  const selectedFiles = requestInfo.mediaType === "tv" || looksLikeMountedTvPack(download.title, mountedFiles)
     ? mediaVideoFiles(mountedFiles, ignoredPatterns)
     : [mainVideoFile(mountedFiles, ignoredPatterns)].filter((file): file is NonNullable<typeof file> => Boolean(file));
   if (selectedFiles.length === 0) throw new Error("mounted NZB contains no streamable video file after ignored/sample filtering");
@@ -275,13 +311,18 @@ export async function makeMountedDownloadAvailable(input: { downloadId: string; 
   const imported = [];
   for (const selected of selectedFiles) {
     const nzbFile = download.nzbDocument.files.find((file) => selected.path.includes(file.id));
-    const filename = nzbFile
+    const subjectName = nzbFile
       ? filenameFromSubject(nzbFile.subject, 0)
       : normalizeMountedFilename(selected.name.replace(/^[-_\s]+|[_\s]+$/g, ""));
-    const downloadFallback = !input.requestId && suspiciousMountedTitle(inferMedia(filename).title)
+    const filename = bestMountedMediaFilename({
+      selectedName: selected.name,
+      subjectName,
+      requestMediaType: requestInfo.mediaType
+    });
+    const downloadFallback = !input.requestId && suspiciousImportTitle(inferMedia(filename).title)
       ? inferMedia(download.title)
       : {};
-    const inferred = { ...inferMedia(filename), ...downloadFallback, ...requestInfo };
+    const inferred = enrichMountedTvMedia({ ...inferMedia(filename), ...downloadFallback, ...requestInfo }, download.title, requestInfo);
     const matchingImport = await findWorkingImportByIdentity(inferred);
 
     const existing = await prisma.importItem.findFirst({
@@ -322,9 +363,16 @@ export async function makeMountedDownloadAvailable(input: { downloadId: string; 
           status: "streaming_import"
         }
       });
-    const ensured = existing || !repairable
-      ? item
-      : await prisma.importItem.update({
+    const shouldUpdateExisting = existing && (
+      existing.requestId !== input.requestId
+      || existing.mediaType !== inferred.mediaType
+      || existing.title !== (inferred.title || download.title)
+      || existing.year !== (inferred.year ?? null)
+      || existing.season !== (inferred.season ?? null)
+      || existing.episode !== (inferred.episode ?? null)
+    );
+    const ensured = shouldUpdateExisting || repairable
+      ? await prisma.importItem.update({
           where: { id: item.id },
           data: {
             requestId: input.requestId,
@@ -337,7 +385,8 @@ export async function makeMountedDownloadAvailable(input: { downloadId: string; 
             completedPath: selected.path,
             status: "streaming_import"
           }
-        });
+        })
+      : item;
 
     const link = await createLibraryEntryForImport(ensured);
     imported.push({ item: ensured, link, streamPath: selected.path });
@@ -427,7 +476,7 @@ export async function repairSuspiciousImports() {
   for (const item of imports) {
     const requestInfo = item.requestId ? await requestMetadata(item.requestId) : {};
     const filename = normalizeMountedFilename(decodePathBasename(item.completedPath));
-    const downloadFallback = !item.requestId && suspiciousMountedTitle(inferMedia(filename).title)
+    const downloadFallback = !item.requestId && suspiciousImportTitle(inferMedia(filename).title)
       ? inferMedia(item.download?.title ?? fallbackMediaTitle(item.download?.title) ?? item.title)
       : {};
     const inferred = { ...inferMedia(filename), ...downloadFallback, ...requestInfo };

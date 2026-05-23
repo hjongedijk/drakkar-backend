@@ -1,4 +1,3 @@
-import "dotenv/config";
 import { join } from "node:path";
 import { z } from "zod";
 import { ensureRuntimeSettings } from "./runtimeSettings.js";
@@ -16,9 +15,10 @@ const envBoolean = z.preprocess((value) => {
 
 const envSchema = z.object({
   NODE_ENV: z.enum(["development", "test", "production"]).default("development"),
+  LOG_LEVEL: z.enum(["trace", "debug", "info", "warn", "error", "fatal", "silent"]).default("info"),
   PORT: z.coerce.number().int().positive().default(3000),
-  DATABASE_URL: z.string().url(),
-  REDIS_URL: z.string().url(),
+  DATABASE_URL: z.string().url().default(runtimeSettings.infrastructure.postgres.url),
+  REDIS_URL: z.string().url().default(runtimeSettings.infrastructure.valkey.url),
   APP_BASE_URL: z.string().url().default("http://localhost:3000"),
   CONFIG_DIR: z.string().default("/data/config"),
   VFS_ROOT: z.string().default("/data"),
@@ -31,18 +31,18 @@ const envSchema = z.object({
   MEDIA_MOVIES_DIR: z.string().optional(),
   MEDIA_TV_DIR: z.string().optional(),
   NZB_BACKUPS_DIR: z.string().default("/data/nzb-backup"),
-  FUSE_MOUNT_ENABLED: envBoolean.default(false),
+  FUSE_MOUNT_ENABLED: envBoolean.default(runtimeSettings.infrastructure.runtime.fuseMountEnabled),
   FUSE_MOUNT_PATH: z.string().default("/mnt/fuse"),
   FUSE_ALLOW_OTHER: envBoolean.default(true),
   FUSE_FORCE_MOUNT: envBoolean.default(true),
   FUSE_DEBUG: envBoolean.default(false),
   FRONTEND_API_TOKEN: z.string().default(runtimeSettings.frontendApiToken),
   AUTH_SESSION_TTL_DAYS: z.coerce.number().int().positive().default(30),
-  REQUEST_SYNC_ENABLED: envBoolean.default(true),
-  BACKGROUND_REPAIR_ENABLED: envBoolean.default(true),
-  STARTUP_RECOVERY_ENABLED: envBoolean.default(true),
-  DOWNLOAD_WORKERS_ENABLED: envBoolean.default(true),
-  STREAM_POOL_PRIME_ENABLED: envBoolean.default(true)
+  REQUEST_SYNC_ENABLED: envBoolean.default(runtimeSettings.infrastructure.runtime.requestSyncEnabled),
+  BACKGROUND_REPAIR_ENABLED: envBoolean.default(runtimeSettings.infrastructure.runtime.backgroundRepairEnabled),
+  STARTUP_RECOVERY_ENABLED: envBoolean.default(runtimeSettings.infrastructure.runtime.startupRecoveryEnabled),
+  DOWNLOAD_WORKERS_ENABLED: envBoolean.default(runtimeSettings.infrastructure.runtime.downloadWorkersEnabled),
+  STREAM_POOL_PRIME_ENABLED: envBoolean.default(runtimeSettings.infrastructure.runtime.streamPoolPrimeEnabled)
 });
 
 const parsedEnv = envSchema.parse(process.env);

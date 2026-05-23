@@ -1,6 +1,7 @@
 import { describe, it } from "node:test";
 import assert from "node:assert/strict";
 import type { QualityProfile } from "@prisma/client";
+import { parseReleaseTitle } from "../src/quality/parser.js";
 import { scoreRelease } from "../src/quality/scoring.js";
 import type { Release } from "../src/releases/types.js";
 
@@ -114,5 +115,35 @@ describe("scoreRelease", () => {
 
     assert.equal(decision.accepted, false);
     assert.ok(decision.reasons.includes("multi-audio release rejected"));
+  });
+});
+
+describe("parseReleaseTitle", () => {
+  it("parses Servarr-style movie quality/source/codec fields", () => {
+    const parsed = parseReleaseTitle("Avatar.The.Way.of.Water.2022.2160p.UHD.BluRay.x265-GROUP");
+
+    assert.equal(parsed.year, 2022);
+    assert.equal(parsed.resolution, "2160p");
+    assert.equal(parsed.source, "bluray");
+    assert.equal(parsed.codec, "x265");
+    assert.equal(parsed.releaseGroup, "GROUP");
+  });
+
+  it("parses Sonarr-style SxxExx and 1x03 episode titles", () => {
+    const sxxexx = parseReleaseTitle("The.Last.of.Us.S01E03.Long.Long.Time.2160p.WEB-DL-GROUP");
+    const oneBy = parseReleaseTitle("The.Last.of.Us.1x03.Long.Long.Time.1080p.WEB-DL-GROUP");
+
+    assert.equal(sxxexx.season, 1);
+    assert.equal(sxxexx.episode, 3);
+    assert.equal(oneBy.season, 1);
+    assert.equal(oneBy.episode, 3);
+  });
+
+  it("parses daily TV date as year metadata", () => {
+    const parsed = parseReleaseTitle("The.Daily.Show.2026.05.23.1080p.WEB-DL-GROUP");
+
+    assert.equal(parsed.year, 2026);
+    assert.equal(parsed.resolution, "1080p");
+    assert.equal(parsed.source, "webdl");
   });
 });

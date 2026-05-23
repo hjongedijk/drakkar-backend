@@ -616,7 +616,7 @@ export async function prepareNzbDocumentForStreaming(input: {
     });
     await prisma.download.update({
       where: { id: input.downloadId },
-      data: { status: "prepared", progress: 100, downloaded: totalSize, speedBytesSec: 0, etaSeconds: 0, error: null }
+      data: { status: "prepared", progress: 99, downloaded: verifiedBytes, speedBytesSec: 0, etaSeconds: null, error: null }
     });
     return { status: "prepared", verifiedSegments: verified };
   } catch (error) {

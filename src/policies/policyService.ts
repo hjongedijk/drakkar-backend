@@ -19,7 +19,8 @@ const queueDecisionKeys = [
   "singleEpisodeContainsSeason",
   "unableToDetermineSample",
   "sample",
-  "archiveNeedsExtraction"
+  "archiveNeedsExtraction",
+  "missingArticles"
 ] as const;
 
 export const queueDecisionActionSchema = z.enum(["do_nothing", "remove", "remove_and_blocklist", "remove_blocklist_and_search", "search_again"]);
@@ -115,7 +116,8 @@ export const DEFAULT_POLICIES: PolicySettings = {
     singleEpisodeContainsSeason: "do_nothing",
     unableToDetermineSample: "do_nothing",
     sample: "remove_blocklist_and_search",
-    archiveNeedsExtraction: "remove_blocklist_and_search"
+    archiveNeedsExtraction: "remove_blocklist_and_search",
+    missingArticles: "remove_blocklist_and_search"
   }
 };
 
@@ -338,11 +340,12 @@ export async function getBlocklistStats() {
 export async function createBlocklistItem(input: unknown) {
   const body = blocklistCreateSchema.parse(input);
   const release = body.release === undefined ? undefined : JSON.parse(JSON.stringify(body.release));
+  const normalizedIncomingTitle = normalizeReleaseTitle(body.title);
 
   if (body.guid) {
     const existing = await prisma.blocklistItem.findFirst({ where: { guid: body.guid } }).catch(() => null);
     if (existing) {
-      return prisma.blocklistItem.update({
+      const updated = await prisma.blocklistItem.update({
         where: { id: existing.id },
         data: {
           title: body.title,
@@ -352,11 +355,37 @@ export async function createBlocklistItem(input: unknown) {
           expiresAt: body.expiresAt ? new Date(body.expiresAt) : existing.expiresAt
         }
       });
+      invalidateBlocklistCache();
+      return updated;
     }
   }
 
+  const titleCandidates = await prisma.blocklistItem.findMany({
+    where: {
+      title: { contains: body.title.split(".")[0]?.split(" ")[0] ?? body.title, mode: "insensitive" }
+    },
+    orderBy: { createdAt: "desc" },
+    take: 500
+  }).catch(() => null);
+  const existingByTitle = titleCandidates?.find((item) =>
+    normalizeReleaseTitle(item.title) === normalizedIncomingTitle &&
+    item.reason === body.reason &&
+    item.source === body.source
+  );
+  if (existingByTitle) {
+    const updated = await prisma.blocklistItem.update({
+      where: { id: existingByTitle.id },
+      data: {
+        release,
+        expiresAt: body.expiresAt ? new Date(body.expiresAt) : existingByTitle.expiresAt
+      }
+    });
+    invalidateBlocklistCache();
+    return updated;
+  }
+
   try {
-    return await prisma.blocklistItem.create({
+    const created = await prisma.blocklistItem.create({
       data: {
         guid: body.guid,
         title: body.title,
@@ -366,6 +395,8 @@ export async function createBlocklistItem(input: unknown) {
         expiresAt: body.expiresAt ? new Date(body.expiresAt) : undefined
       }
     });
+    invalidateBlocklistCache();
+    return created;
   } catch (error) {
     if (
       error instanceof Prisma.PrismaClientKnownRequestError &&
@@ -373,10 +404,12 @@ export async function createBlocklistItem(input: unknown) {
       body.guid
     ) {
       const existing = await prisma.blocklistItem.findFirstOrThrow({ where: { guid: body.guid } });
-      return prisma.blocklistItem.update({
+      const updated = await prisma.blocklistItem.update({
         where: { id: existing.id },
         data: { title: body.title, reason: body.reason, source: body.source, release }
       });
+      invalidateBlocklistCache();
+      return updated;
     }
     throw error;
   }
@@ -395,11 +428,13 @@ export async function updateBlocklistItem(id: string, input: unknown) {
       ...(body.expiresAt !== undefined ? { expiresAt: body.expiresAt ? new Date(body.expiresAt) : null } : {})
     }
   });
+  invalidateBlocklistCache();
   return presentBlocklistItem(updated);
 }
 
 export async function deleteBlocklistItem(id: string) {
   await prisma.blocklistItem.delete({ where: { id } });
+  invalidateBlocklistCache();
   return { ok: true };
 }
 
@@ -407,11 +442,13 @@ export async function deleteExpiredBlocklistItems() {
   const result = await prisma.blocklistItem.deleteMany({
     where: { expiresAt: { lte: new Date() } }
   });
+  invalidateBlocklistCache();
   return { deleted: result.count };
 }
 
 export async function clearBlocklistItems() {
   const result = await prisma.blocklistItem.deleteMany({});
+  invalidateBlocklistCache();
   return { deleted: result.count };
 }
 
@@ -423,9 +460,52 @@ type BlocklistReleaseInput = {
   indexer?: string;
 };
 
+type BlocklistCandidate = {
+  id: string;
+  guid: string | null;
+  title: string;
+  reason: string;
+  source: string | null;
+  release: Prisma.JsonValue | null;
+  expiresAt: Date | null;
+  createdAt: Date;
+  updatedAt: Date;
+};
+
+const ACTIVE_BLOCKLIST_CACHE_TTL_MS = 15_000;
+let activeBlocklistCache: { expiresAt: number; items: BlocklistCandidate[] } | null = null;
+let activeBlocklistLoad: Promise<BlocklistCandidate[]> | null = null;
+
+function invalidateBlocklistCache() {
+  activeBlocklistCache = null;
+  activeBlocklistLoad = null;
+}
+
+async function getActiveBlocklistCandidates() {
+  const now = Date.now();
+  if (activeBlocklistCache && activeBlocklistCache.expiresAt > now) return activeBlocklistCache.items;
+  if (activeBlocklistLoad) return activeBlocklistLoad;
+
+  activeBlocklistLoad = prisma.blocklistItem.findMany({
+    where: { OR: [{ expiresAt: null }, { expiresAt: { gt: new Date(now) } }] },
+    orderBy: { createdAt: "desc" },
+    take: 20_000
+  }).then((items) => {
+    activeBlocklistCache = { expiresAt: Date.now() + ACTIVE_BLOCKLIST_CACHE_TTL_MS, items };
+    activeBlocklistLoad = null;
+    return items;
+  }).catch((error) => {
+    activeBlocklistLoad = null;
+    throw error;
+  });
+
+  return activeBlocklistLoad;
+}
+
 function normalizeReleaseTitle(value: string) {
   return value
     .toLowerCase()
+    .replace(/-[a-z0-9]+$/i, "")
     .replace(/['’"]/g, "")
     .replace(/[^a-z0-9]+/g, " ")
     .replace(/\s+/g, " ")
@@ -460,14 +540,9 @@ function sameSavedRelease(item: { guid: string | null; title: string; release: P
 async function activeBlocklistMatches(release: BlocklistReleaseInput) {
   const now = new Date();
   const guid = release.guid === undefined || release.guid === null ? undefined : String(release.guid);
-  const candidates = await prisma.blocklistItem.findMany({
-    where: {
-      OR: [...(guid ? [{ guid }] : []), { title: { contains: release.title.split(".")[0]?.split(" ")[0] ?? release.title, mode: "insensitive" } }]
-    },
-    orderBy: { createdAt: "desc" },
-    take: 500
-  });
-  return candidates.filter((item) => (!item.expiresAt || item.expiresAt > now) && sameSavedRelease(item, release));
+  return (await getActiveBlocklistCandidates())
+    .filter((item) => (!item.expiresAt || item.expiresAt > now) && (!guid || item.guid === guid || sameSavedRelease(item, release)))
+    .filter((item) => sameSavedRelease(item, release));
 }
 
 export async function isReleaseBlocklisted(release: BlocklistReleaseInput) {
@@ -504,6 +579,7 @@ export function getPolicyUsageReport() {
 export function classifyQueueDecisionKey(message: string): QueueDecisionKey | null {
   const normalized = message.toLowerCase();
   if (/already exists|already imported|working library item already exists/.test(normalized)) return "episodeAlreadyImported";
+  if (/430 no such article|no such article|article.*not found|missing article|missing segment|segment download failed/.test(normalized)) return "missingArticles";
   if (/no streamable video|no eligible files|no importable media|contains no streamable video/.test(normalized)) return "noEligibleFiles";
   if (/no audio/.test(normalized)) return "noAudioTracks";
   if (/sample/.test(normalized)) return "sample";

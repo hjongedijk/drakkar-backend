@@ -1,4 +1,5 @@
 import { prisma } from "../db/prisma.js";
+import { getStoredArchiveEntryByPath, listStoredArchiveEntries } from "../archive/rarStoredIndex.js";
 import { detectArchive, isPar2File } from "../extract/detect.js";
 import { filenameFromSubject } from "../usenet/filename.js";
 
@@ -244,7 +245,7 @@ export async function listMountedFiles(path: string): Promise<MountedVfsNode[]> 
   const mount = await getMountByPath(mountPath);
   if (!mount) throw new Error("mounted NZB not found");
   const basePath = parts[1] === "releases" ? `/mounted/releases/${mount.nzbDocumentId}` : mount.path;
-  return mount.nzbDocument.files.map((file, index) => {
+  const directFiles = mount.nzbDocument.files.map((file, index) => {
     const name = safeFileName(file.subject, index);
     const archive = detectArchive(name) !== "none" || isPar2File(name);
     return {
@@ -258,6 +259,18 @@ export async function listMountedFiles(path: string): Promise<MountedVfsNode[]> 
       status: archive ? "requires_extract" : mount.streamable ? "streamable" : "not_streamable"
     };
   }).sort((a, b) => a.name.localeCompare(b.name, undefined, { numeric: true, sensitivity: "base" }));
+  const archiveFiles = await listStoredArchiveEntries(mount.nzbDocumentId);
+  const virtualFiles = archiveFiles.map((file) => ({
+    name: file.name,
+    path: `${basePath}/archive/${encodeURIComponent(file.name)}`,
+    type: "streamable-file" as const,
+    size: file.size,
+    modifiedAt: file.modifiedAt.toISOString(),
+    mountId: mount.id,
+    nzbDocumentId: mount.nzbDocumentId,
+    status: "streamable_archive"
+  }));
+  return [...virtualFiles, ...directFiles].sort((a, b) => a.name.localeCompare(b.name, undefined, { numeric: true, sensitivity: "base" }));
 }
 
 export async function statMountedPath(path: string) {
@@ -282,6 +295,21 @@ export async function statMountedPath(path: string) {
       size: mount.nzbDocument.totalSize,
       modifiedAt: mount.updatedAt.toISOString(),
       isDirectory: true
+    };
+  }
+
+  const archiveEntry = await getStoredArchiveEntryByPath(path).catch(() => null);
+  if (archiveEntry) {
+    clearMissingMountedPath(path);
+    return {
+      path,
+      type: "streamable-file",
+      size: archiveEntry.size,
+      modifiedAt: archiveEntry.modifiedAt.toISOString(),
+      isDirectory: false,
+      requiresStreaming: true,
+      requiresExtract: false,
+      status: "streamable_archive"
     };
   }
 

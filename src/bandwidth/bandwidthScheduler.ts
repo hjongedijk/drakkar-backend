@@ -20,9 +20,7 @@ export async function getBandwidthStatus() {
     0,
     maxTotalConnections
   );
-  const reservedStreamingCapacity = activeStreamCount > 0
-    ? clamp(reservedStreamingConnections, allocatedStreamingConnections, maxTotalConnections)
-    : 0;
+  const reservedStreamingCapacity = activeStreamCount > 0 ? allocatedStreamingConnections : 0;
   const remainingAfterStreamingReservation = Math.max(0, maxTotalConnections - reservedStreamingCapacity);
   const effectiveDownloadCap = activeStreamCount > 0
     ? Math.min(maxDownloadConnections, remainingAfterStreamingReservation)

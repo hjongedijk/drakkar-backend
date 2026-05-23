@@ -9,6 +9,7 @@ import type { Release } from "../../releases/types.js";
 import { parseNzbXml } from "../../nzb/parser.js";
 import { classifyNzbImportPlan } from "../../usenet/importMode.js";
 import { looksLikeArchiveRelease } from "../../releases/archiveHeuristics.js";
+import { assertServiceAllowed, guardedExternalCall, recordServiceFailure, recordServiceSuccess } from "../../services/serviceGuard.js";
 
 export type SearchKind = "movie" | "tv" | "season" | "episode" | "manual" | "rss";
 
@@ -29,21 +30,24 @@ const inFlightSearches = new Map<string, Promise<Release[]>>();
 const inFlightNzbFetches = new Map<string, Promise<Awaited<ReturnType<typeof fetchNzbForReleaseUncached>>>>();
 const inFlightFeedRefreshes = new Map<string, Promise<Release[]>>();
 const SEARCH_METRICS_KEY = "metrics:nzbhydra:search";
-const MOVIE_CATEGORIES = ["2000"];
-const TV_CATEGORIES = ["5000"];
+const MOVIE_CATEGORIES = ["2030", "2040", "2045", "2050", "2060"];
+const TV_CATEGORIES = ["5030", "5040", "5045", "5080"];
 const DEFAULT_SEARCH_PAGE_LIMIT = 100;
 const MAX_TARGETED_SEARCH_RESULTS = 1000;
 const FEED_PAGE_LIMIT = 500;
-const MAX_FEED_RESULTS = 1500;
+const NZBHYDRA_SERVICE = "nzbhydra2";
+const NZBHYDRA_GUARD_OPTIONS = { failureLimit: 10, cooldownSeconds: 60 };
 
-function requireHydra(settings: AppSettings) {
-  if (!settings.nzbhydraUrl || !settings.nzbhydraApiKey) {
-    throw new Error("NZBHydra2 URL and API key must be configured");
-  }
+export function isNzbhydraConfigured(settings: AppSettings) {
+  return Boolean(settings.nzbhydraUrl && settings.nzbhydraApiKey);
 }
 
-function buildSearchUrl(settings: AppSettings, params: SearchParams) {
-  requireHydra(settings);
+async function requireHydra(settings: AppSettings) {
+  await assertServiceAllowed(NZBHYDRA_SERVICE, isNzbhydraConfigured(settings), "NZBHydra2 is not configured; skipping indexer request");
+}
+
+async function buildSearchUrl(settings: AppSettings, params: SearchParams) {
+  await requireHydra(settings);
   const url = new URL("/api", settings.nzbhydraUrl);
   url.searchParams.set("apikey", settings.nzbhydraApiKey ?? "");
   url.searchParams.set("o", "xml");
@@ -76,7 +80,7 @@ function normalizeSearchParams(settings: AppSettings, params: SearchParams) {
 }
 
 export function searchCacheKey(settings: AppSettings, params: SearchParams) {
-  const normalized = { version: 2, ...normalizeSearchParams(settings, params) };
+  const normalized = { version: 3, ...normalizeSearchParams(settings, params) };
   return `search:${createHash("sha1").update(JSON.stringify(normalized)).digest("hex")}`;
 }
 
@@ -113,10 +117,11 @@ function normalizeTitle(value: string) {
 
 function feedCacheKey(settings: AppSettings, mediaType: "movie" | "tv") {
   const normalized = {
-    version: 2,
+    version: 3,
     hydra: settings.nzbhydraUrl,
     mediaType,
-    categories: mediaType === "tv" ? TV_CATEGORIES : MOVIE_CATEGORIES
+    categories: mediaType === "tv" ? TV_CATEGORIES : MOVIE_CATEGORIES,
+    maxResults: settings.nzbhydraFeedMaxResults
   };
   return `search-feed:${createHash("sha1").update(JSON.stringify(normalized)).digest("hex")}`;
 }
@@ -126,7 +131,19 @@ function titleMatches(releaseTitle: string, query?: string) {
   const haystack = normalizeTitle(releaseTitle);
   const needle = normalizeTitle(query);
   if (!needle) return true;
-  return haystack.includes(needle) || haystack.includes(needle.replaceAll(" ", ""));
+  const compactHaystack = haystack.replaceAll(" ", "");
+  const compactNeedle = needle.replaceAll(" ", "");
+  return haystack.includes(needle) || haystack.includes(compactNeedle) || compactHaystack.includes(compactNeedle);
+}
+
+function seasonTitlePattern(season: number) {
+  return new RegExp(`(?:\\bS0?${season}(?:\\b|E\\d{1,3}\\b)|\\b0?${season}x\\d{1,3}\\b)`, "i");
+}
+
+function episodeTitlePattern(season: number | undefined, episode: number) {
+  return season
+    ? new RegExp(`(?:\\bS0?${season}E0?${episode}\\b|\\b0?${season}x0?${episode}\\b)`, "i")
+    : new RegExp(`(?:\\bS\\d{1,2}E0?${episode}\\b|\\b\\d{1,2}x0?${episode}\\b)`, "i");
 }
 
 function releaseMatchesSearch(release: Release, params: SearchParams) {
@@ -139,15 +156,13 @@ function releaseMatchesSearch(release: Release, params: SearchParams) {
     const season = params.season;
     const episode = params.episode;
     if (season) {
-      const seasonToken = `S${String(season).padStart(2, "0")}`;
-      const hasSeasonToken = new RegExp(`\\b${seasonToken}\\b`, "i").test(release.title);
+      const hasSeasonToken = seasonTitlePattern(season).test(release.title);
       if (release.season && release.season !== season) return false;
       if (!release.season && !hasSeasonToken) return false;
     }
     if (episode) {
-      const episodeToken = `E${String(episode).padStart(2, "0")}`;
       if (release.episode && release.episode !== episode) return false;
-      if (!release.episode && !new RegExp(`\\bS\\d{1,2}${episodeToken}\\b`, "i").test(release.title)) return false;
+      if (!release.episode && !episodeTitlePattern(season ?? 0, episode).test(release.title)) return false;
     }
   }
 
@@ -187,7 +202,7 @@ async function refreshFeed(settings: AppSettings, mediaType: "movie" | "tv") {
     const releases = await fetchPagedSearch(settings, {
       kind: "rss",
       categories: mediaType === "tv" ? TV_CATEGORIES : MOVIE_CATEGORIES
-    }, FEED_PAGE_LIMIT, MAX_FEED_RESULTS);
+    }, FEED_PAGE_LIMIT, settings.nzbhydraFeedMaxResults);
     await redis.set(cacheKey, JSON.stringify(releases), "EX", settings.nzbhydraFeedCacheTtlSeconds);
     return releases;
   })();
@@ -200,6 +215,9 @@ async function refreshFeed(settings: AppSettings, mediaType: "movie" | "tv") {
 }
 
 export async function refreshNzbhydraUpdateFeeds(settings: AppSettings) {
+  if (!isNzbhydraConfigured(settings)) {
+    return { movies: 0, tv: 0, errors: ["NZBHydra2 is not configured; update feed skipped"] };
+  }
   const [movies, tv] = await Promise.allSettled([
     refreshFeed(settings, "movie"),
     refreshFeed(settings, "tv")
@@ -211,8 +229,8 @@ export async function refreshNzbhydraUpdateFeeds(settings: AppSettings) {
   };
 }
 
-function releaseDownloadUrl(settings: AppSettings, release: Release) {
-  requireHydra(settings);
+async function releaseDownloadUrl(settings: AppSettings, release: Release) {
+  await requireHydra(settings);
   if (!release.downloadUrl) throw new Error("release has no download URL");
 
   const url = new URL(release.downloadUrl, settings.nzbhydraUrl);
@@ -237,16 +255,19 @@ function nzbFetchCacheKey(settings: AppSettings, release: Release) {
 }
 
 export async function testNzbhydraConnection(settings: AppSettings) {
-  requireHydra(settings);
+  await requireHydra(settings);
   const url = new URL("/api", settings.nzbhydraUrl);
   url.searchParams.set("apikey", settings.nzbhydraApiKey ?? "");
   url.searchParams.set("t", "caps");
   url.searchParams.set("o", "xml");
-  const response = await fetch(url, { signal: AbortSignal.timeout(settings.nzbhydraTimeoutMs) });
-  return { ok: response.ok, status: response.status };
+  return guardedExternalCall(NZBHYDRA_SERVICE, isNzbhydraConfigured(settings), "NZBHydra2 is not configured; connection test skipped", async () => {
+    const response = await fetch(url, { signal: AbortSignal.timeout(settings.nzbhydraTimeoutMs) });
+    return { ok: response.ok, status: response.status };
+  }, NZBHYDRA_GUARD_OPTIONS);
 }
 
 export async function searchNzbhydra(settings: AppSettings, params: SearchParams): Promise<Release[]> {
+  await requireHydra(settings);
   const cacheKey = searchCacheKey(settings, params);
   const cached = await redis.get(cacheKey);
   if (cached) {
@@ -269,7 +290,13 @@ export async function searchNzbhydra(settings: AppSettings, params: SearchParams
     await incrementSearchMetric("networkFetches");
     const pageLimit = params.limit ?? DEFAULT_SEARCH_PAGE_LIMIT;
     const maxResults = params.limit ? Math.max(params.limit, pageLimit) : MAX_TARGETED_SEARCH_RESULTS;
-    const releases = await fetchPagedSearch(settings, params, pageLimit, maxResults);
+    const releases = await guardedExternalCall(
+      NZBHYDRA_SERVICE,
+      isNzbhydraConfigured(settings),
+      "NZBHydra2 is not configured; search skipped",
+      () => fetchPagedSearch(settings, params, pageLimit, maxResults),
+      NZBHYDRA_GUARD_OPTIONS
+    );
     await redis.set(cacheKey, JSON.stringify(releases), "EX", settings.nzbhydraCacheTtlSeconds);
     return releases;
   })();
@@ -289,7 +316,7 @@ async function fetchPagedSearch(settings: AppSettings, params: SearchParams, pag
   let total: number | undefined;
 
   while (releases.length < maxResults) {
-    const url = buildSearchUrl(settings, { ...params, limit: pageLimit, offset });
+    const url = await buildSearchUrl(settings, { ...params, limit: pageLimit, offset });
     const response = await fetch(url, { signal: AbortSignal.timeout(settings.nzbhydraTimeoutMs) });
     if (!response.ok) {
       const mediaType = params.kind === "rss" ? `${params.categories?.join(",") ?? "feed"} update feed` : "search";
@@ -370,25 +397,31 @@ export async function fetchNzbForRelease(settings: AppSettings, release: Release
 }
 
 async function fetchNzbForReleaseUncached(settings: AppSettings, release: Release, cacheKey: string) {
-  const url = releaseDownloadUrl(settings, release);
+  const url = await releaseDownloadUrl(settings, release);
   await incrementSearchMetric("nzbNetworkFetches");
-  const response = await fetch(url, { signal: AbortSignal.timeout(settings.nzbhydraTimeoutMs) });
-  if (!response.ok) throw new Error(`NZB download failed with HTTP ${response.status}`);
+  try {
+    const response = await fetch(url, { signal: AbortSignal.timeout(settings.nzbhydraTimeoutMs) });
+    if (!response.ok) throw new Error(`NZB download failed with HTTP ${response.status}`);
 
-  const bytes = Buffer.from(await response.arrayBuffer());
-  const disposition = response.headers.get("content-disposition");
-  const filenameMatch = disposition?.match(/filename\*?=(?:UTF-8''|"?)([^";]+)/i);
-  const filename = safeNzbFilename(release, filenameMatch?.[1] ? decodeURIComponent(filenameMatch[1]) : basename(url.pathname));
-  await mkdir(env.VFS_NZB_DIR, { recursive: true });
-  const cachePath = join(env.VFS_NZB_DIR, `hydra-cache-${cacheKey.slice(4)}.nzb`);
-  const contentType = response.headers.get("content-type") ?? "application/x-nzb";
-  await writeFile(cachePath, bytes);
-  await redis.set(cacheKey, JSON.stringify({ path: cachePath, filename, contentType }), "EX", settings.nzbhydraCacheTtlSeconds).catch(() => undefined);
-  return {
-    bytes,
-    filename,
-    contentType
-  };
+    const bytes = Buffer.from(await response.arrayBuffer());
+    const disposition = response.headers.get("content-disposition");
+    const filenameMatch = disposition?.match(/filename\*?=(?:UTF-8''|"?)([^";]+)/i);
+    const filename = safeNzbFilename(release, filenameMatch?.[1] ? decodeURIComponent(filenameMatch[1]) : basename(url.pathname));
+    await mkdir(env.VFS_NZB_DIR, { recursive: true });
+    const cachePath = join(env.VFS_NZB_DIR, `hydra-cache-${cacheKey.slice(4)}.nzb`);
+    const contentType = response.headers.get("content-type") ?? "application/x-nzb";
+    await writeFile(cachePath, bytes);
+    await redis.set(cacheKey, JSON.stringify({ path: cachePath, filename, contentType }), "EX", settings.nzbhydraCacheTtlSeconds).catch(() => undefined);
+    await recordServiceSuccess(NZBHYDRA_SERVICE);
+    return {
+      bytes,
+      filename,
+      contentType
+    };
+  } catch (error) {
+    await recordServiceFailure(NZBHYDRA_SERVICE, error, NZBHYDRA_GUARD_OPTIONS);
+    throw error;
+  }
 }
 
 export async function testDownloadNzb(settings: AppSettings, release: Release) {

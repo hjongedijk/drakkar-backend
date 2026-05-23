@@ -10,6 +10,7 @@ import { markLibraryItemStreamedByPath } from "../media-library/libraryService.j
 import { planMountedFileRange } from "./rangePlanner.service.js";
 import { getMountFileByPath } from "../vfs/mountedNzbService.js";
 import { buildDecodedYencSegments } from "./yencManifest.service.js";
+import { getStoredArchiveEntryByPath } from "../archive/rarStoredIndex.js";
 
 const sessionSetKey = "vfs:stream:sessions";
 const streamMetricsKey = "vfs:stream:metrics";
@@ -86,6 +87,7 @@ type MountedFileSegment = {
   bytes: number;
   start: number;
   end: number;
+  sourceOffset?: number;
 };
 type MountedFileManifest = {
   path: string;
@@ -483,6 +485,24 @@ function findSegmentIndex(segments: MountedFileSegment[], offset: number) {
 }
 
 async function getMountedFileManifest(path: string): Promise<MountedFileManifest> {
+  const archiveEntry = await getStoredArchiveEntryByPath(path);
+  if (archiveEntry) {
+    return {
+      path,
+      fileId: `archive:${archiveEntry.documentId}:${archiveEntry.name}`,
+      size: archiveEntry.size,
+      segments: archiveEntry.segments.map((segment) => ({
+        fileId: segment.fileId,
+        articleId: segment.articleId,
+        segmentNumber: segment.segmentNumber,
+        bytes: segment.bytes,
+        start: segment.start,
+        end: segment.end,
+        sourceOffset: segment.sourceOffset
+      }))
+    };
+  }
+
   const mount = await getMountFileByPath(path);
   if (!mount) throw new Error("mounted NZB not found");
   if (!mount.streamable) throw new Error("mounted NZB is not prepared for streaming yet");
@@ -665,7 +685,7 @@ async function readManifestWindow(input: {
       segmentIndex += 1;
       continue;
     }
-    const segmentOffset = Math.max(0, cursor - segment.start);
+    const segmentOffset = (segment.sourceOffset ?? 0) + Math.max(0, cursor - segment.start);
     const take = Math.min(safeLength - total, segment.end - cursor + 1);
     const decoded = await getOrFetchSegmentBuffer({
       fileId: segment.fileId,

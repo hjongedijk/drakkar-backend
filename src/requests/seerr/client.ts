@@ -1,5 +1,6 @@
 import type { RequestProvider } from "@prisma/client";
 import type { ExternalMediaRequest } from "../types.js";
+import { assertServiceAllowed, guardedExternalCall, recordServiceFailure, recordServiceSuccess } from "../../services/serviceGuard.js";
 
 type SeerrRequest = {
   id: number;
@@ -43,18 +44,35 @@ type SeerrMediaDetails = {
   };
 };
 
-function providerFetch(provider: RequestProvider, path: string, init: RequestInit = {}) {
+function serviceName(provider: RequestProvider) {
+  return `request-provider:${provider.id}`;
+}
+
+function providerConfigured(provider: RequestProvider) {
+  return Boolean(provider.enabled && provider.baseUrl && provider.apiKey);
+}
+
+async function providerFetch(provider: RequestProvider, path: string, init: RequestInit = {}) {
+  await assertServiceAllowed(serviceName(provider), providerConfigured(provider), `${provider.name} is not configured; request skipped`);
   const url = new URL(path, provider.baseUrl);
-  return fetch(url, {
-    ...init,
-    headers: {
-      "x-api-key": provider.apiKey,
-      accept: "application/json",
-      ...(init.body ? { "content-type": "application/json" } : {}),
-      ...init.headers
-    },
-    signal: AbortSignal.timeout(15000)
-  });
+  try {
+    const response = await fetch(url, {
+      ...init,
+      headers: {
+        "x-api-key": provider.apiKey,
+        accept: "application/json",
+        ...(init.body ? { "content-type": "application/json" } : {}),
+        ...init.headers
+      },
+      signal: AbortSignal.timeout(15000)
+    });
+    if (response.ok) await recordServiceSuccess(serviceName(provider));
+    else await recordServiceFailure(serviceName(provider), new Error(`${provider.name} returned HTTP ${response.status}`));
+    return response;
+  } catch (error) {
+    await recordServiceFailure(serviceName(provider), error);
+    throw error;
+  }
 }
 
 async function fetchMediaDetails(provider: RequestProvider, request: SeerrRequest) {
@@ -88,17 +106,19 @@ async function mapWithConcurrency<TInput, TOutput>(
 }
 
 export async function testSeerrConnection(provider: RequestProvider) {
-  const status = await providerFetch(provider, "/api/v1/status");
-  if (!status.ok) return { ok: false, status: status.status, endpoint: "status", message: `${provider.name} status check failed (${status.status})` };
-  const requests = await providerFetch(provider, "/api/v1/request?take=1&skip=0&filter=all&sort=added");
-  return {
-    ok: requests.ok,
-    status: requests.status,
-    endpoint: requests.ok ? "requests" : "request-list",
-    message: requests.ok
-      ? `${provider.name} connection OK`
-      : `${provider.name} request list failed (${requests.status}). Check host, API key, and permissions.`
-  };
+  return guardedExternalCall(serviceName(provider), providerConfigured(provider), `${provider.name} is not configured; connection test skipped`, async () => {
+    const status = await providerFetch(provider, "/api/v1/status");
+    if (!status.ok) return { ok: false, status: status.status, endpoint: "status", message: `${provider.name} status check failed (${status.status})` };
+    const requests = await providerFetch(provider, "/api/v1/request?take=1&skip=0&filter=all&sort=added");
+    return {
+      ok: requests.ok,
+      status: requests.status,
+      endpoint: requests.ok ? "requests" : "request-list",
+      message: requests.ok
+        ? `${provider.name} connection OK`
+        : `${provider.name} request list failed (${requests.status}). Check host, API key, and permissions.`
+    };
+  });
 }
 
 function numberValue(value: unknown) {
@@ -186,6 +206,7 @@ async function fetchAllRequestPages(provider: RequestProvider, pageSize = 100) {
 }
 
 export async function fetchSeerrRequests(provider: RequestProvider): Promise<ExternalMediaRequest[]> {
+  await assertServiceAllowed(serviceName(provider), providerConfigured(provider), `${provider.name} is not configured; request sync skipped`);
   const requests = await fetchAllRequestPages(provider);
   return mapWithConcurrency(requests, 6, async (request) => {
     const mediaType = request.media?.mediaType ?? request.type ?? "movie";

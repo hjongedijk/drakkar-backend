@@ -2,6 +2,7 @@ import { randomUUID } from "node:crypto";
 import { dirname, resolve } from "node:path";
 import { env } from "../config/env.js";
 import { getSettings, updateSettings } from "../settings/settingsStore.js";
+import { DRAKKAR_VERSION } from "../version.js";
 
 type PlexLibrary = {
   key: string;
@@ -11,7 +12,7 @@ type PlexLibrary = {
 };
 
 const PLEX_PRODUCT = "Drakkar";
-const PLEX_VERSION = "0.1.1";
+const PLEX_VERSION = DRAKKAR_VERSION;
 const refreshDedup = new Map<string, number>();
 
 function plexHeaders(token?: string, clientIdentifier = "drakkar") {

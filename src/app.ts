@@ -1,7 +1,5 @@
 import { randomUUID } from "node:crypto";
 import cors from "@fastify/cors";
-import swagger from "@fastify/swagger";
-import swaggerUi from "@fastify/swagger-ui";
 import Fastify from "fastify";
 import { env } from "./config/env.js";
 import { getAuthUserByApiKey, getAuthUserById } from "./auth/service.js";
@@ -23,15 +21,16 @@ import { logRoutes } from "./routes/logs.js";
 import { calendarRoutes } from "./routes/calendar.js";
 import { taskRoutes } from "./routes/tasks.js";
 import { plexRoutes } from "./routes/plex.js";
-import { setupRoutes } from "./routes/setup.js";
+import { getSetupStatus, setupRoutes } from "./routes/setup.js";
 import { registerCoreTasks } from "./tasks/coreTasks.js";
+import { graphqlRoutes } from "./routes/graphql.js";
+import { buildLineLogger } from "./logging/lineLogger.js";
 
 export function buildApp() {
   registerCoreTasks();
   const app = Fastify({
-    logger: {
-      level: process.env.NODE_ENV === "production" ? "info" : "debug"
-    },
+    logger: buildLineLogger(env.LOG_LEVEL),
+    disableRequestLogging: true,
     genReqId: (request) => {
       const header = request.headers["x-request-id"];
       return Array.isArray(header) ? header[0] ?? randomUUID() : header ?? randomUUID();
@@ -42,10 +41,23 @@ export function buildApp() {
     reply.header("x-request-id", request.id);
   });
 
+  app.addHook("onResponse", async (request, reply) => {
+    const responseTime = reply.elapsedTime;
+    if (reply.statusCode >= 400 || responseTime > 1000) {
+      request.log[reply.statusCode >= 500 ? "error" : "warn"]({
+        method: request.method,
+        url: request.url,
+        statusCode: reply.statusCode,
+        responseTime
+      }, "request completed");
+    }
+  });
+
   app.addHook("onRequest", async (request, reply) => {
     if (request.method === "OPTIONS") return;
     if (!request.url.startsWith("/api/")) return;
     const parsedUrl = new URL(request.url, env.APP_BASE_URL);
+    if (request.method === "GET" && parsedUrl.pathname === "/api/graphql" && !parsedUrl.searchParams.has("query")) return;
     const apiToken = request.headers["x-api-token"] ?? parsedUrl.searchParams.get("apiToken") ?? "";
     if (apiToken !== env.FRONTEND_API_TOKEN) {
       return reply.status(401).send({ message: "Invalid frontend API token." });
@@ -55,8 +67,18 @@ export function buildApp() {
   app.addHook("onRequest", async (request, reply) => {
     if (request.method === "OPTIONS") return;
     if (!request.url.startsWith("/api/")) return;
-    if (request.url.startsWith("/api/auth/login")) return;
+    {
+      const parsedUrl = new URL(request.url, env.APP_BASE_URL);
+      if (request.method === "GET" && parsedUrl.pathname === "/api/graphql" && !parsedUrl.searchParams.has("query")) return;
+    }
     if (request.url.startsWith("/api/setup/status")) return;
+    if (request.url.startsWith("/api/setup/complete")) return;
+
+    const setup = await getSetupStatus();
+    if (!setup.completed) {
+      return reply.status(428).send({ message: "Setup must be completed before using Drakkar." });
+    }
+    if (request.url.startsWith("/api/auth/login")) return;
 
     const authorization = request.headers.authorization;
     const bearerToken = authorization?.startsWith("Bearer ") ? authorization.slice("Bearer ".length).trim() : undefined;
@@ -81,18 +103,6 @@ export function buildApp() {
   });
 
   void app.register(cors, { origin: true });
-  void app.register(swagger, {
-    openapi: {
-      info: {
-        title: "Drakkar API",
-        version: "0.1.1"
-      }
-    }
-  });
-  void app.register(swaggerUi, {
-    routePrefix: "/docs"
-  });
-
   void app.register(statusRoutes);
   void app.register(authRoutes);
   void app.register(settingsRoutes);
@@ -111,6 +121,7 @@ export function buildApp() {
   void app.register(taskRoutes);
   void app.register(plexRoutes);
   void app.register(setupRoutes);
+  void app.register(graphqlRoutes);
 
   return app;
 }

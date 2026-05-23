@@ -2,6 +2,7 @@ import type { FastifyInstance } from "fastify";
 import { prisma } from "../db/prisma.js";
 import { redis } from "../db/redis.js";
 import { classifyRepairOutcome, deriveImportHealth, estimateHealthProgress, isCompletedHealthJob } from "../health/checks.js";
+import { DRAKKAR_VERSION } from "../version.js";
 
 export async function healthRoutes(app: FastifyInstance): Promise<void> {
   app.get("/health", {
@@ -58,7 +59,7 @@ export async function healthRoutes(app: FastifyInstance): Promise<void> {
       status: healthy ? "ok" : "degraded",
       database,
       valkey: valkeyStatus,
-      version: "0.1.1",
+      version: DRAKKAR_VERSION,
       servicesUp,
       servicesTotal,
       healthPercent: Math.round((servicesUp / servicesTotal) * 100),

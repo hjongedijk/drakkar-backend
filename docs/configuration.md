@@ -1,52 +1,34 @@
-# Configuration
+# Backend Configuration
 
-Configuration is split across environment variables, database-backed settings, and mounted folders.
+The backend reads Drakkar defaults and app settings from `/data/config/settings.json`. Docker Compose uses fixed local defaults for PostgreSQL, Valkey, and ports; no `.env` file is required or documented.
 
-## Important environment variables
+## settings.json
 
-- `DATABASE_URL`
-- `REDIS_URL`
-- `BACKEND_PORT`
-- `BACKEND_URL`
-- `VFS_ROOT`
-- `VFS_DOWNLOADS_DIR`
-- `VFS_COMPLETED_DIR`
-- `VFS_NZB_DIR`
-- `NZB_BACKUPS_DIR`
-- `MEDIA_SYMLINKS_DIR`
-- `MEDIA_MOVIES_DIR`
-- `MEDIA_TV_DIR`
-- `FUSE_MOUNT_PATH`
+The backend creates `/data/config/settings.json` on first boot with a generated `frontendApiToken`, infrastructure defaults, and empty integration defaults. The setup wizard and Settings page should be used for:
 
-Defaults are already set in the backend for the standard Drakkar layout:
-
-- `/data/config`
-- `/data/downloads`
-- `/data/completed`
-- `/data/nzb`
-- `/data/nzb-backup`
-- `/mnt/media`
-
-Override them only when you want a non-standard layout.
-
-## Runtime layout
-
-- `/data/config` persisted app configuration
-- `/data/downloads` active payload downloads
-- `/data/completed` verified/completed content before import
-- `/data/nzb` working NZB files
-- `/data/nzb-backup` optional backup copies of working NZBs
-- `/mnt/media/movies` movie output for media servers
-- `/mnt/media/tv` TV output for media servers
-
-## Settings UI
-
-Most integrations are configured in the frontend Settings page:
-
+- infrastructure defaults
 - NZBHydra2
 - Seerr
+- Plex
+- metadata providers
 - Usenet providers
-- quality profiles
-- queue/import policy
-- NZB backup toggle
+- indexer settings
 
+Keep `/data/config/settings.json` with the database during backups and upgrades.
+
+## Runtime Layout
+
+- `/data/config`: persisted settings
+- `/data/downloads`: active payload downloads
+- `/data/completed`: materialized completed content when required
+- `/data/nzb`: working NZB files
+- `/data/nzb-backup`: optional backup copies
+- `/mnt/media/movies`: movie library output
+- `/mnt/media/tv`: TV library output
+- `/mnt/fuse`: FUSE VFS mount for direct streaming
+
+## Default NZBHydra Categories
+
+- Movies: `2030`, `2040`, `2045`, `2050`, `2060`
+- TV: `5030`, `5040`, `5045`, `5080`
+- Optional foreign categories: movie `2010`, TV `5020`

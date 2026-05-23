@@ -1,6 +1,7 @@
 import type { FastifyBaseLogger } from "fastify";
 import { cleanupDownloadHistory } from "../../downloads/downloadService.js";
 import { refreshNzbhydraUpdateFeeds } from "../../indexers/nzbhydra/client.js";
+import { reconcileAvailableDownloadsWithoutImports } from "../../usenet/workers.js";
 import { pruneLogData } from "../../logs/logPruneService.js";
 import { getSettings } from "../../settings/settingsStore.js";
 import { LOG_PRUNE_INTERVAL_MS, LOG_PRUNE_TASK_ID, NZBHYDRA_RSS_SYNC_INTERVAL_MS, NZBHYDRA_RSS_SYNC_TASK_ID, REQUEST_SYNC_INTERVAL_MS, REQUEST_SYNC_TASK_ID, registerCoreTasks } from "../../tasks/coreTasks.js";
@@ -72,8 +73,20 @@ export async function runRequestSyncCycle(logger: FastifyBaseLogger) {
           ok: provider.ok
         }))
       }, "request sync completed");
+      const importReconcile = await reconcileAvailableDownloadsWithoutImports(logger);
+      if (importReconcile.mountedFixed > 0 || importReconcile.materializedImported > 0 || importReconcile.requeued > 0 || importReconcile.failed > 0) {
+        logger.info(importReconcile, "stale prepared/available imports reconciled");
+      }
       await recoverFailedRequestDownloads();
-      await ensureMonitoredRequests();
+      const monitored = await ensureMonitoredRequests();
+      if (monitored.retried > 0 || monitored.skippedBecauseQueueFull > 0) {
+        logger.info({
+          retried: monitored.retried,
+          queueSeedTarget: monitored.queueSeedTarget,
+          pendingQueueItems: monitored.pendingQueueItems,
+          skippedBecauseQueueFull: monitored.skippedBecauseQueueFull
+        }, "monitored request queue seeding completed");
+      }
       const cleanup = await cleanupDownloadHistory({ keepFailed: 0, keepCancelled: 0 });
       if (cleanup.deleted > 0 || cleanup.cleanedFailedJobs > 0) logger.info(cleanup, "download history auto-cleaned");
       return sync;

@@ -490,7 +490,7 @@ export async function recoverStaleActiveDownloadJobs(logger: FastifyBaseLogger) 
 export async function reconcileAvailableDownloadsWithoutImports(logger: FastifyBaseLogger) {
   const candidates = await prisma.download.findMany({
     where: {
-      status: { in: ["available", "completed"] },
+      status: { in: ["available", "completed", "prepared"] },
       nzbDocumentId: { not: null },
       imports: { none: {} }
     },
@@ -558,6 +558,16 @@ export async function reconcileAvailableDownloadsWithoutImports(logger: FastifyB
       requeued += 1;
     } catch (error) {
       failed += 1;
+      const rawMessage = error instanceof Error ? error.message : "import reconcile failed";
+      const message = humanizeDownloadError(rawMessage) ?? rawMessage;
+      await handleQueueDecisionFailure({
+        downloadId: download.id,
+        requestId: linkedRequest?.id,
+        title: download.title,
+        rawMessage,
+        publicMessage: message,
+        source: "import-validation"
+      }).catch(() => undefined);
       logger.warn({ downloadId: download.id, err: error }, "available download without imports could not be reconciled");
     }
   }

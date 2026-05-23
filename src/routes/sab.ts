@@ -1,4 +1,5 @@
 import type { FastifyInstance } from "fastify";
+import { DRAKKAR_VERSION } from "../version.js";
 import { addNzbUpload, addUrl, getHistory, getQueue, setDownloadStatus } from "../downloads/downloadService.js";
 
 export async function sabRoutes(app: FastifyInstance): Promise<void> {
@@ -6,7 +7,7 @@ export async function sabRoutes(app: FastifyInstance): Promise<void> {
     const query = request.query as { mode?: string; name?: string; value?: string };
     switch (query.mode) {
       case "version":
-        return { version: "0.1.1" };
+        return { version: DRAKKAR_VERSION };
       case "queue":
         return { queue: { slots: await getQueue() } };
       case "history":

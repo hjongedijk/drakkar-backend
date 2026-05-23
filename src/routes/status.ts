@@ -12,6 +12,7 @@ import { getMountedPoolDebugState } from "../streaming/mountedStream.service.js"
 import { getFuseMountStatus } from "../vfs/fuseMountService.js";
 import { getPolicyUsageReport } from "../policies/policyService.js";
 import { healthRoutes } from "./health.js";
+import { DRAKKAR_VERSION } from "../version.js";
 
 const SERVICE_STATUS_CACHE_TTL_MS = 30_000;
 
@@ -93,7 +94,7 @@ export async function statusRoutes(app: FastifyInstance): Promise<void> {
 
     return {
       appName: "Drakkar",
-      version: "0.1.1",
+      version: DRAKKAR_VERSION,
       backend: "ok",
       postgresql: "ok",
       valkey: "ok",

@@ -20,7 +20,7 @@ describe("naming service", () => {
   });
 
   it("cleans illegal path characters", () => {
-    assert.equal(cleanPathPart('Bad: Movie / Name? '), "Bad Movie Name");
+    assert.equal(cleanPathPart('Bad: Movie / Name? '), "Bad - Movie + Name!");
   });
 
   it("builds completed and STRM library paths", () => {

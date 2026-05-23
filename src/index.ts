@@ -17,8 +17,8 @@ import {
 import { primeMountedStreamPool } from "./streaming/mountedStream.service.js";
 import { startFuseMount, stopFuseMount } from "./vfs/fuseMountService.js";
 import { startBackgroundRepairSchedule, stopBackgroundRepairSchedule } from "./repair/repairService.js";
-import { ensureDefaultAdminUser } from "./auth/service.js";
 import { bootstrapDevelopmentTestConnectionData } from "./dev/testConnectionData.js";
+import { bootstrapRuntimeConfiguredServices } from "./config/runtimeConfigBootstrap.js";
 import {
   IMPORT_RECONCILE_TASK_ID,
   INTERRUPTED_RECOVERY_TASK_ID,
@@ -49,7 +49,7 @@ for (const signal of ["SIGINT", "SIGTERM"]) {
 
 try {
   await validateRequiredFolders(app.log);
-  await ensureDefaultAdminUser();
+  await bootstrapRuntimeConfiguredServices(app.log);
   await bootstrapDevelopmentTestConnectionData(app.log);
   await app.listen({ port: env.PORT, host: "0.0.0.0" });
   void (async () => {

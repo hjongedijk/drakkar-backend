@@ -1,6 +1,7 @@
 import { getMountFileByPath } from "../vfs/mountedNzbService.js";
 import { prisma } from "../db/prisma.js";
 import { buildDecodedYencSegments } from "./yencManifest.service.js";
+import { getStoredArchiveEntryByPath } from "../archive/rarStoredIndex.js";
 
 export type PlannedArticleRange = {
   fileId: string;
@@ -47,6 +48,28 @@ export function normalizeRange(range: string | undefined, size: number) {
 }
 
 export async function planMountedFileRange(path: string, range?: string): Promise<PlannedStreamRange> {
+  const archiveEntry = await getStoredArchiveEntryByPath(path);
+  if (archiveEntry) {
+    const { start, end } = normalizeRange(range, archiveEntry.size);
+    const ranges: PlannedArticleRange[] = [];
+    for (const segment of archiveEntry.segments) {
+      if (segment.end < start) continue;
+      if (segment.start > end) break;
+      const readStart = Math.max(start, segment.start);
+      const readEnd = Math.min(end, segment.end);
+      ranges.push({
+        fileId: segment.fileId,
+        articleId: segment.articleId,
+        segmentNumber: segment.segmentNumber,
+        segmentOffset: segment.sourceOffset + (readStart - segment.start),
+        readOffset: readStart,
+        length: readEnd - readStart + 1,
+        bytes: segment.bytes
+      });
+    }
+    return { path, fileId: `archive:${archiveEntry.documentId}:${archiveEntry.name}`, start, end, size: archiveEntry.size, ranges };
+  }
+
   const mount = await getMountFileByPath(path);
   if (!mount) throw new Error("mounted NZB not found");
   if (!mount.streamable) throw new Error("mounted NZB is not prepared for streaming yet");

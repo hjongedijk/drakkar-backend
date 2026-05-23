@@ -4,9 +4,12 @@ import { searchNzbhydra, type SearchParams } from "../indexers/nzbhydra/client.j
 import type { Release } from "../releases/types.js";
 import { looksLikeArchiveRelease } from "../releases/archiveHeuristics.js";
 
+const MIN_STRICT_TV_RESULTS_BEFORE_FALLBACK = 20;
+
 function normalizeReleaseTitle(value: string) {
   return value
     .toLowerCase()
+    .replace(/-[a-z0-9]+$/i, "")
     .replace(/['’"]/g, "")
     .replace(/[\[\](){}]/g, " ")
     .replace(/[^a-z0-9]+/g, " ")
@@ -68,11 +71,16 @@ export async function runSearch(params: SearchParams & { recordHistory?: boolean
     let filtered = uniqAndFilterReleases(releases, badKeys);
     const usedStrictIds = Boolean(searchParams.imdbId || searchParams.tmdbId || searchParams.tvdbId);
     let message: string | undefined;
-    if (filtered.length === 0 && usedStrictIds && searchParams.query) {
+    const shouldFallback =
+      usedStrictIds &&
+      searchParams.query &&
+      (filtered.length === 0 ||
+        (["tv", "season", "episode"].includes(searchParams.kind) && filtered.length < MIN_STRICT_TV_RESULTS_BEFORE_FALLBACK));
+    if (shouldFallback) {
       const fallbackParams = { ...searchParams, imdbId: undefined, tmdbId: undefined, tvdbId: undefined };
       const fallback = await searchNzbhydra(settings, fallbackParams);
-      filtered = uniqAndFilterReleases(fallback, badKeys);
-      message = "fallback without strict IDs";
+      filtered = uniqAndFilterReleases([...filtered, ...fallback], badKeys);
+      message = "merged fallback without strict IDs";
     }
     if (recordHistory) {
       await prisma.searchHistory.create({

@@ -23,27 +23,31 @@ function toAuthUser(user: { id: string; email: string; displayName: string | nul
 }
 
 export async function ensureDefaultAdminUser() {
-  const existing = await prisma.user.findFirst({
-    where: { OR: [{ email: "admin" }, { displayName: "admin" }] }
-  });
-  if (existing) {
-    if (!existing.passwordHash) {
-      await prisma.user.update({
-        where: { id: existing.id },
-        data: { passwordHash: hashPassword("password1234"), isAdmin: true, email: "admin", displayName: "admin" }
-      });
-    }
-    return;
-  }
+  // Legacy hook kept for migrations/imports. Fresh installs create admin through setup wizard.
+  return;
+}
 
-  await prisma.user.create({
+export async function countAdminUsers() {
+  return prisma.user.count({ where: { isAdmin: true } });
+}
+
+export async function createInitialAdminUser(input: { username: string; displayName?: string; password: string }) {
+  const username = input.username.trim();
+  if (!username) throw new Error("username is required");
+  if (input.password.length < 8) throw new Error("password must be at least 8 characters");
+  const existingAdmins = await countAdminUsers();
+  if (existingAdmins > 0) throw new Error("admin user already exists");
+
+  const user = await prisma.user.create({
     data: {
-      email: "admin",
-      displayName: "admin",
+      email: username,
+      displayName: input.displayName?.trim() || username,
       isAdmin: true,
-      passwordHash: hashPassword("password1234")
-    }
+      passwordHash: hashPassword(input.password)
+    },
+    select: { id: true, email: true, displayName: true, isAdmin: true }
   });
+  return toAuthUser(user);
 }
 
 export async function loginUser(username: string, password: string) {

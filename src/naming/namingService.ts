@@ -32,6 +32,8 @@ export const DEFAULT_NAMING_SETTINGS: NamingSettings = {
 };
 
 const NAMING_KEY = "naming";
+const reservedDeviceNamePattern = /^(aux|com[1-9]|con|lpt[1-9]|nul|prn)(\.|$)/i;
+const duplicateSeparatorPattern = /([- ._])\1+/g;
 
 async function getSetting<T>(key: string, fallback: T) {
   const row = await prisma.setting.findUnique({ where: { key } });
@@ -61,13 +63,18 @@ export async function updateNamingSettings(input: unknown) {
 }
 
 export function cleanPathPart(value: string) {
-  return (
-    value
-      .replace(/[<>:"/\\|?*\x00-\x1F]+/g, " ")
-      .replace(/\s+/g, " ")
-      .replace(/[. ]+$/g, "")
-      .trim() || "Unknown"
-  );
+  const cleaned = value
+    .replace(/\\/g, "+")
+    .replace(/\//g, "+")
+    .replace(/[<>|"\x00-\x1F]+/g, "")
+    .replace(/[:]/g, " - ")
+    .replace(/[?]/g, "!")
+    .replace(/[*]/g, "-")
+    .replace(/\s+/g, " ")
+    .replace(duplicateSeparatorPattern, (_match, separator: string) => separator)
+    .replace(/[- ._]+$/g, "")
+    .trim() || "Unknown";
+  return reservedDeviceNamePattern.test(cleaned) ? `_${cleaned}` : cleaned;
 }
 
 function tokenValue(media: NamingMedia, token: string, format?: string) {
