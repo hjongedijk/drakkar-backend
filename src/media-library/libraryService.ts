@@ -11,9 +11,33 @@ import type { Release } from "../releases/types.js";
 import { runSearch } from "../search/searchService.js";
 import { getSettings } from "../settings/settingsStore.js";
 import { mediaIdentityKey } from "./identity.js";
+import { resolveImportMedia } from "../symlinks/symlinkService.js";
+
+let refreshPromise: Promise<{ refreshed: number; items: Awaited<ReturnType<typeof listLibraryItems>> }> | null = null;
+let refreshQueued = false;
 
 function sortTitle(title: string) {
   return title.replace(/^(the|a|an)\s+/i, "").toLowerCase();
+}
+
+async function mapWithConcurrency<TInput, TOutput>(
+  input: TInput[],
+  concurrency: number,
+  mapper: (value: TInput, index: number) => Promise<TOutput>
+) {
+  const output = new Array<TOutput>(input.length);
+  let nextIndex = 0;
+
+  const workers = Array.from({ length: Math.max(1, Math.min(concurrency, input.length || 1)) }, async () => {
+    while (nextIndex < input.length) {
+      const currentIndex = nextIndex;
+      nextIndex += 1;
+      output[currentIndex] = await mapper(input[currentIndex] as TInput, currentIndex);
+    }
+  });
+
+  await Promise.all(workers);
+  return output;
 }
 
 function statusFromRequest(status: string, hasFilesystemEntry = false) {
@@ -49,7 +73,7 @@ function importStrategy(status?: string | null) {
 }
 
 function shouldHideLibraryItem(item: MediaLibraryItem) {
-  const releaseStyleTitle = /\bS\d{1,2}E\d{1,3}(?:E\d{1,3}|[- .]E?\d{1,3})?\b/i.test(item.title)
+  const releaseStyleTitle = /\bS\d{1,2}E\d{1,4}(?:E\d{1,4}|[- .]E?\d{1,4})?\b/i.test(item.title)
     && /\b(2160p|1080p|720p|web-?dl|webrip|bluray|h\.?264|x264|x265|hevc|ddp|dts)\b/i.test(item.title);
   const suspiciousTitle = /&quot;|^\s*\d+\]\s*|^[a-z0-9]{20,}$/i.test(item.title) || releaseStyleTitle;
   const hasMetadata = Boolean(item.requestId || item.tmdbId || item.tvdbId || item.imdbId || item.posterUrl || item.backdropUrl);
@@ -117,7 +141,7 @@ export async function deleteLibraryItem(id: string, options: { blocklist?: boole
     }).catch(() => undefined);
   }
 
-  await refreshMediaLibrary();
+  void refreshMediaLibrary().catch(() => undefined);
   return { deleted: true, item };
 }
 
@@ -185,7 +209,7 @@ export function markLibraryItemStreamedByPath(path: string) {
   });
 }
 
-export async function refreshMediaLibrary() {
+async function runLibraryRefreshCycle() {
   const touched = new Set<string>();
   const settings = await getSettings();
   const providers = await prisma.requestProvider.findMany();
@@ -195,11 +219,20 @@ export async function refreshMediaLibrary() {
   const importDownloadIds = new Set(imports.map((item) => item.downloadId).filter((value): value is string => Boolean(value)));
 
   const requests = await prisma.mediaRequest.findMany({ include: { provider: true } });
-  for (const request of requests) {
+  const requestsById = new Map(requests.map((request) => [request.id, request]));
+  const sourceKeys = [
+    ...requests.map((request) => `request:${request.id}`),
+    ...imports.map((item) => `import:${item.id}`)
+  ];
+  const existingLibraryItems = sourceKeys.length > 0
+    ? await prisma.mediaLibraryItem.findMany({ where: { sourceKey: { in: sourceKeys } } })
+    : [];
+  const existingBySourceKey = new Map(existingLibraryItems.map((item) => [item.sourceKey, item]));
+  const requestItems = await mapWithConcurrency(requests, 12, async (request) => {
     const sourceKey = `request:${request.id}`;
     touched.add(sourceKey);
     const hasFilesystemEntry = importRequestIds.has(request.id) || (request.downloadId ? importDownloadIds.has(request.downloadId) : false);
-    const item = await prisma.mediaLibraryItem.upsert({
+    return prisma.mediaLibraryItem.upsert({
       where: { sourceKey },
       update: {
         mediaType: request.mediaType,
@@ -249,32 +282,30 @@ export async function refreshMediaLibrary() {
         releaseGroup: selectedReleaseField(request.selectedRelease, "releaseGroup")
       }
     });
-    await enrichLibraryItem(item, settings).catch(() => undefined);
-  }
+  });
 
-  for (const item of imports) {
-    const request = item.requestId
-      ? await prisma.mediaRequest.findUnique({ where: { id: item.requestId }, include: { provider: true } })
-      : null;
+  const importItems = await mapWithConcurrency(imports, 12, async (item) => {
+    const request = item.requestId ? requestsById.get(item.requestId) ?? null : null;
+    const resolved = await resolveImportMedia(item).catch(() => null);
     const link = item.symlinks[0];
     const strategy = importStrategy(link?.status);
     const sourceKey = `import:${item.id}`;
     touched.add(sourceKey);
-    const existing = await prisma.mediaLibraryItem.findUnique({ where: { sourceKey } });
-    const title = request?.title ?? existing?.title ?? item.title;
-    const year = request?.year ?? existing?.year ?? item.year;
-    const libraryItem = await prisma.mediaLibraryItem.upsert({
+    const existing = existingBySourceKey.get(sourceKey);
+    const title = request?.title ?? resolved?.title ?? existing?.title ?? item.title;
+    const year = request?.year ?? resolved?.year ?? existing?.year ?? item.year;
+    return prisma.mediaLibraryItem.upsert({
       where: { sourceKey },
       update: {
-        mediaType: item.mediaType,
+        mediaType: resolved?.mediaType ?? item.mediaType,
         title,
         sortTitle: sortTitle(title),
         year,
         tmdbId: request?.tmdbId ?? existing?.tmdbId ?? undefined,
         tvdbId: request?.tvdbId ?? existing?.tvdbId ?? undefined,
         imdbId: request?.imdbId ?? existing?.imdbId ?? undefined,
-        season: item.season,
-        episode: item.episode,
+        season: resolved?.season ?? item.season,
+        episode: resolved?.episode ?? item.episode,
         requestId: item.requestId,
         downloadId: item.downloadId,
         requestedBy: request?.requestedBy,
@@ -291,15 +322,15 @@ export async function refreshMediaLibrary() {
       },
       create: {
         sourceKey,
-        mediaType: item.mediaType,
+        mediaType: resolved?.mediaType ?? item.mediaType,
         title,
         sortTitle: sortTitle(title),
         year,
         tmdbId: request?.tmdbId ?? existing?.tmdbId ?? undefined,
         tvdbId: request?.tvdbId ?? existing?.tvdbId ?? undefined,
         imdbId: request?.imdbId ?? existing?.imdbId ?? undefined,
-        season: item.season,
-        episode: item.episode,
+        season: resolved?.season ?? item.season,
+        episode: resolved?.episode ?? item.episode,
         requestId: item.requestId,
         downloadId: item.downloadId,
         requestedBy: request?.requestedBy,
@@ -315,8 +346,10 @@ export async function refreshMediaLibrary() {
         strmPath: strategy === "strm" ? link?.linkPath : undefined
       }
     });
-    await enrichLibraryItem(libraryItem, settings).catch(() => undefined);
-  }
+  });
+
+  const metadataCandidates = [...requestItems, ...importItems];
+  await mapWithConcurrency(metadataCandidates, 6, async (item) => enrichLibraryItem(item, settings).catch(() => item));
 
   await prisma.mediaLibraryItem.deleteMany({
     where: {
@@ -335,19 +368,57 @@ export async function refreshMediaLibrary() {
     }
   });
 
-  await dedupeEpisodeLibraryItems();
+  await dedupeLibraryItems();
 
   return { refreshed: touched.size, items: await listLibraryItems() };
 }
 
-async function dedupeEpisodeLibraryItems() {
-  const episodes = await prisma.mediaLibraryItem.findMany({
-    where: { mediaType: "tv", season: { not: null }, episode: { not: null } },
+export async function refreshMediaLibrary() {
+  if (refreshPromise) {
+    refreshQueued = true;
+    return refreshPromise;
+  }
+
+  refreshPromise = (async () => {
+    let result = await runLibraryRefreshCycle();
+    while (refreshQueued) {
+      refreshQueued = false;
+      result = await runLibraryRefreshCycle();
+    }
+    return result;
+  })().finally(() => {
+    refreshPromise = null;
+  });
+
+  return refreshPromise;
+}
+
+function libraryItemPriority(item: MediaLibraryItem) {
+  const statusWeight: Record<string, number> = {
+    available: 600,
+    grabbed: 500,
+    searching: 400,
+    requested: 300,
+    approved: 250,
+    missing: 200,
+    failed: 100
+  };
+  const sourceWeight = item.sourceKey.startsWith("import:") ? 40 : 0;
+  const fileWeight = item.filePath ? 20 : 0;
+  const requestWeight = item.requestId ? 10 : 0;
+  return (statusWeight[item.libraryStatus] ?? 0) + sourceWeight + fileWeight + requestWeight;
+}
+
+async function dedupeLibraryItems() {
+  const items = await prisma.mediaLibraryItem.findMany({
+    where: {
+      OR: [{ sourceKey: { startsWith: "import:" } }, { sourceKey: { startsWith: "request:" } }]
+    },
     orderBy: [{ updatedAt: "desc" }, { createdAt: "desc" }]
   });
-  const seen = new Set<string>();
+  const seen = new Map<string, MediaLibraryItem>();
   const duplicateIds: string[] = [];
-  for (const item of episodes) {
+  for (const item of items) {
     const key = mediaIdentityKey({
       mediaType: item.mediaType,
       title: item.title,
@@ -358,11 +429,17 @@ async function dedupeEpisodeLibraryItems() {
       season: item.season,
       episode: item.episode
     });
-    if (seen.has(key)) {
-      duplicateIds.push(item.id);
+    const existing = seen.get(key);
+    if (!existing) {
+      seen.set(key, item);
       continue;
     }
-    seen.add(key);
+    if (libraryItemPriority(item) > libraryItemPriority(existing)) {
+      duplicateIds.push(existing.id);
+      seen.set(key, item);
+      continue;
+    }
+    duplicateIds.push(item.id);
   }
   if (duplicateIds.length === 0) return;
   await prisma.mediaLibraryItem.deleteMany({ where: { id: { in: duplicateIds } } });

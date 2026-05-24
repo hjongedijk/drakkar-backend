@@ -14,6 +14,7 @@ import { ensureDefaultProfiles } from "../../quality/profileService.js";
 import { createBlocklistItem, isReleaseBlocklisted } from "../../policies/policyService.js";
 import { createSeerrRequest, fetchSeerrRequestById, fetchSeerrRequests, testSeerrConnection, updateSeerrAvailable } from "../seerr/client.js";
 import type { ExternalMediaRequest } from "../types.js";
+import { requestDuplicateRank, requestMatchesIdentity } from "./requestIdentity.js";
 
 const TV_ACTIVE_DOWNLOAD_STATUSES = ["queued", "fetching_nzb", "verifying", "prepared", "waiting_for_provider", "waiting_for_nzb", "downloading", "paused"];
 const SEARCH_COOLDOWN_SECONDS = 300;
@@ -22,7 +23,7 @@ const MONITOR_QUEUE_SEED_STATUSES = ["queued", "fetching_nzb", "verifying", "wai
 const TV_SEASONS_PER_MONITOR_PASS = 8;
 const TV_EPISODE_DOWNLOADS_PER_REQUEST_PASS = 4;
 const MONITORED_REQUESTS_MAX_DURATION_MS = 20_000;
-const REQUEST_SYNC_MAX_DURATION_MS = 60_000;
+const REQUEST_SYNC_MAX_DURATION_MS = 35_000;
 const REQUEST_SYNC_PROVIDER_MAX_REQUESTS = 200;
 const SEERR_WEBHOOK_PRIORITY = 900;
 
@@ -36,6 +37,28 @@ function blockReasonFromFailure(message?: string | null) {
   return "import_failed";
 }
 
+function scoreReleaseForRequest(
+  request: Pick<MediaRequest, "mediaType" | "title" | "year">,
+  release: Parameters<typeof scoreRelease>[0],
+  profile: Awaited<ReturnType<typeof resolveProfile>>
+) {
+  const decision = scoreRelease(release, profile);
+  const reasons = [...decision.reasons];
+  if (request.mediaType === "movie" && (decision.parsed.season || decision.parsed.episode || /\bS\d{1,2}(?:E\d{1,4})?\b/i.test(release.title))) {
+    reasons.push("TV episode or season release rejected for movie request");
+  }
+  if (request.mediaType === "movie" && request.year && decision.parsed.year && decision.parsed.year !== request.year) {
+    reasons.push(`movie year ${decision.parsed.year} does not match requested year ${request.year}`);
+  }
+  const accepted = reasons.length === 0;
+  return {
+    ...decision,
+    accepted,
+    score: accepted ? decision.score : Math.min(decision.score, -1000),
+    reasons
+  };
+}
+
 function isAiredDate(value?: string | null) {
   if (!value) return true;
   const timestamp = Date.parse(value);
@@ -47,9 +70,9 @@ function intersectEpisodes(left: Set<number>, right: Set<number>) {
   return new Set([...left].filter((episode) => right.has(episode)));
 }
 
-async function fetchProviderRequests(provider: RequestProvider) {
+async function fetchProviderRequests(provider: RequestProvider, options: { full?: boolean } = {}) {
   return fetchSeerrRequests(provider, {
-    maxRequests: REQUEST_SYNC_PROVIDER_MAX_REQUESTS,
+    maxRequests: options.full ? undefined : REQUEST_SYNC_PROVIDER_MAX_REQUESTS,
     includeDetails: false
   });
 }
@@ -222,7 +245,7 @@ export function deleteProvider(id: string) {
   });
 }
 
-export async function syncRequests(providerId?: string) {
+export async function syncRequests(providerId?: string, options: { full?: boolean } = {}) {
   const startedAt = Date.now();
   const providers = await prisma.requestProvider.findMany({
     where: { enabled: true, ...(providerId ? { id: providerId } : {}) }
@@ -244,7 +267,7 @@ export async function syncRequests(providerId?: string) {
     let updatedForProvider = 0;
     let skippedForProvider = 0;
     try {
-      const requests = await fetchProviderRequests(provider);
+      const requests = await fetchProviderRequests(provider, options);
       fetchedForProvider = requests.length;
       const syncedRequests: MediaRequest[] = [];
       for (const request of requests) {
@@ -298,7 +321,7 @@ export async function syncRequests(providerId?: string) {
     }
   }
 
-  await refreshMediaLibrary().catch(() => undefined);
+  if (createdCount > 0 || updatedCount > 0) void refreshMediaLibrary().catch(() => undefined);
   return {
     imported: createdCount,
     updated: updatedCount,
@@ -693,10 +716,98 @@ function requestNeedsUpdate(existing: MediaRequest, next: ExternalMediaRequest, 
   );
 }
 
-async function upsertRequest(provider: RequestProvider, request: ExternalMediaRequest): Promise<{ request: MediaRequest; action: SyncRequestAction }> {
-  const existing = await prisma.mediaRequest.findUnique({
-    where: { providerId_externalId: { providerId: provider.id, externalId: request.externalId } }
+function requestCandidateFilters(request: ExternalMediaRequest) {
+  const filters: Prisma.MediaRequestWhereInput[] = [{ externalId: request.externalId }];
+  if (request.imdbId) filters.push({ imdbId: request.imdbId });
+  if (request.tmdbId) filters.push({ tmdbId: request.tmdbId });
+  if (request.tvdbId) filters.push({ tvdbId: request.tvdbId });
+  if (!request.imdbId && !request.tmdbId && !request.tvdbId && request.year) filters.push({ year: request.year });
+  return filters;
+}
+
+async function findDuplicateRequestCandidates(provider: RequestProvider, request: ExternalMediaRequest) {
+  const candidates = await prisma.mediaRequest.findMany({
+    where: {
+      providerId: provider.id,
+      mediaType: request.mediaType,
+      OR: requestCandidateFilters(request)
+    },
+    include: {
+      imports: { select: { id: true } }
+    },
+    orderBy: { createdAt: "asc" }
   });
+  return candidates.filter((candidate) => candidate.externalId === request.externalId || requestMatchesIdentity(candidate, request));
+}
+
+function chooseCanonicalRequest(
+  candidates: Array<MediaRequest & { imports: { id: string }[] }>,
+  externalId: string
+) {
+  const exact = candidates.find((candidate) => candidate.externalId === externalId);
+  if (exact) return exact;
+  return [...candidates].sort((left, right) => {
+    const scoreDelta = requestDuplicateRank(right) - requestDuplicateRank(left);
+    if (scoreDelta !== 0) return scoreDelta;
+    return left.createdAt.getTime() - right.createdAt.getTime();
+  })[0] ?? null;
+}
+
+async function consolidateDuplicateRequests(
+  canonical: MediaRequest & { imports: { id: string }[] },
+  duplicates: Array<MediaRequest & { imports: { id: string }[] }>
+) {
+  if (duplicates.length === 0) return canonical;
+  const duplicateIds = duplicates.map((item) => item.id);
+  const carryDownloadId = canonical.downloadId ?? duplicates.find((item) => item.downloadId)?.downloadId ?? null;
+  const carrySelectedRelease = canonical.selectedRelease ?? duplicates.find((item) => item.selectedRelease)?.selectedRelease ?? undefined;
+  const carryRequestedQuality = canonical.requestedQuality ?? duplicates.find((item) => item.requestedQuality)?.requestedQuality ?? undefined;
+  const carryRequestedBy = canonical.requestedBy ?? duplicates.find((item) => item.requestedBy)?.requestedBy ?? undefined;
+  const carryExternalStatus = canonical.externalStatus ?? duplicates.find((item) => item.externalStatus)?.externalStatus ?? undefined;
+  const carrySeasons = canonical.seasons ?? duplicates.find((item) => item.seasons)?.seasons ?? undefined;
+  const carryEpisodes = canonical.episodes ?? duplicates.find((item) => item.episodes)?.episodes ?? undefined;
+
+  await prisma.$transaction(async (tx) => {
+    await tx.importItem.updateMany({
+      where: { requestId: { in: duplicateIds } },
+      data: { requestId: canonical.id }
+    });
+    await tx.mediaLibraryItem.updateMany({
+      where: { requestId: { in: duplicateIds } },
+      data: { requestId: canonical.id }
+    });
+    await tx.mediaLibraryItem.deleteMany({
+      where: { sourceKey: { in: duplicateIds.map((id) => `request:${id}`) } }
+    });
+    await tx.mediaRequest.update({
+      where: { id: canonical.id },
+      data: {
+        ...(carryDownloadId ? { downloadId: carryDownloadId } : {}),
+        ...(carrySelectedRelease ? { selectedRelease: carrySelectedRelease as Prisma.InputJsonValue } : {}),
+        ...(carryRequestedQuality ? { requestedQuality: carryRequestedQuality } : {}),
+        ...(carryRequestedBy ? { requestedBy: carryRequestedBy } : {}),
+        ...(carryExternalStatus ? { externalStatus: carryExternalStatus } : {}),
+        ...(carrySeasons ? { seasons: carrySeasons as Prisma.InputJsonValue } : {}),
+        ...(carryEpisodes ? { episodes: carryEpisodes as Prisma.InputJsonValue } : {})
+      }
+    });
+    await tx.mediaRequest.deleteMany({
+      where: { id: { in: duplicateIds } }
+    });
+  });
+
+  return prisma.mediaRequest.findUniqueOrThrow({
+    where: { id: canonical.id },
+    include: { imports: { select: { id: true } } }
+  });
+}
+
+async function upsertRequest(provider: RequestProvider, request: ExternalMediaRequest): Promise<{ request: MediaRequest; action: SyncRequestAction }> {
+  const candidates = await findDuplicateRequestCandidates(provider, request);
+  const canonical = chooseCanonicalRequest(candidates, request.externalId);
+  const existing = canonical
+    ? await consolidateDuplicateRequests(canonical, candidates.filter((candidate) => candidate.id !== canonical.id))
+    : null;
   const linkedDownload = existing?.downloadId ? await prisma.download.findUnique({ where: { id: existing.downloadId } }) : null;
   const hasLiveLinkedDownload = Boolean(linkedDownload);
   const clearDownloadId = Boolean(existing?.downloadId && !hasLiveLinkedDownload);
@@ -711,23 +822,32 @@ async function upsertRequest(provider: RequestProvider, request: ExternalMediaRe
     return { request: existing, action: "skipped" };
   }
 
-  const synced = await prisma.mediaRequest.upsert({
-    where: { providerId_externalId: { providerId: provider.id, externalId: request.externalId } },
-    update: {
-      title: request.title,
-      year: request.year,
-      tmdbId: request.tmdbId,
-      tvdbId: request.tvdbId,
-      imdbId: request.imdbId,
-      seasons: jsonValue(request.seasons),
-      episodes: jsonValue(request.episodes),
-      requestedBy: request.requestedBy,
-      requestedQuality: request.requestedQuality,
-      externalStatus: request.externalStatus,
-      status: nextStatus,
-      ...(clearDownloadId ? { downloadId: null } : {})
-    },
-    create: {
+  if (existing) {
+    const synced = await prisma.mediaRequest.update({
+      where: { id: existing.id },
+      data: {
+        externalId: request.externalId,
+        mediaType: request.mediaType,
+        providerId: provider.id,
+        title: request.title,
+        year: request.year,
+        tmdbId: request.tmdbId,
+        tvdbId: request.tvdbId,
+        imdbId: request.imdbId,
+        seasons: jsonValue(request.seasons),
+        episodes: jsonValue(request.episodes),
+        requestedBy: request.requestedBy,
+        requestedQuality: request.requestedQuality,
+        externalStatus: request.externalStatus,
+        status: nextStatus,
+        ...(clearDownloadId ? { downloadId: null } : {})
+      }
+    });
+    return { request: synced, action: "updated" };
+  }
+
+  const synced = await prisma.mediaRequest.create({
+    data: {
       providerId: provider.id,
       externalId: request.externalId,
       mediaType: request.mediaType,
@@ -745,7 +865,7 @@ async function upsertRequest(provider: RequestProvider, request: ExternalMediaRe
     }
   });
 
-  return { request: synced, action: existing ? "updated" : "created" };
+  return { request: synced, action: "created" };
 }
 
 export async function listRequests() {
@@ -1049,8 +1169,8 @@ export async function rankReleasesForRequest(id: string) {
     releases.map(async (release) => ({
       release,
       decision: (await isReleaseBlocklisted(release))
-        ? { ...scoreRelease(release, profile), accepted: false, score: -1000, reasons: ["release is blocklisted"] }
-        : scoreRelease(release, profile)
+        ? { ...scoreReleaseForRequest(request, release, profile), accepted: false, score: -1000, reasons: ["release is blocklisted"] }
+        : scoreReleaseForRequest(request, release, profile)
     }))
   );
   ranked.sort((a, b) => b.decision.score - a.decision.score);
@@ -1076,8 +1196,8 @@ export async function rankTvEpisodeForRequest(id: string, season: number, episod
     releases.map(async (release) => ({
       release,
       decision: (await isReleaseBlocklisted(release))
-        ? { ...scoreRelease(release, profile), accepted: false, score: -1000, reasons: ["release is blocklisted"] }
-        : scoreRelease(release, profile)
+        ? { ...scoreReleaseForRequest(request, release, profile), accepted: false, score: -1000, reasons: ["release is blocklisted"] }
+        : scoreReleaseForRequest(request, release, profile)
     }))
   );
   ranked.sort((a, b) => b.decision.score - a.decision.score);
@@ -1121,8 +1241,8 @@ export async function grabBestForRequest(id: string, options?: { priorityBoost?:
     releases.map(async (release) => ({
       release,
       decision: (await isReleaseBlocklisted(release))
-        ? { ...scoreRelease(release, profile), accepted: false, score: -1000, reasons: ["release is blocklisted"] }
-        : scoreRelease(release, profile)
+        ? { ...scoreReleaseForRequest(request, release, profile), accepted: false, score: -1000, reasons: ["release is blocklisted"] }
+        : scoreReleaseForRequest(request, release, profile)
     }))
   );
   const ranked = scored.filter((item) => item.decision.accepted).sort((a, b) => b.decision.score - a.decision.score);
@@ -1396,8 +1516,8 @@ async function grabBestTvSeasonForRequest(
     releases.map(async (release) => ({
       release,
       decision: (await isReleaseBlocklisted(release))
-        ? { ...scoreRelease(release, profile), accepted: false, score: -1000, reasons: ["release is blocklisted"] }
-        : scoreRelease(release, profile)
+        ? { ...scoreReleaseForRequest(request, release, profile), accepted: false, score: -1000, reasons: ["release is blocklisted"] }
+        : scoreReleaseForRequest(request, release, profile)
     }))
   );
   const accepted = scored.filter((item) => item.decision.accepted).sort((a, b) => b.decision.score - a.decision.score);
@@ -1524,8 +1644,8 @@ async function searchEpisodesForSeason(
         releases.map(async (release) => ({
           release,
           decision: (await isReleaseBlocklisted(release))
-            ? { ...scoreRelease(release, profile), accepted: false, score: -1000, reasons: ["release is blocklisted"] }
-            : scoreRelease(release, profile)
+            ? { ...scoreReleaseForRequest(request, release, profile), accepted: false, score: -1000, reasons: ["release is blocklisted"] }
+            : scoreReleaseForRequest(request, release, profile)
         }))
       );
       return scored
@@ -1611,25 +1731,25 @@ function titleCoversSeason(title: string, season: number) {
 }
 
 function episodePattern(season: number, episode?: number) {
-  const episodePart = episode ? `0?${episode}` : "\\d{1,3}";
-  return new RegExp(`(?:\\bS0?${season}E(?<episode>${episodePart})(?:\\b|E\\d{1,3}|[- .]?E?\\d{1,3}\\b)|\\b0?${season}x(?<episode_x>${episodePart})\\b)`, "i");
+  const episodePart = episode ? `0?${episode}` : "\\d{1,4}";
+  return new RegExp(`(?:\\bS0?${season}E(?<episode>${episodePart})(?:\\b|E\\d{1,4}|[- .]?E?\\d{1,4}\\b)|\\b0?${season}x(?<episode_x>${episodePart})\\b)`, "i");
 }
 
 function episodesCoveredByTitle(title: string, season: number) {
   const episodes = new Set<number>();
-  const single = title.match(new RegExp(`\\bS0?${season}E(?<episode>\\d{1,3})\\b`, "i"));
+  const single = title.match(new RegExp(`\\bS0?${season}E(?<episode>\\d{1,4})\\b`, "i"));
   if (single?.groups?.episode) episodes.add(Number(single.groups.episode));
 
-  const oneBy = title.match(new RegExp(`\\b0?${season}x(?<episode>\\d{1,3})\\b`, "i"));
+  const oneBy = title.match(new RegExp(`\\b0?${season}x(?<episode>\\d{1,4})\\b`, "i"));
   if (oneBy?.groups?.episode) episodes.add(Number(oneBy.groups.episode));
 
-  const multi = title.match(new RegExp(`\\bS0?${season}E(?<first>\\d{1,3})(?<rest>(?:E\\d{1,3})+)\\b`, "i"));
+  const multi = title.match(new RegExp(`\\bS0?${season}E(?<first>\\d{1,4})(?<rest>(?:E\\d{1,4})+)\\b`, "i"));
   if (multi?.groups?.first && multi.groups.rest) {
     episodes.add(Number(multi.groups.first));
-    for (const match of multi.groups.rest.matchAll(/E(\d{1,3})/gi)) episodes.add(Number(match[1]));
+    for (const match of multi.groups.rest.matchAll(/E(\d{1,4})/gi)) episodes.add(Number(match[1]));
   }
 
-  const range = title.match(new RegExp(`\\bS0?${season}E(?<start>\\d{1,3})[- .]?E?(?<end>\\d{1,3})\\b`, "i"));
+  const range = title.match(new RegExp(`\\bS0?${season}E(?<start>\\d{1,4})[- .]?E?(?<end>\\d{1,4})\\b`, "i"));
   if (range?.groups?.start && range.groups.end) {
     const start = Number(range.groups.start);
     const end = Number(range.groups.end);
@@ -1720,7 +1840,7 @@ export async function grabReleaseForRequest(id: string, release: unknown) {
     });
     return { grabbed: false, reason: "release is blocklisted", release: typedRelease };
   }
-  const decision = scoreRelease(typedRelease, profile);
+  const decision = scoreReleaseForRequest(request, typedRelease, profile);
   if (!decision.accepted) {
     await prisma.mediaRequest.update({
       where: { id },

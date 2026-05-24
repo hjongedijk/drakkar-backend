@@ -16,7 +16,7 @@ Drakkar coordinates request sync, NZB search, download queueing, FUSE-mounted me
 
 ## Version
 
-Current backend version: `0.2.4`
+Current backend version: `0.2.5`
 
 ## Runtime layout
 
@@ -118,11 +118,20 @@ Important endpoints:
 - `/api/docs`
 - `/api/graphql`
 - `/api/auth/login`
+- `/api/webhooks/seerr`
+- `/api/compat/sonarr`
+- `/api/compat/radarr`
 - `/api/library`
 - `/api/downloads/queue`
 - `/api/downloads/history`
 - `/api/vfs/*`
 - `/sabnzbd/api`
+
+## Request intake
+
+- Single Seerr approvals should use the webhook at `/api/webhooks/seerr`
+- Periodic bulk request sync now runs every 15 minutes by default
+- The webhook path is intended to keep individual requests fast without forcing constant full-library polling
 
 ## Docs
 

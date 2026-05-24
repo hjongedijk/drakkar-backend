@@ -86,18 +86,18 @@ function suspiciousImportTitle(value: string) {
     || /^\s*\d+\]\s*/.test(value)
     || /^[a-z0-9]{20,}$/i.test(value)
     || (/^[a-z0-9]{8,19}$/i.test(compact) && /[a-z]/.test(compact) && /[A-Z]/.test(compact) && /\d/.test(compact))
-    || (/\bS\d{1,2}E\d{1,3}(?:E\d{1,3}|[- .]E?\d{1,3})?\b/i.test(value) && /\b(2160p|1080p|720p|web-?dl|webrip|bluray|h\.?264|x264|x265|hevc|ddp|dts)\b/i.test(value))
+    || (/\bS\d{1,2}E\d{1,4}(?:E\d{1,4}|[- .]E?\d{1,4})?\b/i.test(value) && /\b(2160p|1080p|720p|web-?dl|webrip|bluray|h\.?264|x264|x265|hevc|ddp|dts)\b/i.test(value))
     || (/\bS\d{1,2}\s*-\s*\d{1,2}\b/i.test(value) && /\b(2160p|1080p|720p|web-?dl|webrip|bluray|h\.?264|x264|x265|hevc)\b/i.test(value))
     || /^[a-z0-9]+-[a-z0-9-]+$/i.test(value);
 }
 
 function inferMedia(path: string) {
   const name = basename(path, extname(path));
-  const multiEpisode = name.match(/\bS(?<season>\d{1,2})E(?<episode>\d{1,3})(?:E\d{1,3}|[- .]E?\d{1,3})\b/i);
-  const seasonEpisode = name.match(/\bS(?<season>\d{1,2})E(?<episode>\d{1,3})\b/i);
+  const multiEpisode = name.match(/\bS(?<season>\d{1,2})E(?<episode>\d{1,4})(?:E\d{1,4}|[- .]E?\d{1,4})\b/i);
+  const seasonEpisode = name.match(/\bS(?<season>\d{1,2})E(?<episode>\d{1,4})\b/i);
   const seasonOnly = name.match(/\bS(?<season>\d{1,2})\b/i);
   const year = name.match(/\b(19\d{2}|20\d{2})\b/)?.[1];
-  const titleBase = name.split(/\b(19\d{2}|20\d{2}|S\d{1,2}(?:E\d{1,3})?)\b/i)[0] ?? name;
+  const titleBase = name.split(/\b(19\d{2}|20\d{2}|S\d{1,2}(?:E\d{1,4})?)\b/i)[0] ?? name;
   return {
     mediaType: multiEpisode || seasonEpisode || seasonOnly ? "tv" : "movie",
     title: cleanTitle(titleBase),
@@ -195,7 +195,7 @@ export async function reconcileRequestStatusAfterImport(requestId?: string, down
 
 function fallbackMediaTitle(value?: string | null) {
   if (!value) return undefined;
-  const prefix = value.split(/\bS\d{1,2}E\d{1,3}\b/i)[0] ?? value;
+  const prefix = value.split(/\bS\d{1,2}E\d{1,4}\b/i)[0] ?? value;
   const cleaned = prefix
     .replace(/[._]+/g, " ")
     .replace(/\s+-\s+[A-Za-z0-9]+$/, "")

@@ -38,6 +38,15 @@ describe("inferMediaIdentity", () => {
     });
   });
 
+  it("detects long-running anime episode numbers", () => {
+    assert.deepEqual(inferMediaIdentity("One.Piece.S01E1162.1080p.NF.WEB-DL.AAC2.0.H.264-VARYG"), {
+      mediaType: "tv",
+      title: "One Piece",
+      season: 1,
+      episode: 1162
+    });
+  });
+
   it("detects movies and release years", () => {
     assert.deepEqual(inferMediaIdentity("Example.Movie.2026.2160p.BluRay.x265-GROUP"), {
       mediaType: "movie",

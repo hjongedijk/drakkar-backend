@@ -11,7 +11,7 @@ export const NAMING_MIGRATION_TASK_ID = "library-naming-migration";
 export const LIBRARY_CLEANUP_TASK_ID = "library-cleanup";
 export const LOG_PRUNE_TASK_ID = "log-prune";
 
-export const REQUEST_SYNC_INTERVAL_MS = 60_000;
+export const REQUEST_SYNC_INTERVAL_MS = 15 * 60_000;
 export const NZBHYDRA_RSS_SYNC_INTERVAL_MS = 15 * 60_000;
 export const BACKGROUND_REPAIR_INTERVAL_MS = 30 * 60_000;
 export const LOG_PRUNE_INTERVAL_MS = 6 * 60 * 60_000;
@@ -20,7 +20,7 @@ export function registerCoreTasks() {
   registerTask({
     id: REQUEST_SYNC_TASK_ID,
     name: "Request Sync",
-    description: "Sync Seerr requests, recover failed request downloads, ensure monitored requests, and clean old failed/cancelled history.",
+    description: "Periodic bulk Seerr sync for large libraries. Single approved requests should arrive immediately through the Seerr webhook; this task handles wider reconciliation, recovery, and queue seeding.",
     intervalMs: REQUEST_SYNC_INTERVAL_MS,
     enabled: env.REQUEST_SYNC_ENABLED,
     manualRunnable: true

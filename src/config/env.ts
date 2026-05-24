@@ -1,6 +1,6 @@
 import { join } from "node:path";
 import { z } from "zod";
-import { ensureRuntimeSettings, getFrontendApiToken } from "./runtimeSettings.js";
+import { ensureRuntimeSettings, getDrakkarApiToken } from "./runtimeSettings.js";
 
 const runtimeSettings = ensureRuntimeSettings(process.env.CONFIG_DIR || "/data/config");
 
@@ -36,7 +36,7 @@ const envSchema = z.object({
   FUSE_ALLOW_OTHER: envBoolean.default(true),
   FUSE_FORCE_MOUNT: envBoolean.default(true),
   FUSE_DEBUG: envBoolean.default(false),
-  FRONTEND_API_TOKEN: z.string().default(runtimeSettings.frontendApiToken),
+  DRAKKAR_API_TOKEN: z.string().default(runtimeSettings.drakkarApiToken),
   AUTH_SESSION_TTL_DAYS: z.coerce.number().int().positive().default(30),
   REQUEST_SYNC_ENABLED: envBoolean.default(runtimeSettings.infrastructure.runtime.requestSyncEnabled),
   BACKGROUND_REPAIR_ENABLED: envBoolean.default(runtimeSettings.infrastructure.runtime.backgroundRepairEnabled),
@@ -51,7 +51,7 @@ export const env = {
   ...parsedEnv,
   MEDIA_MOVIES_DIR: parsedEnv.MEDIA_MOVIES_DIR ?? join(parsedEnv.MEDIA_SYMLINKS_DIR, "movies"),
   MEDIA_TV_DIR: parsedEnv.MEDIA_TV_DIR ?? join(parsedEnv.MEDIA_SYMLINKS_DIR, "tv"),
-  getFrontendApiToken
+  getDrakkarApiToken
 };
 
 export const requiredDirectories = [

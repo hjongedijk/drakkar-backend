@@ -14,9 +14,11 @@ import {
   listProviders,
   listRequests,
   markRequestAvailable,
+  backfillPlaceholderRequestMetadata,
   rankReleasesForRequest,
   rankTvEpisodeForRequest,
   recoverFailedRequestDownloads,
+  recoverSelectedReleaseDownloads,
   ensureMonitoredRequests,
   refreshRequest,
   setRequestStatus,
@@ -25,6 +27,7 @@ import {
   testRequestProvider,
   updateProvider
 } from "../requests/sync/service.js";
+import { refreshMediaLibrary } from "../media-library/libraryService.js";
 
 const providerSchema = z.object({
   type: z.literal("seerr").default("seerr"),
@@ -48,6 +51,11 @@ const manualRequestSchema = z.object({
   tmdbId: z.string().optional(),
   tvdbId: z.string().optional(),
   imdbId: z.string().optional()
+});
+
+const syncRequestsSchema = z.object({
+  providerId: z.string().optional(),
+  full: z.boolean().optional()
 });
 
 const episodeParamsSchema = z.object({
@@ -118,7 +126,8 @@ export async function requestRoutes(app: FastifyInstance): Promise<void> {
   app.get("/api/requests/:id", async (request) => publicRequest(await getRequest(idParam(request))));
   app.get("/api/requests/:id/monitor", async (request) => publicResult(await getRequestMonitor(idParam(request))));
   app.post("/api/requests/sync", async (request) => {
-    const result = await syncRequests((request.body as { providerId?: string } | undefined)?.providerId);
+    const body = syncRequestsSchema.parse(request.body ?? {});
+    const result = await syncRequests(body.providerId, { full: body.full });
     void (async () => {
       try {
         await recoverFailedRequestDownloads();
@@ -132,6 +141,29 @@ export async function requestRoutes(app: FastifyInstance): Promise<void> {
       recovery: { recovered: 0, deferred: true },
       monitored: { retried: 0, deferred: true },
       requests: result.requests.map(publicRequest)
+    });
+  });
+  app.post("/api/requests/full-sync-refresh", async (request, reply) => {
+    if (!request.authUser?.isAdmin) return reply.status(403).send({ message: "Admin access required." });
+    const body = syncRequestsSchema.parse(request.body ?? {});
+    const sync = await syncRequests(body.providerId, { full: true });
+    const [failedRecovery, selectedRecovery, metadataBackfill, monitored, library] = await Promise.all([
+      recoverFailedRequestDownloads(),
+      recoverSelectedReleaseDownloads(),
+      backfillPlaceholderRequestMetadata(),
+      ensureMonitoredRequests(),
+      refreshMediaLibrary()
+    ]);
+    return publicResult({
+      sync: {
+        ...sync,
+        requests: sync.requests.map(publicRequest)
+      },
+      recoverFailed: failedRecovery,
+      recoverSelected: selectedRecovery,
+      metadataBackfill,
+      monitored,
+      library
     });
   });
   app.post("/api/webhooks/seerr", async (request) => {

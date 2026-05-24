@@ -133,6 +133,7 @@ describe("parseReleaseTitle", () => {
     const sxxexx = parseReleaseTitle("The.Last.of.Us.S01E03.Long.Long.Time.2160p.WEB-DL-GROUP");
     const oneBy = parseReleaseTitle("The.Last.of.Us.1x03.Long.Long.Time.1080p.WEB-DL-GROUP");
     const multi = parseReleaseTitle("Avatar.The.Last.Airbender.S02E12E13.1080p.BluRay.x264-CiNEFiLE");
+    const longAnime = parseReleaseTitle("One.Piece.S01E1162.1080p.NF.WEB-DL.AAC2.0.H.264-VARYG");
 
     assert.equal(sxxexx.season, 1);
     assert.equal(sxxexx.episode, 3);
@@ -140,6 +141,8 @@ describe("parseReleaseTitle", () => {
     assert.equal(oneBy.episode, 3);
     assert.equal(multi.season, 2);
     assert.equal(multi.episode, 12);
+    assert.equal(longAnime.season, 1);
+    assert.equal(longAnime.episode, 1162);
   });
 
   it("parses daily TV date as year metadata", () => {

@@ -4,15 +4,16 @@ import type { ImportItem } from "@prisma/client";
 import { env } from "../config/env.js";
 import { prisma } from "../db/prisma.js";
 import { canonicalizeDisplayTitle, inferMediaIdentity, normalizeTitleForIdentity } from "../media-library/identity.js";
-import { fetchMediaMetadata } from "../metadata/metadataService.js";
+import { fetchMediaMetadata, fetchSeriesStructure } from "../metadata/metadataService.js";
 import { completedPathToVfsPath, getNamingSettings, libraryPathFor } from "../naming/namingService.js";
 import { getPolicySettings } from "../policies/policyService.js";
 import { refreshPlexPath } from "../plex/plexService.js";
 import { getSettings } from "../settings/settingsStore.js";
+import type { AppSettings } from "../settings/settingsStore.js";
 
 function fallbackMediaTitle(value?: string | null) {
   if (!value) return undefined;
-  const prefix = value.split(/\bS\d{1,2}E\d{1,3}\b/i)[0] ?? value;
+  const prefix = value.split(/\bS\d{1,2}E\d{1,4}\b/i)[0] ?? value;
   const cleaned = prefix
     .replace(/[._]+/g, " ")
     .replace(/\s+-\s+[A-Za-z0-9]+$/, "")
@@ -47,8 +48,9 @@ function lookupTitleVariants(value: string, year?: number | null) {
 export async function resolveImportMedia(item: ImportItem) {
   const request = item.requestId ? await prisma.mediaRequest.findUnique({ where: { id: item.requestId } }) : null;
   const download = item.downloadId ? await prisma.download.findUnique({ where: { id: item.downloadId } }) : null;
+  const settings = await getSettings();
   const compactTitle = item.title.trim();
-  const releaseStyleTitle = /\bS\d{1,2}E\d{1,3}(?:E\d{1,3}|[- .]E?\d{1,3})?\b/i.test(item.title)
+  const releaseStyleTitle = /\bS\d{1,2}E\d{1,4}(?:E\d{1,4}|[- .]E?\d{1,4})?\b/i.test(item.title)
     && /\b(2160p|1080p|720p|web-?dl|webrip|bluray|h\.?264|x264|x265|hevc|ddp|dts)\b/i.test(item.title);
   const suspiciousTitle = !item.title
     || /^[a-z0-9]+-[a-z0-9-]+$/i.test(item.title)
@@ -72,16 +74,29 @@ export async function resolveImportMedia(item: ImportItem) {
     year: item.year ?? (inferredIdentity?.mediaType === "movie" ? inferredIdentity.year : undefined),
     season: item.season ?? (inferredIdentity?.mediaType === "tv" ? inferredIdentity.season : undefined),
     episode: item.episode ?? (inferredIdentity?.mediaType === "tv" ? inferredIdentity.episode : undefined),
-    tmdbId: request?.tmdbId,
-    tvdbId: request?.tvdbId
+    tmdbId: undefined as string | undefined,
+    tvdbId: undefined as string | undefined
   };
 
-  const knownMetadata = await findKnownMetadataForMedia(media);
+  const requestCandidate = request ? {
+    title: request.title,
+    year: request.year ?? undefined,
+    tmdbId: request.tmdbId ?? undefined,
+    tvdbId: request.tvdbId ?? undefined
+  } : null;
+  if (requestCandidate && await metadataCandidateMatchesMedia(settings, media, requestCandidate)) {
+    media.title = canonicalizeDisplayTitle(requestCandidate.title ?? media.title, requestCandidate.year ?? media.year);
+    media.year = media.year ?? requestCandidate.year;
+    media.tmdbId = requestCandidate.tmdbId ?? media.tmdbId;
+    media.tvdbId = requestCandidate.tvdbId ?? media.tvdbId;
+  }
+
+  const knownMetadata = await findKnownMetadataForMedia(media, settings);
   if (knownMetadata) {
     media.title = knownMetadata.title ?? media.title;
     media.year = media.year ?? knownMetadata.year ?? undefined;
-    media.tmdbId = media.tmdbId ?? knownMetadata.tmdbId;
-    media.tvdbId = media.tvdbId ?? knownMetadata.tvdbId;
+    media.tmdbId = media.tmdbId ?? knownMetadata.tmdbId ?? undefined;
+    media.tvdbId = media.tvdbId ?? knownMetadata.tvdbId ?? undefined;
   }
 
   const needsMetadata = !media.year || (media.mediaType === "movie" ? !media.tmdbId : !media.tvdbId);
@@ -89,9 +104,7 @@ export async function resolveImportMedia(item: ImportItem) {
   const lookupTitle = normalizeLookupTitle(titleFallback) ?? normalizeLookupTitle(media.title) ?? media.title;
   const lookupYear = request?.year
     ?? (media.mediaType === "tv" && !media.tvdbId ? undefined : suspiciousTitle ? undefined : media.year);
-
-  const settings = await getSettings();
-  const metadata = await fetchMediaMetadata(settings, {
+  const metadataLookup = {
     mediaType: media.mediaType,
     title: lookupTitle,
     year: lookupYear,
@@ -100,7 +113,11 @@ export async function resolveImportMedia(item: ImportItem) {
     tmdbId: media.tmdbId,
     tvdbId: media.tvdbId,
     imdbId: request?.imdbId
-  }).catch(() => undefined);
+  };
+  let metadata = await fetchMediaMetadata(settings, metadataLookup).catch(() => undefined);
+  if (metadata && !(await metadataCandidateMatchesMedia(settings, media, metadata))) {
+    metadata = undefined;
+  }
 
   if (!metadata) {
     if ((titleFallback && titleFallback !== item.title) || media.season !== item.season || media.episode !== item.episode) {
@@ -146,7 +163,9 @@ async function findKnownMetadataForMedia(media: {
   year?: number | null;
   tmdbId?: string | null;
   tvdbId?: string | null;
-}) {
+  season?: number | null;
+  episode?: number | null;
+}, settings: AppSettings) {
   if (media.tmdbId || media.tvdbId || !media.title) return null;
   const normalizedTitles = lookupTitleVariants(media.title, media.year);
   const [libraryCandidates, requestCandidates] = await Promise.all([
@@ -167,10 +186,55 @@ async function findKnownMetadataForMedia(media: {
       select: { title: true, year: true, tmdbId: true, tvdbId: true }
     })
   ]);
-  const match = [...libraryCandidates, ...requestCandidates].find((candidate) =>
-    [...lookupTitleVariants(candidate.title, candidate.year)].some((title) => normalizedTitles.has(title))
-  );
-  return match ?? null;
+  for (const candidate of [...libraryCandidates, ...requestCandidates]) {
+    if (![...lookupTitleVariants(candidate.title, candidate.year)].some((title) => normalizedTitles.has(title))) continue;
+    if (await metadataCandidateMatchesMedia(settings, media, candidate)) return candidate;
+  }
+  return null;
+}
+
+function seriesStructureAllowsEpisode(
+  seasonNumber: number | null | undefined,
+  episodeNumber: number | null | undefined,
+  structure: Awaited<ReturnType<typeof fetchSeriesStructure>>
+) {
+  if (seasonNumber == null || episodeNumber == null) return true;
+  if (!structure || !structure.seasons.length) return true;
+  const season = structure.seasons.find((entry) => entry.seasonNumber === seasonNumber);
+  if (!season) return false;
+  if (!season.episodeCount || season.episodeCount <= 0) return true;
+  return episodeNumber <= season.episodeCount;
+}
+
+async function metadataCandidateMatchesMedia(
+  settings: AppSettings,
+  media: {
+    mediaType: string;
+    title: string;
+    year?: number | null;
+    season?: number | null;
+    episode?: number | null;
+  },
+  candidate: {
+    title?: string | null;
+    year?: number | null;
+    tmdbId?: string | null;
+    tvdbId?: string | null;
+  }
+) {
+  if (media.mediaType === "movie") return !(media.year != null && candidate.year != null && media.year !== candidate.year);
+  if (media.mediaType !== "tv" || media.season == null || media.episode == null) return true;
+  if (!candidate.tmdbId && !candidate.tvdbId) return true;
+  const structure = await fetchSeriesStructure(settings, {
+    mediaType: "tv",
+    title: candidate.title ?? media.title,
+    year: candidate.year ?? media.year,
+    tmdbId: candidate.tmdbId ?? undefined,
+    tvdbId: candidate.tvdbId ?? undefined,
+    season: media.season,
+    episode: media.episode
+  }).catch(() => undefined);
+  return seriesStructureAllowsEpisode(media.season, media.episode, structure);
 }
 
 async function removeExisting(path: string) {
@@ -198,7 +262,7 @@ function strmContents(item: ImportItem) {
   const base = env.APP_BASE_URL.replace(/\/+$/, "");
   const params = new URLSearchParams({
     path: vfsPath,
-    apiToken: env.FRONTEND_API_TOKEN
+    apiToken: env.DRAKKAR_API_TOKEN
   });
   return `${base}/api/vfs/stream?${params.toString()}\n`;
 }
@@ -257,7 +321,7 @@ function plexLog(level: "info" | "warn", message: string, fields: Record<string,
 function inferTvEpisodeTargets(item: ImportItem, media: Awaited<ReturnType<typeof resolveImportMedia>>) {
   if (media.mediaType !== "tv") return [media];
   const searchSpace = [item.sourcePath, item.completedPath, item.title].filter(Boolean).join(" ");
-  const multiEpisode = searchSpace.match(/\bS(?<season>\d{1,2})E(?<episode1>\d{1,3})(?:E(?<episode2a>\d{1,3})|[- .]E?(?<episode2b>\d{1,3}))\b/i);
+  const multiEpisode = searchSpace.match(/\bS(?<season>\d{1,2})E(?<episode1>\d{1,4})(?:E(?<episode2a>\d{1,4})|[- .]E?(?<episode2b>\d{1,4}))\b/i);
   if (multiEpisode?.groups) {
     const season = media.season ?? Number(multiEpisode.groups.season);
     const firstEpisode = Number(multiEpisode.groups.episode1);

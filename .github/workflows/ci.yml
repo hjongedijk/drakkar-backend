@@ -25,6 +25,7 @@ on:
 jobs:
   build-test:
     runs-on: ubuntu-latest
+    timeout-minutes: 20
     services:
       valkey:
         image: valkey/valkey:8-alpine
@@ -60,8 +61,11 @@ jobs:
 
       - name: Test
         run: npm test
+        timeout-minutes: 8
         env:
+          NODE_ENV: test
           CONFIG_DIR: ${{ runner.temp }}/drakkar-config
+          REDIS_URL: redis://127.0.0.1:6379
 
       - name: Docker build smoke test
         run: docker build -t drakkar-backend:ci .

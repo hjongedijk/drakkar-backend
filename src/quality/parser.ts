@@ -36,9 +36,9 @@ const sourcePatterns: Array<[string, RegExp]> = [
 
 export function parseReleaseTitle(title: string): ParsedQuality {
   const seasonEpisode =
-    title.match(/\bS(?<season>\d{1,2})E(?<episode>\d{1,3})(?:E\d{1,3}|[- .]E?\d{1,3})\b/i) ??
-    title.match(/\bS(?<season>\d{1,2})E(?<episode>\d{1,3})\b/i) ??
-    title.match(/\b(?<season>\d{1,2})x(?<episode>\d{1,3})\b/i);
+    title.match(/\bS(?<season>\d{1,2})E(?<episode>\d{1,4})(?:E\d{1,4}|[- .]E?\d{1,4})\b/i) ??
+    title.match(/\bS(?<season>\d{1,2})E(?<episode>\d{1,4})\b/i) ??
+    title.match(/\b(?<season>\d{1,2})x(?<episode>\d{1,4})\b/i);
   const daily = title.match(/\b(?<year>(?:19|20)\d{2})[ ._-](?<month>0[1-9]|1[0-2])[ ._-](?<day>0[1-9]|[12]\d|3[01])\b/i);
   const year = title.match(/\b(19\d{2}|20\d{2})\b/)?.[0];
   const releaseGroup = title.match(/-([A-Z0-9][A-Z0-9._-]{1,})$/i)?.[1];

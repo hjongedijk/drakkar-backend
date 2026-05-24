@@ -5,7 +5,7 @@ import { tmpdir } from "node:os";
 import { z } from "zod";
 
 const runtimeSettingsSchema = z.object({
-  frontendApiToken: z.string().min(16),
+  drakkarApiToken: z.string().min(16),
   apiBaseUrl: z.string().default(""),
   backendUrl: z.string().default("http://backend:3000"),
   infrastructure: z.object({
@@ -92,7 +92,7 @@ let cachedRuntimeSettings: RuntimeSettings | null = null;
 
 function defaultRuntimeSettings(): RuntimeSettings {
   return {
-    frontendApiToken: `drakkar_${randomBytes(32).toString("base64url")}`,
+    drakkarApiToken: `drakkar_${randomBytes(32).toString("base64url")}`,
     apiBaseUrl: "",
     backendUrl: "http://backend:3000",
     infrastructure: {
@@ -223,7 +223,8 @@ export function ensureRuntimeSettings(configDir = process.env.CONFIG_DIR || "/da
     return created;
   }
 
-  const parsed = JSON.parse(readFileSync(path, "utf8")) as unknown;
+  const parsed = JSON.parse(readFileSync(path, "utf8")) as Partial<RuntimeSettings> & { frontendApiToken?: string; drakkarApiToken?: string };
+  if (!parsed.drakkarApiToken && parsed.frontendApiToken) parsed.drakkarApiToken = parsed.frontendApiToken;
   const input = mergeExampleProviderArrays(parsed as Partial<RuntimeSettings>) as RuntimeSettings & {
     nzbhydra?: { categories?: string[]; timeoutMs?: number };
   };
@@ -249,8 +250,8 @@ export function getRuntimeSettings(configDir = process.env.CONFIG_DIR || "/data/
   return cachedRuntimeSettings ?? ensureRuntimeSettings(configDir);
 }
 
-export function getFrontendApiToken(configDir = process.env.CONFIG_DIR || "/data/config") {
-  return getRuntimeSettings(configDir).frontendApiToken;
+export function getDrakkarApiToken(configDir = process.env.CONFIG_DIR || "/data/config") {
+  return getRuntimeSettings(configDir).drakkarApiToken;
 }
 
 export function updateRuntimeSettings(
@@ -266,9 +267,12 @@ export function updateRuntimeSettings(
   return next;
 }
 
-export function rotateFrontendApiToken(configDir = process.env.CONFIG_DIR || "/data/config") {
+export function rotateDrakkarApiToken(configDir = process.env.CONFIG_DIR || "/data/config") {
   return updateRuntimeSettings((current) => ({
     ...current,
-    frontendApiToken: `drakkar_${randomBytes(32).toString("base64url")}`
+    drakkarApiToken: `drakkar_${randomBytes(32).toString("base64url")}`
   }), configDir);
 }
+
+export const getFrontendApiToken = getDrakkarApiToken;
+export const rotateFrontendApiToken = rotateDrakkarApiToken;

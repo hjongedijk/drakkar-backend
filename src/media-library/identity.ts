@@ -82,7 +82,7 @@ export function mediaIdentityKey(input: {
 
 export function inferMediaIdentity(rawTitle: string) {
   const normalized = cleanTitle(rawTitle);
-  const multiEpisode = normalized.match(/\bS(\d{1,2})E(\d{1,3})(?:E(\d{1,3})|[- .]E?(\d{1,3}))\b/i);
+  const multiEpisode = normalized.match(/\bS(\d{1,2})E(\d{1,4})(?:E(\d{1,4})|[- .]E?(\d{1,4}))\b/i);
   if (multiEpisode) {
     return {
       mediaType: "tv",
@@ -92,7 +92,7 @@ export function inferMediaIdentity(rawTitle: string) {
     };
   }
 
-  const episode = normalized.match(/\bS(\d{1,2})E(\d{1,3})\b/i);
+  const episode = normalized.match(/\bS(\d{1,2})E(\d{1,4})\b/i);
   if (episode) {
     return {
       mediaType: "tv",
@@ -102,7 +102,7 @@ export function inferMediaIdentity(rawTitle: string) {
     };
   }
 
-  const alternateEpisode = normalized.match(/\b(\d{1,2})x(\d{1,3})\b/i);
+  const alternateEpisode = normalized.match(/\b(\d{1,2})x(\d{1,4})\b/i);
   if (alternateEpisode) {
     return {
       mediaType: "tv",
@@ -112,7 +112,7 @@ export function inferMediaIdentity(rawTitle: string) {
     };
   }
 
-  const seasonPack = normalized.match(/\bS(\d{1,2})(?!\s*E\d{1,3})\b/i);
+  const seasonPack = normalized.match(/\bS(\d{1,2})(?!\s*E\d{1,4})\b/i);
   if (seasonPack) {
     return {
       mediaType: "tv",

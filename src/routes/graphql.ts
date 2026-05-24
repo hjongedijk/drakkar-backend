@@ -271,12 +271,12 @@ function openApiDocument() {
           },
           required: ["query"]
         },
-        FrontendTokenState: {
+        DrakkarApiTokenState: {
           type: "object",
           properties: {
-            frontendApiToken: { type: "string" }
+            drakkarApiToken: { type: "string" }
           },
-          required: ["frontendApiToken"]
+          required: ["drakkarApiToken"]
         }
       }
     },
@@ -519,18 +519,18 @@ function openApiDocument() {
           }
         }
       },
-      "/api/settings/frontend-token": {
+      "/api/settings/drakkar-api-token": {
         get: {
           tags: ["Settings"],
           summary: "Read the Drakkar API token",
-          responses: { "200": { description: "Frontend token state", content: { "application/json": { schema: { $ref: "#/components/schemas/FrontendTokenState" } } } } }
+          responses: { "200": { description: "Drakkar API token state", content: { "application/json": { schema: { $ref: "#/components/schemas/DrakkarApiTokenState" } } } } }
         }
       },
-      "/api/settings/frontend-token/rotate": {
+      "/api/settings/drakkar-api-token/rotate": {
         post: {
           tags: ["Settings"],
           summary: "Rotate the Drakkar API token",
-          responses: { "200": { description: "New token", content: { "application/json": { schema: { $ref: "#/components/schemas/FrontendTokenState" } } } } }
+          responses: { "200": { description: "New token", content: { "application/json": { schema: { $ref: "#/components/schemas/DrakkarApiTokenState" } } } } }
         }
       },
       "/api/graphql": {
@@ -665,8 +665,8 @@ export async function graphqlRoutes(app: FastifyInstance): Promise<void> {
     <script crossorigin src="https://unpkg.com/react-dom@18/umd/react-dom.production.min.js"></script>
     <script crossorigin src="https://unpkg.com/graphiql@2/graphiql.min.js"></script>
     <script>
-      const token = window.__DRAKKAR_CONFIG__?.FRONTEND_API_TOKEN || '';
-      const defaultQuery = '# Auth required: use your normal Drakkar session or the same Drakkar API token.\\nquery DashboardPreview {\\n  me { username displayName isAdmin }\\n  status { appName version backend postgresql valkey }\\n  downloads(limit: 5) { title status progress speedBytesSec }\\n  library(limit: 5) { title mediaType libraryStatus streamStatus updatedAt }\\n  settings { nzbhydraConfigured usenetConfigured requestProvidersConfigured plexConfigured }\\n}';
+      const token = window.__DRAKKAR_CONFIG__?.DRAKKAR_API_TOKEN || window.__DRAKKAR_CONFIG__?.FRONTEND_API_TOKEN || '';
+      const defaultQuery = '# Auth uses the Drakkar API token.\\nquery DashboardPreview {\\n  me { username displayName isAdmin }\\n  status { appName version backend postgresql valkey }\\n  downloads(limit: 5) { title status progress speedBytesSec }\\n  library(limit: 5) { title mediaType libraryStatus streamStatus updatedAt }\\n  settings { nzbhydraConfigured usenetConfigured requestProvidersConfigured plexConfigured }\\n}';
       const fetcher = GraphiQL.createFetcher({
         url: '/api/graphql',
         headers: {
@@ -726,7 +726,7 @@ export async function graphqlRoutes(app: FastifyInstance): Promise<void> {
     <script src="/config.js"></script>
     <script src="https://unpkg.com/swagger-ui-dist@5/swagger-ui-bundle.js"></script>
     <script>
-      const token = window.__DRAKKAR_CONFIG__?.FRONTEND_API_TOKEN || '';
+      const token = window.__DRAKKAR_CONFIG__?.DRAKKAR_API_TOKEN || window.__DRAKKAR_CONFIG__?.FRONTEND_API_TOKEN || '';
       window.ui = SwaggerUIBundle({
         url: '/api/openapi.json',
         dom_id: '#swagger-ui',

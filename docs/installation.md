@@ -26,14 +26,25 @@ It includes:
 - backend
 - postgres
 - valkey
-- optional `seerr` profile
-- optional `debug` profile with Valkey Insight
+- valkey-insight
+- nzbhydra2
+- apprise-api
+- seerr
+- bazarr
 
 ## Required services
 
 - PostgreSQL
 - Valkey
 - Linux FUSE support
+
+Bundled companion services in the public compose:
+
+- `seerr` for requests
+- `nzbhydra2` for indexed search
+- `bazarr` via Drakkar Arr-compatible endpoints
+- `apprise-api` for notification support used by companion apps
+- `valkey-insight` for optional Valkey inspection
 
 ## Required mounts
 
@@ -59,6 +70,18 @@ volumes:
 ```
 
 Use `:rshared,z` only on SELinux hosts that require relabeling.
+
+## Compose dependency model
+
+The public compose intentionally only uses `depends_on` for real startup requirements:
+
+- `backend` waits for `postgres` and `valkey`
+- `frontend` waits for `backend`
+- `valkey-insight` waits for `valkey`
+- `bazarr` waits for `backend`
+- `nzbhydra2` only waits lightly for `apprise-api`
+
+`seerr`, `apprise-api`, and `nzbhydra2` are not blocked on Drakkar health unless they truly need it to start. This reduces unnecessary restart coupling in larger stacks.
 
 ## Host mount propagation
 

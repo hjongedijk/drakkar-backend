@@ -24,7 +24,16 @@ import { plexRoutes } from "./routes/plex.js";
 import { getSetupStatus, setupRoutes } from "./routes/setup.js";
 import { registerCoreTasks } from "./tasks/coreTasks.js";
 import { graphqlRoutes } from "./routes/graphql.js";
+import { bazarrCompatRoutes } from "./routes/bazarrCompat.js";
 import { buildLineLogger } from "./logging/lineLogger.js";
+
+const API_TOKEN_AUTH_USER = {
+  id: "drakkar-api-token",
+  username: "drakkar",
+  displayName: "Drakkar API",
+  isAdmin: true,
+  mustChangePassword: false
+} as const;
 
 export function buildApp() {
   registerCoreTasks();
@@ -57,16 +66,18 @@ export function buildApp() {
     if (request.method === "OPTIONS") return;
     if (!request.url.startsWith("/api/")) return;
     if (request.url === "/api/health") return;
+    if (request.url.startsWith("/api/compat/")) return;
     const parsedUrl = new URL(request.url, env.APP_BASE_URL);
     if (request.method === "GET" && ["/api/docs", "/api/openapi.json", "/api/graphql"].includes(parsedUrl.pathname) && !parsedUrl.searchParams.has("query")) return;
-    const frontendToken = env.getFrontendApiToken(env.CONFIG_DIR);
+    const drakkarApiToken = env.getDrakkarApiToken(env.CONFIG_DIR);
     const authorization = request.headers.authorization;
     const bearerToken = authorization?.startsWith("Bearer ") ? authorization.slice("Bearer ".length).trim() : undefined;
     const headerToken = Array.isArray(request.headers["x-api-token"]) ? request.headers["x-api-token"][0] : request.headers["x-api-token"];
-    const apiToken = headerToken ?? parsedUrl.searchParams.get("apiToken") ?? (bearerToken === frontendToken ? bearerToken : "");
-    if (apiToken !== frontendToken) {
-      return reply.status(401).send({ message: "Invalid frontend API token." });
+    const apiToken = headerToken ?? parsedUrl.searchParams.get("apiToken") ?? (bearerToken === drakkarApiToken ? bearerToken : "");
+    if (apiToken !== drakkarApiToken) {
+      return reply.status(401).send({ message: "Invalid Drakkar API token." });
     }
+    request.authUser = { ...API_TOKEN_AUTH_USER };
   });
 
   app.addHook("onRequest", async (request, reply) => {
@@ -76,6 +87,7 @@ export function buildApp() {
       const parsedUrl = new URL(request.url, env.APP_BASE_URL);
       if (request.method === "GET" && ["/api/docs", "/api/openapi.json", "/api/graphql"].includes(parsedUrl.pathname) && !parsedUrl.searchParams.has("query")) return;
       if (parsedUrl.pathname === "/api/health") return;
+      if (parsedUrl.pathname.startsWith("/api/compat/")) return;
       if (parsedUrl.pathname === "/api/setup/status") return;
       const setup = await getSetupStatus();
       if (parsedUrl.pathname === "/api/setup/complete") {
@@ -85,8 +97,10 @@ export function buildApp() {
       }
     }
     if (request.url.startsWith("/api/auth/login")) return;
+    if (request.authUser) return;
 
     const parsedUrl = new URL(request.url, env.APP_BASE_URL);
+    if (parsedUrl.pathname.startsWith("/api/compat/")) return;
     if (parsedUrl.pathname === "/api/webhooks/seerr") return;
     const authorization = request.headers.authorization;
     const bearerToken = authorization?.startsWith("Bearer ") ? authorization.slice("Bearer ".length).trim() : undefined;
@@ -131,6 +145,7 @@ export function buildApp() {
   void app.register(plexRoutes);
   void app.register(setupRoutes);
   void app.register(graphqlRoutes);
+  void app.register(bazarrCompatRoutes);
 
   return app;
 }
