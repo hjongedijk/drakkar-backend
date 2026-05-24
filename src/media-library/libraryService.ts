@@ -258,16 +258,19 @@ export async function refreshMediaLibrary() {
     const strategy = importStrategy(link?.status);
     const sourceKey = `import:${item.id}`;
     touched.add(sourceKey);
+    const existing = await prisma.mediaLibraryItem.findUnique({ where: { sourceKey } });
+    const title = request?.title ?? existing?.title ?? item.title;
+    const year = request?.year ?? existing?.year ?? item.year;
     const libraryItem = await prisma.mediaLibraryItem.upsert({
       where: { sourceKey },
       update: {
         mediaType: item.mediaType,
-        title: request?.title ?? item.title,
-        sortTitle: sortTitle(request?.title ?? item.title),
-        year: request?.year ?? item.year,
-        tmdbId: request?.tmdbId,
-        tvdbId: request?.tvdbId,
-        imdbId: request?.imdbId,
+        title,
+        sortTitle: sortTitle(title),
+        year,
+        tmdbId: request?.tmdbId ?? existing?.tmdbId ?? undefined,
+        tvdbId: request?.tvdbId ?? existing?.tvdbId ?? undefined,
+        imdbId: request?.imdbId ?? existing?.imdbId ?? undefined,
         season: item.season,
         episode: item.episode,
         requestId: item.requestId,
@@ -287,12 +290,12 @@ export async function refreshMediaLibrary() {
       create: {
         sourceKey,
         mediaType: item.mediaType,
-        title: request?.title ?? item.title,
-        sortTitle: sortTitle(request?.title ?? item.title),
-        year: request?.year ?? item.year,
-        tmdbId: request?.tmdbId,
-        tvdbId: request?.tvdbId,
-        imdbId: request?.imdbId,
+        title,
+        sortTitle: sortTitle(title),
+        year,
+        tmdbId: request?.tmdbId ?? existing?.tmdbId ?? undefined,
+        tvdbId: request?.tvdbId ?? existing?.tvdbId ?? undefined,
+        imdbId: request?.imdbId ?? existing?.imdbId ?? undefined,
         season: item.season,
         episode: item.episode,
         requestId: item.requestId,

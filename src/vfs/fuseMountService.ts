@@ -178,6 +178,9 @@ export async function startFuseMount(logger: FastifyBaseLogger) {
 
   try {
     const mountPath = env.FUSE_MOUNT_PATH;
+    if (env.FUSE_FORCE_MOUNT) {
+      await unmountStaleFuse(mountPath, logger);
+    }
     await prepareMountPath(mountPath, logger);
     const instance = new Fuse(mountPath, fuseOperations(), {
       debug: env.FUSE_DEBUG,
@@ -210,16 +213,20 @@ export async function startFuseMount(logger: FastifyBaseLogger) {
 }
 
 export async function stopFuseMount(logger: FastifyBaseLogger) {
-  if (!fuseInstance) return;
   const active = fuseInstance;
   fuseInstance = null;
   fileHandles.clear();
-  await new Promise<void>((resolve) => {
-    active.unmount((error: Error | null) => {
-      if (error) logger.warn({ err: error, mountPath: env.FUSE_MOUNT_PATH }, "native FUSE unmount failed");
-      resolve();
+  if (active) {
+    await new Promise<void>((resolve) => {
+      active.unmount((error: Error | null) => {
+        if (error) logger.warn({ err: error, mountPath: env.FUSE_MOUNT_PATH }, "native FUSE unmount failed");
+        resolve();
+      });
     });
-  });
+  }
+  if (env.FUSE_FORCE_MOUNT) {
+    await unmountStaleFuse(env.FUSE_MOUNT_PATH, logger);
+  }
   logger.info({ mountPath: env.FUSE_MOUNT_PATH }, "native TypeScript FUSE mount stopped");
 }
 
@@ -268,9 +275,10 @@ function isStaleFuseMountError(error: unknown) {
 }
 
 async function unmountStaleFuse(mountPath: string, logger: FastifyBaseLogger) {
-  for (const command of ["fusermount", "fusermount3"]) {
+  for (const command of ["fusermount", "fusermount3", "umount"]) {
     try {
-      await execFileAsync(command, ["-uz", mountPath]);
+      const args = command === "umount" ? ["-l", mountPath] : ["-uz", mountPath];
+      await execFileAsync(command, args);
       logger.info({ mountPath, command }, "stale FUSE mount detached");
       return;
     } catch (error) {

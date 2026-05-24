@@ -25,13 +25,23 @@ on:
 jobs:
   build-test:
     runs-on: ubuntu-latest
+    services:
+      valkey:
+        image: valkey/valkey:8-alpine
+        ports:
+          - 6379:6379
+        options: >-
+          --health-cmd "valkey-cli ping"
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 10
 
     steps:
       - name: Checkout
-        uses: actions/checkout@v4
+        uses: actions/checkout@v5
 
       - name: Setup Node
-        uses: actions/setup-node@v4
+        uses: actions/setup-node@v5
         with:
           node-version: 24.15.0
           cache: npm
@@ -50,6 +60,8 @@ jobs:
 
       - name: Test
         run: npm test
+        env:
+          CONFIG_DIR: ${{ runner.temp }}/drakkar-config
 
       - name: Docker build smoke test
         run: docker build -t drakkar-backend:ci .

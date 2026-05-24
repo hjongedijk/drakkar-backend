@@ -29,6 +29,20 @@ function cleanTitle(value: string) {
     .trim();
 }
 
+function stripWrappedYear(value: string) {
+  return value.replace(/\s*\((19|20)\d{2}\)\s*$/g, "").trim();
+}
+
+export function canonicalizeDisplayTitle(value: string, year?: number | null) {
+  const normalized = stripWrappedYear(cleanTitle(value))
+    .replace(/\s*[:]\s*/g, " ")
+    .replace(/\s+-\s+/g, " ")
+    .replace(/\s+/g, " ")
+    .trim();
+  if (!year) return normalized;
+  return normalized.replace(new RegExp(`\\b${year}\\b$`), "").replace(/\s+/g, " ").trim();
+}
+
 function trimAtQuality(value: string) {
   const pattern = new RegExp(`\\b(${qualityMarkers.join("|")})\\b.*$`, "i");
   return value.replace(pattern, "").trim();
@@ -72,7 +86,7 @@ export function inferMediaIdentity(rawTitle: string) {
   if (episode) {
     return {
       mediaType: "tv",
-      title: trimAtQuality(normalized.slice(0, episode.index)).trim() || normalized,
+      title: canonicalizeDisplayTitle(trimAtQuality(normalized.slice(0, episode.index)).trim() || normalized),
       season: Number(episode[1]),
       episode: Number(episode[2])
     };
@@ -82,7 +96,7 @@ export function inferMediaIdentity(rawTitle: string) {
   if (alternateEpisode) {
     return {
       mediaType: "tv",
-      title: trimAtQuality(normalized.slice(0, alternateEpisode.index)).trim() || normalized,
+      title: canonicalizeDisplayTitle(trimAtQuality(normalized.slice(0, alternateEpisode.index)).trim() || normalized),
       season: Number(alternateEpisode[1]),
       episode: Number(alternateEpisode[2])
     };
@@ -92,7 +106,7 @@ export function inferMediaIdentity(rawTitle: string) {
   if (seasonPack) {
     return {
       mediaType: "tv",
-      title: trimAtQuality(normalized.slice(0, seasonPack.index)).trim() || normalized,
+      title: canonicalizeDisplayTitle(trimAtQuality(normalized.slice(0, seasonPack.index)).trim() || normalized),
       season: Number(seasonPack[1])
     };
   }
@@ -101,7 +115,7 @@ export function inferMediaIdentity(rawTitle: string) {
   if (dailyEpisode) {
     return {
       mediaType: "tv",
-      title: trimAtQuality(normalized.slice(0, dailyEpisode.index)).trim() || normalized,
+      title: canonicalizeDisplayTitle(trimAtQuality(normalized.slice(0, dailyEpisode.index)).trim() || normalized),
       year: Number(dailyEpisode[1])
     };
   }
@@ -110,13 +124,13 @@ export function inferMediaIdentity(rawTitle: string) {
   if (year?.index != null) {
     return {
       mediaType: "movie",
-      title: trimAtQuality(normalized.slice(0, year.index)).trim() || normalized,
+      title: canonicalizeDisplayTitle(trimAtQuality(normalized.slice(0, year.index)).trim() || normalized, Number(year[1])),
       year: Number(year[1])
     };
   }
 
   return {
     mediaType: "unknown",
-    title: trimAtQuality(normalized) || normalized
+    title: canonicalizeDisplayTitle(trimAtQuality(normalized) || normalized)
   };
 }

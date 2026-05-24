@@ -601,7 +601,7 @@ export async function reprocessImport(id: string) {
   return getImport(id);
 }
 
-export async function migrateImportsToCurrentNaming() {
+export async function migrateImportsToCurrentNaming(options?: { refreshPlex?: boolean; changedPaths?: Set<string> }) {
   const naming = await getNamingSettings();
   const imports = await prisma.importItem.findMany({
     include: { request: true, symlinks: true }
@@ -642,7 +642,10 @@ export async function migrateImportsToCurrentNaming() {
           data: { completedPath: current }
         });
 
-    await createLibraryEntryForImport(updated);
+    await createLibraryEntryForImport(updated, {
+      refreshPlex: options?.refreshPlex ?? false,
+      changedPaths: options?.changedPaths
+    });
     relinked += 1;
   }
 

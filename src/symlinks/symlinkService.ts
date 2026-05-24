@@ -1,9 +1,9 @@
-import { copyFile, lstat, mkdir, readFile, readdir, readlink, rmdir, symlink, unlink, writeFile } from "node:fs/promises";
-import { dirname, extname, join } from "node:path";
+import { copyFile, lstat, mkdir, readFile, readdir, readlink, rm, rmdir, symlink, unlink, writeFile } from "node:fs/promises";
+import { dirname, extname, join, relative } from "node:path";
 import type { ImportItem } from "@prisma/client";
 import { env } from "../config/env.js";
 import { prisma } from "../db/prisma.js";
-import { inferMediaIdentity } from "../media-library/identity.js";
+import { canonicalizeDisplayTitle, inferMediaIdentity, normalizeTitleForIdentity } from "../media-library/identity.js";
 import { fetchMediaMetadata } from "../metadata/metadataService.js";
 import { completedPathToVfsPath, getNamingSettings, libraryPathFor } from "../naming/namingService.js";
 import { getPolicySettings } from "../policies/policyService.js";
@@ -17,17 +17,31 @@ function fallbackMediaTitle(value?: string | null) {
     .replace(/[._]+/g, " ")
     .replace(/\s+-\s+[A-Za-z0-9]+$/, "")
     .trim();
-  return cleaned || undefined;
+  return canonicalizeDisplayTitle(cleaned) || undefined;
 }
 
 function normalizeLookupTitle(value?: string | null) {
   if (!value) return undefined;
-  return value
+  return canonicalizeDisplayTitle(value)
     .replace(/\(\d{4}\)\s*$/g, "")
     .replace(/\($/g, "")
     .replace(/[._]+/g, " ")
     .replace(/\s+/g, " ")
     .trim() || undefined;
+}
+
+function lookupTitleVariants(value: string, year?: number | null) {
+  return new Set(
+    [
+      value,
+      canonicalizeDisplayTitle(value),
+      canonicalizeDisplayTitle(value, year),
+      normalizeLookupTitle(value)
+    ]
+      .filter((item): item is string => Boolean(item))
+      .map((item) => normalizeTitleForIdentity(item))
+      .filter(Boolean)
+  );
 }
 
 async function mediaFromImport(item: ImportItem) {
@@ -51,13 +65,21 @@ async function mediaFromImport(item: ImportItem) {
     : item.title;
   const media = {
     mediaType: shouldTrustDownloadIdentity && downloadIdentity?.mediaType !== "unknown" ? downloadIdentity?.mediaType ?? item.mediaType : item.mediaType,
-    title: titleFallback,
+    title: canonicalizeDisplayTitle(titleFallback, item.year),
     year: item.year ?? (inferredIdentity?.mediaType === "movie" ? inferredIdentity.year : undefined),
     season: item.season ?? (inferredIdentity?.mediaType === "tv" ? inferredIdentity.season : undefined),
     episode: item.episode ?? (inferredIdentity?.mediaType === "tv" ? inferredIdentity.episode : undefined),
     tmdbId: request?.tmdbId,
     tvdbId: request?.tvdbId
   };
+
+  const knownMetadata = await findKnownMetadataForMedia(media);
+  if (knownMetadata) {
+    media.title = knownMetadata.title ?? media.title;
+    media.year = media.year ?? knownMetadata.year ?? undefined;
+    media.tmdbId = media.tmdbId ?? knownMetadata.tmdbId;
+    media.tvdbId = media.tvdbId ?? knownMetadata.tvdbId;
+  }
 
   const needsMetadata = !media.year || (media.mediaType === "movie" ? !media.tmdbId : !media.tvdbId);
   if (!needsMetadata) return media;
@@ -83,7 +105,8 @@ async function mediaFromImport(item: ImportItem) {
         where: { id: item.id },
         data: {
           mediaType: media.mediaType,
-          title: titleFallback,
+          title: media.title,
+          year: media.year,
           season: media.season,
           episode: media.episode
         }
@@ -94,7 +117,7 @@ async function mediaFromImport(item: ImportItem) {
 
   const nextMedia = {
     ...media,
-    title: metadata.title ?? media.title,
+    title: canonicalizeDisplayTitle(metadata.title ?? media.title, metadata.year ?? media.year),
     year: metadata.year ?? media.year,
     tmdbId: media.tmdbId ?? metadata.tmdbId,
     tvdbId: media.tvdbId ?? metadata.tvdbId
@@ -114,11 +137,55 @@ async function mediaFromImport(item: ImportItem) {
   return nextMedia;
 }
 
+async function findKnownMetadataForMedia(media: {
+  mediaType: string;
+  title: string;
+  year?: number | null;
+  tmdbId?: string | null;
+  tvdbId?: string | null;
+}) {
+  if (media.tmdbId || media.tvdbId || !media.title) return null;
+  const normalizedTitles = lookupTitleVariants(media.title, media.year);
+  const [libraryCandidates, requestCandidates] = await Promise.all([
+    prisma.mediaLibraryItem.findMany({
+      where: {
+        mediaType: media.mediaType,
+        year: media.year ?? undefined,
+        OR: [{ tmdbId: { not: null } }, { tvdbId: { not: null } }]
+      },
+      select: { title: true, year: true, tmdbId: true, tvdbId: true }
+    }),
+    prisma.mediaRequest.findMany({
+      where: {
+        mediaType: media.mediaType,
+        year: media.year ?? undefined,
+        OR: [{ tmdbId: { not: null } }, { tvdbId: { not: null } }]
+      },
+      select: { title: true, year: true, tmdbId: true, tvdbId: true }
+    })
+  ]);
+  const match = [...libraryCandidates, ...requestCandidates].find((candidate) =>
+    [...lookupTitleVariants(candidate.title, candidate.year)].some((title) => normalizedTitles.has(title))
+  );
+  return match ?? null;
+}
+
 async function removeExisting(path: string) {
   try {
-    await unlink(path);
+    await rm(path, { force: true, recursive: true });
   } catch {
     // Missing paths are fine; mismatched existing files get replaced by the selected strategy.
+  }
+}
+
+async function pruneEmptyParents(startPath: string, rootPath: string) {
+  let current = dirname(startPath);
+  const normalizedRoot = rootPath.replace(/\/+$/, "");
+  while (current.startsWith(normalizedRoot) && current !== normalizedRoot) {
+    const remaining = await readdir(current).catch(() => null);
+    if (!remaining || remaining.length > 0) break;
+    await rmdir(current).catch(() => undefined);
+    current = dirname(current);
   }
 }
 
@@ -142,17 +209,37 @@ function sourcePathForImport(item: ImportItem) {
 async function stagedSourcePathForImport(item: ImportItem) {
   const sourcePath = sourcePathForImport(item);
   const ext = extname(item.completedPath) || ".mkv";
-  const stagedPath = join(env.VFS_COMPLETED_DIR, ".staging", "imports", `${item.id}${ext}`);
+  const stagedPath = join(dirname(env.MEDIA_SYMLINKS_DIR), "completed", ".staging", "imports", `${item.id}${ext}`);
   await mkdir(dirname(stagedPath), { recursive: true });
-  try {
-    const existing = await readlink(stagedPath);
-    if (existing === sourcePath) return stagedPath;
-    await unlink(stagedPath);
-  } catch {
-    await removeExisting(stagedPath);
-  }
-  await symlink(sourcePath, stagedPath);
+  await ensureSymlinkTarget(stagedPath, relative(dirname(stagedPath), sourcePath));
   return stagedPath;
+}
+
+async function ensureSymlinkTarget(linkPath: string, target: string) {
+  for (let attempt = 0; attempt < 3; attempt += 1) {
+    const existing = await currentSymlinkTarget(linkPath);
+    if (existing === target) return;
+    if (existing !== null) await removeExisting(linkPath);
+    try {
+      await symlink(target, linkPath);
+      return;
+    } catch (error) {
+      if (!(error instanceof Error) || !/EEXIST/i.test(error.message)) throw error;
+    }
+  }
+  const existing = await currentSymlinkTarget(linkPath);
+  if (existing === target) return;
+  throw new Error(`could not converge symlink target for ${linkPath}`);
+}
+
+async function currentSymlinkTarget(path: string) {
+  try {
+    const stats = await lstat(path);
+    if (!stats.isSymbolicLink()) return "__non_symlink__";
+    return await readlink(path);
+  } catch {
+    return null;
+  }
 }
 
 function plexLog(level: "info" | "warn", message: string, fields: Record<string, unknown>) {
@@ -178,7 +265,10 @@ function validateMediaForLibraryPath(item: ImportItem, media: Awaited<ReturnType
   }
 }
 
-export async function createLibraryEntryForImport(item: ImportItem) {
+export async function createLibraryEntryForImport(
+  item: ImportItem,
+  options?: { refreshPlex?: boolean; changedPaths?: Set<string> }
+) {
   const policies = await getPolicySettings();
   const naming = await getNamingSettings();
   const strategy = policies.importStrategy;
@@ -186,6 +276,7 @@ export async function createLibraryEntryForImport(item: ImportItem) {
   validateMediaForLibraryPath(item, media);
   const linkPath = libraryPathFor({ media, completedPath: item.completedPath, naming, strategy });
   await mkdir(dirname(linkPath), { recursive: true });
+  const existingLink = await prisma.symlink.findUnique({ where: { linkPath } }).catch(() => null);
 
   const staleLinks = await prisma.symlink.findMany({
     where: {
@@ -193,32 +284,45 @@ export async function createLibraryEntryForImport(item: ImportItem) {
       NOT: { linkPath }
     }
   });
+  let refreshRequired = staleLinks.length > 0;
   for (const stale of staleLinks) {
     await unlink(stale.linkPath).catch(() => undefined);
+    await pruneEmptyParents(stale.linkPath, item.mediaType === "tv" ? env.MEDIA_TV_DIR : env.MEDIA_MOVIES_DIR);
     await prisma.symlink.delete({ where: { id: stale.id } }).catch(() => undefined);
   }
 
   let persistedSourcePath = sourcePathForImport(item);
   if (strategy === "copy") {
     if (item.completedPath.startsWith("/mounted/")) throw new Error("mounted streaming imports cannot use copy strategy");
+    const existed = await lstat(linkPath).then((stats) => stats.isFile()).catch(() => false);
+    refreshRequired = refreshRequired
+      || !existed
+      || existingLink?.sourcePath !== persistedSourcePath
+      || existingLink?.importId !== item.id
+      || existingLink?.status !== strategy;
     await removeExisting(linkPath);
     await copyFile(item.completedPath, linkPath);
   } else if (strategy === "strm") {
+    const nextContents = strmContents(item);
+    const contents = await readFile(linkPath, "utf8").catch(() => null);
+    refreshRequired = refreshRequired
+      || contents !== nextContents
+      || existingLink?.sourcePath !== persistedSourcePath
+      || existingLink?.importId !== item.id
+      || existingLink?.status !== strategy;
     await removeExisting(linkPath);
-    await writeFile(linkPath, strmContents(item));
+    await writeFile(linkPath, nextContents);
   } else {
     const sourcePath = await stagedSourcePathForImport(item);
     persistedSourcePath = sourcePath;
-    try {
-      const existing = await readlink(linkPath);
-      if (existing !== sourcePath) {
-        await unlink(linkPath);
-        await symlink(sourcePath, linkPath);
-      }
-    } catch {
-      await removeExisting(linkPath);
-      await symlink(sourcePath, linkPath);
-    }
+    const target = relative(dirname(linkPath), sourcePath);
+    const existingTarget = await currentSymlinkTarget(linkPath);
+    refreshRequired = refreshRequired
+      || existingTarget !== target
+      || existingLink?.sourcePath !== persistedSourcePath
+      || existingLink?.importId !== item.id
+      || existingLink?.status !== strategy;
+    await ensureSymlinkTarget(linkPath, target);
   }
 
   const link = await prisma.symlink.upsert({
@@ -226,12 +330,15 @@ export async function createLibraryEntryForImport(item: ImportItem) {
     update: { sourcePath: persistedSourcePath, importId: item.id, status: strategy },
     create: { sourcePath: persistedSourcePath, linkPath, importId: item.id, status: strategy }
   });
-  void refreshPlexPath(link.linkPath)
-    .then((result) => {
-      if (!result.skipped) plexLog("info", "plex targeted refresh triggered", result);
-      else if (result.reason !== "not_configured" && result.reason !== "deduped") plexLog("warn", "plex targeted refresh skipped", result);
-    })
-    .catch((error) => plexLog("warn", "plex targeted refresh failed", { error: error instanceof Error ? error.message : error }));
+  if (refreshRequired) options?.changedPaths?.add(link.linkPath);
+  if ((options?.refreshPlex ?? true) && refreshRequired) {
+    void refreshPlexPath(link.linkPath)
+      .then((result) => {
+        if (!result.skipped) plexLog("info", "plex targeted refresh triggered", result);
+        else if (result.reason !== "not_configured" && result.reason !== "deduped") plexLog("warn", "plex targeted refresh skipped", result);
+      })
+      .catch((error) => plexLog("warn", "plex targeted refresh failed", { error: error instanceof Error ? error.message : error }));
+  }
   return link;
 }
 
@@ -258,7 +365,7 @@ export async function listSymlinks() {
 export async function repairSymlinks() {
   const imports = await prisma.importItem.findMany();
   const repaired = [];
-  for (const item of imports) repaired.push(await createLibraryEntryForImport(item));
+  for (const item of imports) repaired.push(await createLibraryEntryForImport(item, { refreshPlex: false }));
   return { repaired: repaired.length };
 }
 

@@ -14,6 +14,7 @@ import { humanizeDownloadError } from "../downloads/presentation.js";
 import { getAllowedDownloadConnections } from "../bandwidth/bandwidthScheduler.js";
 import { env } from "../config/env.js";
 import { classifyQueueDecisionKey, getPolicySettings, getQueueDecisionAction } from "../policies/policyService.js";
+import { getFuseMountStatus } from "../vfs/fuseMountService.js";
 
 let workers: Worker[] = [];
 let activeDownloadJobs = 0;
@@ -488,6 +489,7 @@ export async function recoverStaleActiveDownloadJobs(logger: FastifyBaseLogger) 
 }
 
 export async function reconcileAvailableDownloadsWithoutImports(logger: FastifyBaseLogger) {
+  const fuseStatus = getFuseMountStatus();
   const candidates = await prisma.download.findMany({
     where: {
       status: { in: ["available", "completed", "prepared"] },
@@ -514,6 +516,10 @@ export async function reconcileAvailableDownloadsWithoutImports(logger: FastifyB
     try {
       const importMode = await getNzbImportMode(download.nzbDocumentId);
       if (importMode === "mounted") {
+        if (env.FUSE_MOUNT_ENABLED && !fuseStatus.mounted) {
+          logger.warn({ downloadId: download.id, fusePath: fuseStatus.path, fuseError: fuseStatus.error }, "skipping mounted import reconcile because FUSE mount is unavailable");
+          continue;
+        }
         await makeMountedDownloadAvailable({
           downloadId: download.id,
           requestId: linkedRequest?.id

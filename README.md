@@ -6,7 +6,7 @@ Drakkar coordinates request sync, NZB search, download queueing, FUSE-mounted me
 
 ## Highlights
 
-- Fastify API with OpenAPI docs
+- Fastify API with GraphQL + REST
 - PostgreSQL via Prisma
 - Valkey for queueing and distributed cache
 - Native FUSE mount support
@@ -42,13 +42,22 @@ FUSE is mounted under `/mnt`, so Plex/Jellyfin/Emby can point at `/mnt/media`.
 Prepare the host mount once per boot:
 
 ```bash
-sudo mkdir -p /mnt
-sudo mount --bind /mnt /mnt
-sudo mount --make-rshared /mnt
-findmnt -T /mnt -o TARGET,PROPAGATION
+sudo mkdir -p /mnt/drakkar
+sudo mount --bind /mnt/drakkar /mnt/drakkar
+sudo mount --make-rshared /mnt/drakkar
+findmnt -T /mnt/drakkar -o TARGET,PROPAGATION
 ```
 
 Expected propagation: `shared` or `rshared`.
+
+For persistent boot setup, use the shipped [drakkar-mount.service](drakkar-mount.service) example and the install steps in [docs/installation.md](docs/installation.md).
+
+Valkey host tuning:
+
+```bash
+echo "vm.overcommit_memory = 1" | sudo tee /etc/sysctl.d/99-valkey.conf
+sudo sysctl -p /etc/sysctl.d/99-valkey.conf
+```
 
 ## Development
 
@@ -74,18 +83,19 @@ Build image:
 docker build -t drakkar-backend:latest .
 ```
 
-The deployment compose file lives in the root project. Public images are published to:
+Deployment compose file:
+
+- [docker-compose.yml](docker-compose.yml)
+
+Public images are published to:
 
 - `ghcr.io/hjongedijk/drakkar-backend`
+- `ghcr.io/hjongedijk/drakkar-frontend`
 
 ## Authentication
 
-The backend seeds an initial local admin account on first boot:
-
-- username: `admin`
-- password: `password1234`
-
-The frontend no longer prefills these credentials. Change the password after first login.
+There is no fixed default admin account anymore.
+On first boot the setup wizard opens before login and creates the first admin plus the main service credentials.
 
 ## API
 
@@ -93,6 +103,7 @@ Important endpoints:
 
 - `/health`
 - `/api/status`
+- `/api/graphql`
 - `/api/auth/login`
 - `/api/library`
 - `/api/downloads/queue`

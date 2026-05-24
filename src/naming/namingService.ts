@@ -2,6 +2,7 @@ import { extname, join, normalize, relative } from "node:path";
 import { z } from "zod";
 import { env } from "../config/env.js";
 import { prisma } from "../db/prisma.js";
+import { canonicalizeDisplayTitle } from "../media-library/identity.js";
 
 export const namingSettingsSchema = z.object({
   movieFolderFormat: z.string().min(1).default("{title} ({year}) {tmdb-{tmdbId}}"),
@@ -81,6 +82,7 @@ function tokenValue(media: NamingMedia, token: string, format?: string) {
   const value = media[token as keyof NamingMedia];
   if (typeof value === "number" && format === "00") return String(value).padStart(2, "0");
   if (value === undefined || value === null || value === "") return token === "year" ? "Unknown Year" : "Unknown";
+  if (token === "title") return canonicalizeDisplayTitle(String(value), media.year);
   return String(value);
 }
 

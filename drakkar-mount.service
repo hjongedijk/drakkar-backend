@@ -1,0 +1,19 @@
+[Unit]
+Description=Prepare Drakkar shared bind mount and Valkey host tuning
+After=local-fs.target
+Before=docker.service
+
+[Service]
+Type=oneshot
+ExecStartPre=/usr/bin/mkdir -p /mnt/drakkar
+ExecStartPre=/usr/bin/mkdir -p /mnt/drakkar/media/movies
+ExecStartPre=/usr/bin/mkdir -p /mnt/drakkar/media/tv
+ExecStartPre=/usr/bin/mkdir -p /mnt/drakkar/fuse
+ExecStartPre=/usr/bin/sh -c 'printf "%s\n" "vm.overcommit_memory = 1" > /etc/sysctl.d/99-valkey.conf'
+ExecStartPre=/usr/sbin/sysctl -p /etc/sysctl.d/99-valkey.conf
+ExecStart=/usr/bin/mount --bind /mnt/drakkar /mnt/drakkar
+ExecStart=/usr/bin/mount --make-rshared /mnt/drakkar
+RemainAfterExit=yes
+
+[Install]
+WantedBy=multi-user.target
