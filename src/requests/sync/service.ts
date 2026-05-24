@@ -250,10 +250,7 @@ export async function syncRequests(providerId?: string) {
           budgetExceeded = true;
           break;
         }
-        const hydratedBase = await enrichRequestMetadataFallback(request);
-        const hydrated = hydratedBase.mediaType === "tv"
-          ? await enrichTvRequestWithStructure(hydratedBase)
-          : hydratedBase;
+        const hydrated = await enrichRequestMetadataFallback(request);
         const { request: synced, action } = await upsertRequest(provider, hydrated);
         imported.push(synced);
         syncedRequests.push(synced);

@@ -49,7 +49,9 @@ function importStrategy(status?: string | null) {
 }
 
 function shouldHideLibraryItem(item: MediaLibraryItem) {
-  const suspiciousTitle = /&quot;|^\s*\d+\]\s*|^[a-z0-9]{20,}$/i.test(item.title);
+  const releaseStyleTitle = /\bS\d{1,2}E\d{1,3}(?:E\d{1,3}|[- .]E?\d{1,3})?\b/i.test(item.title)
+    && /\b(2160p|1080p|720p|web-?dl|webrip|bluray|h\.?264|x264|x265|hevc|ddp|dts)\b/i.test(item.title);
+  const suspiciousTitle = /&quot;|^\s*\d+\]\s*|^[a-z0-9]{20,}$/i.test(item.title) || releaseStyleTitle;
   const hasMetadata = Boolean(item.requestId || item.tmdbId || item.tvdbId || item.imdbId || item.posterUrl || item.backdropUrl);
   return item.sourceKey.startsWith("import:") && suspiciousTitle && !hasMetadata;
 }

@@ -48,10 +48,13 @@ export async function resolveImportMedia(item: ImportItem) {
   const request = item.requestId ? await prisma.mediaRequest.findUnique({ where: { id: item.requestId } }) : null;
   const download = item.downloadId ? await prisma.download.findUnique({ where: { id: item.downloadId } }) : null;
   const compactTitle = item.title.trim();
+  const releaseStyleTitle = /\bS\d{1,2}E\d{1,3}(?:E\d{1,3}|[- .]E?\d{1,3})?\b/i.test(item.title)
+    && /\b(2160p|1080p|720p|web-?dl|webrip|bluray|h\.?264|x264|x265|hevc|ddp|dts)\b/i.test(item.title);
   const suspiciousTitle = !item.title
     || /^[a-z0-9]+-[a-z0-9-]+$/i.test(item.title)
     || (/^[a-z0-9]{8,19}$/i.test(compactTitle) && /[a-z]/.test(compactTitle) && /[A-Z]/.test(compactTitle) && /\d/.test(compactTitle))
     || (!request && /^[a-z]{10,19}$/i.test(compactTitle) && /[a-z]/.test(compactTitle) && /[A-Z]/.test(compactTitle))
+    || releaseStyleTitle
     || /\($/.test(item.title.trim());
   const downloadIdentity = download?.title ? inferMediaIdentity(download.title) : null;
   const shouldTrustDownloadIdentity = suspiciousTitle

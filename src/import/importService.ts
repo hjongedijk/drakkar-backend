@@ -86,6 +86,7 @@ function suspiciousImportTitle(value: string) {
     || /^\s*\d+\]\s*/.test(value)
     || /^[a-z0-9]{20,}$/i.test(value)
     || (/^[a-z0-9]{8,19}$/i.test(compact) && /[a-z]/.test(compact) && /[A-Z]/.test(compact) && /\d/.test(compact))
+    || (/\bS\d{1,2}E\d{1,3}(?:E\d{1,3}|[- .]E?\d{1,3})?\b/i.test(value) && /\b(2160p|1080p|720p|web-?dl|webrip|bluray|h\.?264|x264|x265|hevc|ddp|dts)\b/i.test(value))
     || (/\bS\d{1,2}\s*-\s*\d{1,2}\b/i.test(value) && /\b(2160p|1080p|720p|web-?dl|webrip|bluray|h\.?264|x264|x265|hevc)\b/i.test(value))
     || /^[a-z0-9]+-[a-z0-9-]+$/i.test(value);
 }
