@@ -7,18 +7,20 @@ export type AuthUser = {
   username: string;
   displayName: string;
   isAdmin: boolean;
+  mustChangePassword: boolean;
 };
 
 function apiKeyHash(token: string) {
   return createHash("sha256").update(token).digest("hex");
 }
 
-function toAuthUser(user: { id: string; email: string; displayName: string | null; isAdmin: boolean }): AuthUser {
+function toAuthUser(user: { id: string; email: string; displayName: string | null; isAdmin: boolean; mustChangePassword: boolean }): AuthUser {
   return {
     id: user.id,
     username: user.email,
     displayName: user.displayName?.trim() || user.email,
-    isAdmin: user.isAdmin
+    isAdmin: user.isAdmin,
+    mustChangePassword: user.mustChangePassword
   };
 }
 
@@ -31,7 +33,7 @@ export async function countAdminUsers() {
   return prisma.user.count({ where: { isAdmin: true } });
 }
 
-export async function createInitialAdminUser(input: { username: string; displayName?: string; password: string }) {
+export async function createInitialAdminUser(input: { username: string; displayName?: string; password: string; mustChangePassword?: boolean }) {
   const username = input.username.trim();
   if (!username) throw new Error("username is required");
   if (input.password.length < 8) throw new Error("password must be at least 8 characters");
@@ -43,20 +45,17 @@ export async function createInitialAdminUser(input: { username: string; displayN
       email: username,
       displayName: input.displayName?.trim() || username,
       isAdmin: true,
+      mustChangePassword: Boolean(input.mustChangePassword),
       passwordHash: hashPassword(input.password)
     },
-    select: { id: true, email: true, displayName: true, isAdmin: true }
+    select: { id: true, email: true, displayName: true, isAdmin: true, mustChangePassword: true }
   });
   return toAuthUser(user);
 }
 
 export async function loginUser(username: string, password: string) {
   const normalized = username.trim();
-  const user = await prisma.user.findFirst({
-    where: {
-      OR: [{ email: normalized }, { displayName: normalized }]
-    }
-  });
+  const user = await prisma.user.findUnique({ where: { email: normalized } });
   if (!user || !verifyPassword(password, user.passwordHash)) return undefined;
   return toAuthUser(user);
 }
@@ -64,7 +63,7 @@ export async function loginUser(username: string, password: string) {
 export async function getAuthUserById(userId: string) {
   const user = await prisma.user.findUnique({
     where: { id: userId },
-    select: { id: true, email: true, displayName: true, isAdmin: true }
+    select: { id: true, email: true, displayName: true, isAdmin: true, mustChangePassword: true }
   });
   return user ? toAuthUser(user) : undefined;
 }
@@ -73,7 +72,7 @@ export async function getFirstAdminAuthUser() {
   const user = await prisma.user.findFirst({
     where: { isAdmin: true },
     orderBy: { createdAt: "asc" },
-    select: { id: true, email: true, displayName: true, isAdmin: true }
+    select: { id: true, email: true, displayName: true, isAdmin: true, mustChangePassword: true }
   });
   return user ? toAuthUser(user) : undefined;
 }
@@ -83,7 +82,7 @@ export async function getAuthUserByApiKey(token: string | undefined) {
   const keyHash = apiKeyHash(token);
   const apiKey = await prisma.apiKey.findFirst({
     where: { keyHash, revokedAt: null, userId: { not: null } },
-    include: { user: { select: { id: true, email: true, displayName: true, isAdmin: true } } }
+    include: { user: { select: { id: true, email: true, displayName: true, isAdmin: true, mustChangePassword: true } } }
   });
   if (!apiKey?.user) return undefined;
   await prisma.apiKey.update({
@@ -102,7 +101,7 @@ export async function updateCurrentUser(userId: string, input: { username: strin
       email: username,
       displayName: input.displayName?.trim() || username
     },
-    select: { id: true, email: true, displayName: true, isAdmin: true }
+    select: { id: true, email: true, displayName: true, isAdmin: true, mustChangePassword: true }
   });
   return toAuthUser(user);
 }
@@ -113,7 +112,7 @@ export async function changeCurrentUserPassword(userId: string, currentPassword:
   if (newPassword.length < 8) throw new Error("new password must be at least 8 characters");
   await prisma.user.update({
     where: { id: userId },
-    data: { passwordHash: hashPassword(newPassword) }
+    data: { passwordHash: hashPassword(newPassword), mustChangePassword: false }
   });
   return { ok: true };
 }

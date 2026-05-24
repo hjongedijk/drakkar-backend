@@ -56,8 +56,12 @@ export async function processingRoutes(app: FastifyInstance): Promise<void> {
   app.post("/api/symlinks/repair", async () => repairSymlinks());
   app.post("/api/symlinks/cleanup", async () => cleanupSymlinks());
 
-  app.get("/api/naming", async () => getNamingSettings());
-  app.put("/api/naming", async (request) => {
+  app.get("/api/naming", async (request, reply) => {
+    if (!request.authUser?.isAdmin) return reply.status(403).send({ message: "Admin access required." });
+    return getNamingSettings();
+  });
+  app.put("/api/naming", async (request, reply) => {
+    if (!request.authUser?.isAdmin) return reply.status(403).send({ message: "Admin access required." });
     const naming = await updateNamingSettings(request.body);
     await migrateImportsToCurrentNaming();
     await repairSymlinks();
@@ -65,5 +69,8 @@ export async function processingRoutes(app: FastifyInstance): Promise<void> {
     await refreshMediaLibrary();
     return naming;
   });
-  app.post("/api/naming/preview", async (request) => previewNaming(namingPreviewSchema.parse(request.body ?? {})));
+  app.post("/api/naming/preview", async (request, reply) => {
+    if (!request.authUser?.isAdmin) return reply.status(403).send({ message: "Admin access required." });
+    return previewNaming(namingPreviewSchema.parse(request.body ?? {}));
+  });
 }

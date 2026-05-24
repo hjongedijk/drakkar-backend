@@ -17,6 +17,7 @@ import { runBackgroundRepairSweep } from "../repair/repairService.js";
 import { runLogPruneCycle, runNzbhydraRssSyncCycle, runRequestSyncCycle } from "../requests/sync/scheduler.js";
 import { refreshMediaLibrary } from "../media-library/libraryService.js";
 import { cleanupSymlinks, pruneLibraryDirectories } from "../symlinks/symlinkService.js";
+import { normalizeNzbStoragePaths } from "../downloads/downloadService.js";
 import {
   reconcileAvailableDownloadsWithoutImports,
   reconcileDownloadQueueState,
@@ -66,8 +67,9 @@ export async function taskRoutes(app: FastifyInstance): Promise<void> {
         result = await runTrackedTask(id, async () => {
           const symlinkCleanup = await cleanupSymlinks();
           const pruned = await pruneLibraryDirectories();
+          const nzbPaths = await normalizeNzbStoragePaths();
           await refreshMediaLibrary();
-          return { symlinkCleanup, pruned };
+          return { symlinkCleanup, pruned, nzbPaths };
         });
         break;
       case LOG_PRUNE_TASK_ID:

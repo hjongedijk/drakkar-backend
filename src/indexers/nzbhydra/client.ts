@@ -10,6 +10,7 @@ import { parseNzbXml } from "../../nzb/parser.js";
 import { classifyNzbImportPlan } from "../../usenet/importMode.js";
 import { looksLikeArchiveRelease } from "../../releases/archiveHeuristics.js";
 import { assertServiceAllowed, guardedExternalCall, recordServiceFailure, recordServiceSuccess } from "../../services/serviceGuard.js";
+import { DRAKKAR_VERSION } from "../../version.js";
 
 export type SearchKind = "movie" | "tv" | "season" | "episode" | "manual" | "rss";
 
@@ -37,6 +38,16 @@ const MAX_TARGETED_SEARCH_RESULTS = 1000;
 const FEED_PAGE_LIMIT = 500;
 const NZBHYDRA_SERVICE = "nzbhydra2";
 const NZBHYDRA_GUARD_OPTIONS = { failureLimit: 10, cooldownSeconds: 60 };
+const DRAKKAR_USER_AGENT = `Drakkar/${DRAKKAR_VERSION} (NZBHydra2 client; +https://wiki.drakkar.botcontrol.nl/)`;
+
+function nzbhydraFetch(input: URL | string, timeoutMs: number) {
+  return fetch(input, {
+    signal: AbortSignal.timeout(timeoutMs),
+    headers: {
+      "user-agent": DRAKKAR_USER_AGENT
+    }
+  });
+}
 
 export function isNzbhydraConfigured(settings: AppSettings) {
   return Boolean(settings.nzbhydraUrl && settings.nzbhydraApiKey);
@@ -261,7 +272,7 @@ export async function testNzbhydraConnection(settings: AppSettings) {
   url.searchParams.set("t", "caps");
   url.searchParams.set("o", "xml");
   return guardedExternalCall(NZBHYDRA_SERVICE, isNzbhydraConfigured(settings), "NZBHydra2 is not configured; connection test skipped", async () => {
-    const response = await fetch(url, { signal: AbortSignal.timeout(settings.nzbhydraTimeoutMs) });
+    const response = await nzbhydraFetch(url, settings.nzbhydraTimeoutMs);
     return { ok: response.ok, status: response.status };
   }, NZBHYDRA_GUARD_OPTIONS);
 }
@@ -317,7 +328,7 @@ async function fetchPagedSearch(settings: AppSettings, params: SearchParams, pag
 
   while (releases.length < maxResults) {
     const url = await buildSearchUrl(settings, { ...params, limit: pageLimit, offset });
-    const response = await fetch(url, { signal: AbortSignal.timeout(settings.nzbhydraTimeoutMs) });
+    const response = await nzbhydraFetch(url, settings.nzbhydraTimeoutMs);
     if (!response.ok) {
       const mediaType = params.kind === "rss" ? `${params.categories?.join(",") ?? "feed"} update feed` : "search";
       throw new Error(`NZBHydra2 ${mediaType} failed with HTTP ${response.status}`);
@@ -400,7 +411,7 @@ async function fetchNzbForReleaseUncached(settings: AppSettings, release: Releas
   const url = await releaseDownloadUrl(settings, release);
   await incrementSearchMetric("nzbNetworkFetches");
   try {
-    const response = await fetch(url, { signal: AbortSignal.timeout(settings.nzbhydraTimeoutMs) });
+    const response = await nzbhydraFetch(url, settings.nzbhydraTimeoutMs);
     if (!response.ok) throw new Error(`NZB download failed with HTTP ${response.status}`);
 
     const bytes = Buffer.from(await response.arrayBuffer());

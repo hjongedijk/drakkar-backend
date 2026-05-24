@@ -1,11 +1,21 @@
 import { ensureRuntimeSettings } from "./runtimeSettings.js";
 import { prisma } from "../db/prisma.js";
-import { getSettings, updateSettings } from "../settings/settingsStore.js";
+import { getSettings, syncRuntimeSettingsFromDatabase, updateSettings } from "../settings/settingsStore.js";
+import { countAdminUsers, createInitialAdminUser } from "../auth/service.js";
 
 type Logger = { info: (input: unknown, msg?: string) => void; warn: (input: unknown, msg?: string) => void };
 
 function hasValue(value?: string | null) {
   return Boolean(value && value.trim());
+}
+
+function runtimeHasCompleteSetup(runtime: ReturnType<typeof ensureRuntimeSettings>) {
+  const hasUsenet = runtime.usenetProviders.some((item) => item.enabled && hasValue(item.name) && hasValue(item.host));
+  const hasRequestProvider = runtime.requestProviders.some((item) => item.enabled && hasValue(item.name) && hasValue(item.baseUrl) && hasValue(item.apiKey));
+  const hasNzbhydra = runtime.nzbhydra.enabled && hasValue(runtime.nzbhydra.url) && hasValue(runtime.nzbhydra.apiKey);
+  const hasMetadata = hasValue(runtime.metadata.tmdbApiKey) || hasValue(runtime.metadata.tvdbApiKey);
+  const hasPlex = runtime.plex.enabled && hasValue(runtime.plex.serverUrl) && hasValue(runtime.plex.token);
+  return hasUsenet && hasRequestProvider && hasNzbhydra && hasMetadata && hasPlex;
 }
 
 export async function bootstrapRuntimeConfiguredServices(log: Logger) {
@@ -78,5 +88,23 @@ export async function bootstrapRuntimeConfiguredServices(log: Logger) {
     requestProvidersSynced += 1;
   }
 
+  const setupCompletedRow = await prisma.setting.findUnique({ where: { key: "setup.completed" } });
+  const adminUsers = await countAdminUsers();
+  if (!setupCompletedRow?.value && adminUsers === 0 && runtimeHasCompleteSetup(runtime)) {
+    await createInitialAdminUser({
+      username: "admin",
+      displayName: "admin",
+      password: "password1234",
+      mustChangePassword: true
+    });
+    await prisma.setting.upsert({
+      where: { key: "setup.completed" },
+      update: { value: true },
+      create: { key: "setup.completed", value: true }
+    });
+    log.warn({ username: "admin" }, "default admin created from settings.json; change password on first login");
+  }
+
+  await syncRuntimeSettingsFromDatabase();
   log.info({ settingsFile: true, usenetProviders: usenetSynced, requestProviders: requestProvidersSynced, nzbhydra: Boolean(nzbhydra) }, "runtime settings.json synced");
 }

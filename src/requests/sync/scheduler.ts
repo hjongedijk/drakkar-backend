@@ -6,7 +6,13 @@ import { pruneLogData } from "../../logs/logPruneService.js";
 import { getSettings } from "../../settings/settingsStore.js";
 import { LOG_PRUNE_INTERVAL_MS, LOG_PRUNE_TASK_ID, NZBHYDRA_RSS_SYNC_INTERVAL_MS, NZBHYDRA_RSS_SYNC_TASK_ID, REQUEST_SYNC_INTERVAL_MS, REQUEST_SYNC_TASK_ID, registerCoreTasks } from "../../tasks/coreTasks.js";
 import { runTrackedTask, setTaskNextRun } from "../../tasks/taskRegistry.js";
-import { ensureMonitoredRequests, recoverFailedRequestDownloads, syncRequests } from "./service.js";
+import {
+  backfillPlaceholderRequestMetadata,
+  ensureMonitoredRequests,
+  recoverFailedRequestDownloads,
+  recoverSelectedReleaseDownloads,
+  syncRequests
+} from "./service.js";
 
 let timer: NodeJS.Timeout | undefined;
 let initialTimer: NodeJS.Timeout | undefined;
@@ -15,12 +21,24 @@ let rssInitialTimer: NodeJS.Timeout | undefined;
 let logPruneTimer: NodeJS.Timeout | undefined;
 let logPruneInitialTimer: NodeJS.Timeout | undefined;
 let running = false;
+let runningStartedAt = 0;
 let rssRunning = false;
+let rssRunningStartedAt = 0;
 let logPruneRunning = false;
+let logPruneRunningStartedAt = 0;
+const STALE_SCHEDULER_GUARD_MS = 15 * 60_000;
+
+function schedulerFlagIsStale(startedAt: number) {
+  return startedAt > 0 && Date.now() - startedAt > STALE_SCHEDULER_GUARD_MS;
+}
 
 export async function runLogPruneCycle(logger: FastifyBaseLogger) {
-  if (logPruneRunning) return;
+  if (logPruneRunning && !schedulerFlagIsStale(logPruneRunningStartedAt)) return;
+  if (logPruneRunning && schedulerFlagIsStale(logPruneRunningStartedAt)) {
+    logger.warn({ task: LOG_PRUNE_TASK_ID }, "recovered stale in-memory scheduler lock");
+  }
   logPruneRunning = true;
+  logPruneRunningStartedAt = Date.now();
   try {
     await runTrackedTask(LOG_PRUNE_TASK_ID, async () => {
       const result = await pruneLogData();
@@ -31,13 +49,18 @@ export async function runLogPruneCycle(logger: FastifyBaseLogger) {
     logger.warn({ err: error }, "log prune failed");
   } finally {
     logPruneRunning = false;
+    logPruneRunningStartedAt = 0;
     setTaskNextRun(LOG_PRUNE_TASK_ID, new Date(Date.now() + LOG_PRUNE_INTERVAL_MS));
   }
 }
 
 export async function runNzbhydraRssSyncCycle(logger: FastifyBaseLogger) {
-  if (rssRunning) return;
+  if (rssRunning && !schedulerFlagIsStale(rssRunningStartedAt)) return;
+  if (rssRunning && schedulerFlagIsStale(rssRunningStartedAt)) {
+    logger.warn({ task: NZBHYDRA_RSS_SYNC_TASK_ID }, "recovered stale in-memory scheduler lock");
+  }
   rssRunning = true;
+  rssRunningStartedAt = Date.now();
   try {
     await runTrackedTask(NZBHYDRA_RSS_SYNC_TASK_ID, async () => {
       const result = await refreshNzbhydraUpdateFeeds(await getSettings());
@@ -48,13 +71,18 @@ export async function runNzbhydraRssSyncCycle(logger: FastifyBaseLogger) {
     logger.warn({ err: error }, "nzbhydra rss/update sync failed");
   } finally {
     rssRunning = false;
+    rssRunningStartedAt = 0;
     setTaskNextRun(NZBHYDRA_RSS_SYNC_TASK_ID, new Date(Date.now() + NZBHYDRA_RSS_SYNC_INTERVAL_MS));
   }
 }
 
 export async function runRequestSyncCycle(logger: FastifyBaseLogger) {
-  if (running) return;
+  if (running && !schedulerFlagIsStale(runningStartedAt)) return;
+  if (running && schedulerFlagIsStale(runningStartedAt)) {
+    logger.warn({ task: REQUEST_SYNC_TASK_ID }, "recovered stale in-memory scheduler lock");
+  }
   running = true;
+  runningStartedAt = Date.now();
   try {
     await runTrackedTask(REQUEST_SYNC_TASK_ID, async () => {
       const sync = await syncRequests();
@@ -78,6 +106,14 @@ export async function runRequestSyncCycle(logger: FastifyBaseLogger) {
         logger.info(importReconcile, "stale prepared/available imports reconciled");
       }
       await recoverFailedRequestDownloads();
+      const selectedReleaseRecovery = await recoverSelectedReleaseDownloads();
+      if (selectedReleaseRecovery.recovered > 0) {
+        logger.info({ recovered: selectedReleaseRecovery.recovered }, "selected releases without downloads were re-queued");
+      }
+      const metadataBackfill = await backfillPlaceholderRequestMetadata();
+      if (metadataBackfill.updated > 0) {
+        logger.info(metadataBackfill, "placeholder request titles backfilled from metadata");
+      }
       const monitored = await ensureMonitoredRequests();
       if (monitored.retried > 0 || monitored.skippedBecauseQueueFull > 0) {
         logger.info({
@@ -95,6 +131,7 @@ export async function runRequestSyncCycle(logger: FastifyBaseLogger) {
     logger.warn({ err: error }, "request sync/recovery failed");
   } finally {
     running = false;
+    runningStartedAt = 0;
     setTaskNextRun(REQUEST_SYNC_TASK_ID, new Date(Date.now() + REQUEST_SYNC_INTERVAL_MS));
   }
 }

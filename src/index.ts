@@ -20,6 +20,7 @@ import { startBackgroundRepairSchedule, stopBackgroundRepairSchedule } from "./r
 import { bootstrapDevelopmentTestConnectionData } from "./dev/testConnectionData.js";
 import { bootstrapRuntimeConfiguredServices } from "./config/runtimeConfigBootstrap.js";
 import { pruneLibraryDirectories } from "./symlinks/symlinkService.js";
+import { normalizeNzbStoragePaths } from "./downloads/downloadService.js";
 import { refreshPlexPath } from "./plex/plexService.js";
 import {
   IMPORT_RECONCILE_TASK_ID,
@@ -82,6 +83,10 @@ try {
         () => migrateImportsToCurrentNaming({ refreshPlex: false, changedPaths: startupPlexRefreshPaths })
       );
       markTaskCompleted(NAMING_MIGRATION_TASK_ID);
+      const nzbPathNormalization = await normalizeNzbStoragePaths();
+      if (nzbPathNormalization.updated > 0 || nzbPathNormalization.moved > 0 || nzbPathNormalization.cleanedLegacy > 0) {
+        app.log.info({ nzbPathNormalization }, "legacy nzb storage paths normalized");
+      }
       if (namingMigration && (namingMigration.moved > 0 || namingMigration.relinked > 0 || namingMigration.skipped > 0)) {
         app.log.info({ namingMigration }, "library naming migration completed");
       }

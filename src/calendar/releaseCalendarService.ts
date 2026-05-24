@@ -28,6 +28,33 @@ export type ReleaseCalendarResponse = {
   entries: ReleaseCalendarEntry[];
 };
 
+type TrackedSeries = {
+  key: string;
+  title: string;
+  year?: number;
+  tmdbId?: string;
+  tvdbId?: string;
+  imdbId?: string;
+  seasonNumbers: Set<number>;
+};
+
+type TrackedMovie = {
+  key: string;
+  title: string;
+  year?: number;
+  tmdbId?: string;
+  tvdbId?: string;
+  imdbId?: string;
+};
+
+type KnownEpisode = {
+  releaseDate: string;
+  entry: ReleaseCalendarEntry;
+};
+
+const CALENDAR_CACHE_TTL_SECONDS = 6 * 60 * 60;
+const CALENDAR_FETCH_CONCURRENCY = 8;
+
 function monthRange(month?: string) {
   const match = month?.match(/^(\d{4})-(\d{2})$/);
   const now = new Date();
@@ -45,17 +72,6 @@ function monthRange(month?: string) {
 function toIsoDate(date: Date) {
   return date.toISOString().slice(0, 10);
 }
-
-type TrackedSeries = {
-  key: string;
-  title: string;
-  year?: number;
-  tmdbId?: string;
-  tvdbId?: string;
-  imdbId?: string;
-  requestId?: string;
-  seasonNumbers: Set<number>;
-};
 
 function trackedKey(input: { mediaType: "movie" | "tv"; tmdbId?: string | null; tvdbId?: string | null; imdbId?: string | null; title: string; year?: number | null }) {
   if (input.imdbId) return `${input.mediaType}:imdb:${input.imdbId}`;
@@ -79,49 +95,129 @@ function shouldHideLibraryItem(input: {
   return input.sourceKey.startsWith("import:") && suspiciousTitle && !hasMetadata;
 }
 
+async function mapWithConcurrency<T, R>(input: T[], concurrency: number, worker: (value: T, index: number) => Promise<R>) {
+  const limit = Math.max(1, Math.min(concurrency, input.length || 1));
+  const results = new Array<R>(input.length);
+  let cursor = 0;
+  const runners = Array.from({ length: limit }, async () => {
+    while (cursor < input.length) {
+      const index = cursor;
+      const value = input[index];
+      cursor += 1;
+      results[index] = await worker(value as T, index);
+    }
+  });
+  await Promise.all(runners);
+  return results;
+}
+
+function isDefined<T>(value: T | null | undefined): value is T {
+  return value !== null && value !== undefined;
+}
+
+function recordMovie(movieMap: Map<string, TrackedMovie>, item: { title: string; year?: number | null; tmdbId?: string | null; tvdbId?: string | null; imdbId?: string | null }) {
+  const key = trackedKey({ mediaType: "movie", ...item });
+  if (!movieMap.has(key)) {
+    movieMap.set(key, {
+      key,
+      title: item.title,
+      year: item.year ?? undefined,
+      tmdbId: item.tmdbId ?? undefined,
+      tvdbId: item.tvdbId ?? undefined,
+      imdbId: item.imdbId ?? undefined
+    });
+  }
+}
+
+function recordSeries(seriesMap: Map<string, TrackedSeries>, item: { title: string; year?: number | null; tmdbId?: string | null; tvdbId?: string | null; imdbId?: string | null; season?: number | null }) {
+  const key = trackedKey({ mediaType: "tv", ...item });
+  const tracked = seriesMap.get(key) ?? {
+    key,
+    title: item.title,
+    year: item.year ?? undefined,
+    tmdbId: item.tmdbId ?? undefined,
+    tvdbId: item.tvdbId ?? undefined,
+    imdbId: item.imdbId ?? undefined,
+    seasonNumbers: new Set<number>()
+  };
+  if (typeof item.season === "number" && item.season > 0) tracked.seasonNumbers.add(item.season);
+  seriesMap.set(key, tracked);
+}
+
+function knownEpisodeKey(entry: Pick<ReleaseCalendarEntry, "seriesTitle" | "tmdbId" | "tvdbId" | "title" | "releaseDate" | "seasonNumber" | "episodeNumber">) {
+  return `${entry.tmdbId ?? entry.tvdbId ?? entry.seriesTitle ?? entry.title}:${entry.releaseDate}:${entry.seasonNumber ?? ""}:${entry.episodeNumber ?? ""}`;
+}
+
 export async function fetchReleaseCalendar(month?: string): Promise<ReleaseCalendarResponse> {
   const range = monthRange(month);
-  const cacheKey = `release-calendar:v3:${range.month}`;
-  const cached = await redis.get(cacheKey);
+  const cacheKey = `release-calendar:v4:${range.month}`;
+  const cached = await redis.get(cacheKey).catch(() => null);
   if (cached) return JSON.parse(cached) as ReleaseCalendarResponse;
 
   const settings = await getSettings();
   const startDate = toIsoDate(range.start);
   const endDate = toIsoDate(range.end);
 
-  const libraryItems = (await prisma.mediaLibraryItem.findMany({
-    where: {
-      OR: [{ sourceKey: { startsWith: "import:" } }, { sourceKey: { startsWith: "request:" } }]
-    },
-    orderBy: { title: "asc" }
-  })).filter((item) => !shouldHideLibraryItem(item));
+  const [libraryItems, requests] = await Promise.all([
+    prisma.mediaLibraryItem.findMany({
+      where: {
+        OR: [{ sourceKey: { startsWith: "import:" } }, { sourceKey: { startsWith: "request:" } }]
+      },
+      orderBy: { title: "asc" }
+    }),
+    prisma.mediaRequest.findMany({
+      where: {
+        status: { not: "rejected" }
+      },
+      orderBy: { title: "asc" }
+    })
+  ]);
 
-  const movieMap = new Map<string, { title: string; year?: number; tmdbId?: string; tvdbId?: string; imdbId?: string }>();
+  const movieMap = new Map<string, TrackedMovie>();
   const seriesMap = new Map<string, TrackedSeries>();
+  const knownEpisodes = new Map<string, KnownEpisode>();
 
   for (const item of libraryItems) {
-    const key = trackedKey(item as { mediaType: "movie" | "tv"; tmdbId?: string | null; tvdbId?: string | null; imdbId?: string | null; title: string; year?: number | null });
+    if (shouldHideLibraryItem(item)) continue;
     if (item.mediaType === "movie") {
-      if (!movieMap.has(key)) movieMap.set(key, { title: item.title, year: item.year ?? undefined, tmdbId: item.tmdbId ?? undefined, tvdbId: item.tvdbId ?? undefined, imdbId: item.imdbId ?? undefined });
+      recordMovie(movieMap, item);
       continue;
     }
-    const tracked = seriesMap.get(key) ?? {
-      key,
-      title: item.title,
-      year: item.year ?? undefined,
-      tmdbId: item.tmdbId ?? undefined,
-      tvdbId: item.tvdbId ?? undefined,
-      imdbId: item.imdbId ?? undefined,
-      requestId: item.requestId ?? undefined,
-      seasonNumbers: new Set<number>()
-    };
-    if (typeof item.season === "number" && item.season > 0) tracked.seasonNumbers.add(item.season);
-    seriesMap.set(key, tracked);
+
+    recordSeries(seriesMap, item);
+
+    if (item.episodeAirDate && typeof item.season === "number" && typeof item.episode === "number") {
+      const releaseDate = toIsoDate(item.episodeAirDate);
+      if (releaseDate >= startDate && releaseDate <= endDate) {
+        const entry: ReleaseCalendarEntry = {
+          id: `episode:${item.sourceKey}`,
+          type: "episode",
+          title: item.episodeTitle || `${item.title} S${String(item.season).padStart(2, "0")}E${String(item.episode).padStart(2, "0")}`,
+          releaseDate,
+          overview: item.episodeOverview ?? item.overview ?? undefined,
+          mediaType: "tv",
+          year: item.year ?? undefined,
+          tmdbId: item.tmdbId ?? undefined,
+          tvdbId: item.tvdbId ?? undefined,
+          imdbId: item.imdbId ?? undefined,
+          seriesTitle: item.title,
+          seasonNumber: item.season,
+          episodeNumber: item.episode
+        };
+        knownEpisodes.set(knownEpisodeKey(entry), { releaseDate, entry });
+      }
+    }
   }
 
-  const entries: ReleaseCalendarEntry[] = [];
+  for (const request of requests) {
+    if (request.mediaType === "movie") {
+      recordMovie(movieMap, request);
+      continue;
+    }
+    recordSeries(seriesMap, request);
+  }
 
-  for (const trackedMovie of movieMap.values()) {
+  const movieEntries = (await mapWithConcurrency<TrackedMovie, ReleaseCalendarEntry | null>([...movieMap.values()], CALENDAR_FETCH_CONCURRENCY, async (trackedMovie) => {
     const info = await fetchCalendarMediaInfo(settings, {
       mediaType: "movie",
       title: trackedMovie.title,
@@ -131,8 +227,8 @@ export async function fetchReleaseCalendar(month?: string): Promise<ReleaseCalen
       imdbId: trackedMovie.imdbId
     }).catch(() => undefined);
     const releaseDate = info?.releaseDate?.slice(0, 10);
-    if (!releaseDate || releaseDate < startDate || releaseDate > endDate) continue;
-    entries.push({
+    if (!releaseDate || releaseDate < startDate || releaseDate > endDate) return null;
+    return {
       id: `movie:${info?.tmdbId ?? trackedMovie.title}:${releaseDate}`,
       type: "movie",
       title: info?.title ?? trackedMovie.title,
@@ -143,10 +239,11 @@ export async function fetchReleaseCalendar(month?: string): Promise<ReleaseCalen
       tmdbId: info?.tmdbId ?? trackedMovie.tmdbId,
       tvdbId: info?.tvdbId ?? trackedMovie.tvdbId,
       imdbId: info?.imdbId ?? trackedMovie.imdbId
-    });
-  }
+    };
+  })).filter(isDefined);
 
-  for (const tracked of seriesMap.values()) {
+  const showAndEpisodeEntries = (await mapWithConcurrency([...seriesMap.values()], CALENDAR_FETCH_CONCURRENCY, async (tracked) => {
+    const entries: ReleaseCalendarEntry[] = [];
     const info = await fetchCalendarMediaInfo(settings, {
       mediaType: "tv",
       title: tracked.title,
@@ -155,6 +252,7 @@ export async function fetchReleaseCalendar(month?: string): Promise<ReleaseCalen
       tvdbId: tracked.tvdbId,
       imdbId: tracked.imdbId
     }).catch(() => undefined);
+
     const showReleaseDate = info?.releaseDate?.slice(0, 10);
     if (showReleaseDate && showReleaseDate >= startDate && showReleaseDate <= endDate) {
       entries.push({
@@ -179,21 +277,25 @@ export async function fetchReleaseCalendar(month?: string): Promise<ReleaseCalen
       tvdbId: info?.tvdbId ?? tracked.tvdbId,
       imdbId: info?.imdbId ?? tracked.imdbId
     }).catch(() => undefined);
-    if (!structure?.tmdbId) continue;
+    if (!structure?.tmdbId) return entries;
 
     const seasonNumbers = tracked.seasonNumbers.size > 0
       ? [...tracked.seasonNumbers]
       : structure.seasons.map((season) => season.seasonNumber).filter((season) => season > 0);
 
-    for (const seasonNumber of seasonNumbers) {
-      const episodes = await fetchSeasonEpisodes(settings, structure.tmdbId, seasonNumber).catch(() => []);
-      for (const episode of episodes) {
+    const seasons = await mapWithConcurrency(seasonNumbers, 4, async (seasonNumber) => {
+      const episodes = await fetchSeasonEpisodes(settings, structure.tmdbId as string, seasonNumber).catch(() => []);
+      return { seasonNumber, episodes };
+    });
+
+    for (const season of seasons) {
+      for (const episode of season.episodes) {
         const airDate = episode.airDate?.slice(0, 10);
         if (!airDate || airDate < startDate || airDate > endDate) continue;
-        entries.push({
-          id: `episode:${tracked.key}:${seasonNumber}:${episode.episodeNumber}`,
+        const entry: ReleaseCalendarEntry = {
+          id: `episode:${tracked.key}:${season.seasonNumber}:${episode.episodeNumber}`,
           type: "episode",
-          title: episode.name || `${tracked.title} S${String(seasonNumber).padStart(2, "0")}E${String(episode.episodeNumber).padStart(2, "0")}`,
+          title: episode.name || `${tracked.title} S${String(season.seasonNumber).padStart(2, "0")}E${String(episode.episodeNumber).padStart(2, "0")}`,
           releaseDate: airDate,
           overview: episode.overview,
           mediaType: "tv",
@@ -202,16 +304,24 @@ export async function fetchReleaseCalendar(month?: string): Promise<ReleaseCalen
           tvdbId: info?.tvdbId ?? tracked.tvdbId ?? structure.tvdbId,
           imdbId: info?.imdbId ?? tracked.imdbId,
           seriesTitle: tracked.title,
-          seasonNumber,
+          seasonNumber: season.seasonNumber,
           episodeNumber: episode.episodeNumber
-        });
+        };
+        if (!knownEpisodes.has(knownEpisodeKey(entry))) entries.push(entry);
       }
     }
-  }
+
+    return entries;
+  })).flat();
 
   const deduped = new Map<string, ReleaseCalendarEntry>();
-  for (const entry of entries) {
-    const key = `${entry.type}:${entry.tmdbId ?? entry.tvdbId ?? entry.title}:${entry.releaseDate}:${entry.seasonNumber ?? ""}:${entry.episodeNumber ?? ""}`;
+  const allEntries: ReleaseCalendarEntry[] = [
+    ...movieEntries,
+    ...showAndEpisodeEntries,
+    ...[...knownEpisodes.values()].map((item) => item.entry)
+  ];
+  for (const entry of allEntries) {
+    const key = `${entry.type}:${entry.tmdbId ?? entry.tvdbId ?? entry.seriesTitle ?? entry.title}:${entry.releaseDate}:${entry.seasonNumber ?? ""}:${entry.episodeNumber ?? ""}`;
     if (!deduped.has(key)) deduped.set(key, entry);
   }
 
@@ -222,10 +332,11 @@ export async function fetchReleaseCalendar(month?: string): Promise<ReleaseCalen
     entries: [...deduped.values()].sort((a, b) =>
       a.releaseDate.localeCompare(b.releaseDate)
       || a.type.localeCompare(b.type)
-      || a.title.localeCompare(b.title, undefined, { sensitivity: "base" })
+      || (a.seriesTitle ?? a.title).localeCompare(b.seriesTitle ?? b.title, undefined, { sensitivity: "base" })
+      || (a.episodeNumber ?? 0) - (b.episodeNumber ?? 0)
     )
   };
 
-  await redis.set(cacheKey, JSON.stringify(response), "EX", 6 * 60 * 60);
+  await redis.set(cacheKey, JSON.stringify(response), "EX", CALENDAR_CACHE_TTL_SECONDS).catch(() => undefined);
   return response;
 }

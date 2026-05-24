@@ -7,14 +7,35 @@ import { getSettings } from "../settings/settingsStore.js";
 import { DRAKKAR_VERSION } from "../version.js";
 
 const schema = buildSchema(`
+  """Basic runtime health for Drakkar and core infrastructure."""
   type Status {
+    """Human-facing application name."""
     appName: String!
+    """Current backend version."""
     version: String!
+    """Backend process health."""
     backend: String!
+    """PostgreSQL connectivity health."""
     postgresql: String!
+    """Valkey/Redis connectivity health."""
     valkey: String!
   }
 
+  """Authenticated Drakkar user."""
+  type AuthUser {
+    """Stable internal user id."""
+    id: ID!
+    """Login username."""
+    username: String!
+    """Display name used in the UI."""
+    displayName: String!
+    """Whether this user has admin access."""
+    isAdmin: Boolean!
+    """Whether the user should change the password after the next login."""
+    mustChangePassword: Boolean!
+  }
+
+  """Projected library row as shown by the Drakkar library UI."""
   type LibraryItem {
     id: ID!
     mediaType: String!
@@ -30,6 +51,7 @@ const schema = buildSchema(`
     updatedAt: String!
   }
 
+  """Download queue or history row."""
   type Download {
     id: ID!
     title: String!
@@ -42,6 +64,7 @@ const schema = buildSchema(`
     updatedAt: String!
   }
 
+  """Stored search/log history row."""
   type SearchLog {
     id: ID!
     type: String!
@@ -51,6 +74,7 @@ const schema = buildSchema(`
     createdAt: String!
   }
 
+  """Boolean summary of whether major integrations are configured."""
   type SettingsSummary {
     nzbhydraConfigured: Boolean!
     usenetConfigured: Boolean!
@@ -59,10 +83,17 @@ const schema = buildSchema(`
   }
 
   type Query {
+    """Current authenticated Drakkar user resolved from session cookie or bearer token."""
+    me: AuthUser!
+    """Lightweight service/runtime health summary."""
     status: Status!
+    """Latest library rows. Use \`limit\` to cap result size."""
     library(limit: Int): [LibraryItem!]!
+    """Latest downloads ordered by update time. Use \`limit\` to cap result size."""
     downloads(limit: Int): [Download!]!
+    """Latest search/log history rows. Use \`limit\` to cap result size."""
     searchHistory(limit: Int): [SearchLog!]!
+    """Whether major integrations are configured at all."""
     settings: SettingsSummary!
   }
 `);
@@ -82,8 +113,455 @@ function serializeDate<T extends Record<string, unknown>>(row: T) {
   return Object.fromEntries(Object.entries(row).map(([key, value]) => [key, value instanceof Date ? value.toISOString() : value]));
 }
 
+function openApiDocument() {
+  return {
+    openapi: "3.1.0",
+    info: {
+      title: "Drakkar API",
+      version: DRAKKAR_VERSION,
+      description: "Drakkar REST and GraphQL API. Use the same Drakkar API token as `x-api-token`, and for protected routes also as `Authorization: Bearer <token>`."
+    },
+    servers: [
+      { url: "/", description: "Current host via frontend proxy or direct backend" }
+    ],
+    tags: [
+      { name: "Status", description: "Service health, diagnostics, and low-level runtime information." },
+      { name: "Auth", description: "Login, session, and API token management." },
+      { name: "Downloads", description: "Queue, history, add/retry/cancel downloads, and NZB URL checks." },
+      { name: "Requests", description: "Seerr sync, request monitoring, ranking, and grabs." },
+      { name: "Library", description: "Library listing, refresh, replacement, and reimport operations." },
+      { name: "Tasks", description: "Scheduled task status and manual task execution." },
+      { name: "Calendar", description: "Release calendar for movies, shows, and episodes." },
+      { name: "GraphQL", description: "Schema explorer and GraphQL POST endpoint." },
+      { name: "Settings", description: "Runtime settings and Drakkar API token management." },
+      { name: "Webhooks", description: "Inbound provider webhook endpoints." }
+    ],
+    components: {
+      securitySchemes: {
+        apiTokenHeader: {
+          type: "apiKey",
+          in: "header",
+          name: "x-api-token",
+          description: "Required on every `/api/*` request."
+        },
+        bearerAuth: {
+          type: "http",
+          scheme: "bearer",
+          bearerFormat: "Token",
+          description: "Use the same Drakkar API token as bearer auth for admin API access."
+        }
+      },
+      schemas: {
+        ApiStatus: {
+          type: "object",
+          properties: {
+            appName: { type: "string" },
+            version: { type: "string" },
+            backend: { type: "string" },
+            postgresql: { type: "string" },
+            valkey: { type: "string" },
+            nzbhydra: { type: "string" },
+            seerr: { type: "string" },
+            activeDownloads: { type: "integer" },
+            queueSize: { type: "integer" }
+          }
+        },
+        QueueCounts: {
+          type: "object",
+          additionalProperties: { type: "integer" }
+        },
+        Download: {
+          type: "object",
+          properties: {
+            id: { type: "string" },
+            title: { type: "string" },
+            source: { type: "string" },
+            status: { type: "string" },
+            statusLabel: { type: "string" },
+            progress: { type: "number" },
+            size: { type: "number" },
+            downloaded: { type: "number" },
+            speedBytesSec: { type: "number" },
+            etaSeconds: { type: ["integer", "null"] },
+            error: { type: ["string", "null"] }
+          }
+        },
+        DownloadPage: {
+          type: "object",
+          properties: {
+            items: { type: "array", items: { $ref: "#/components/schemas/Download" } },
+            page: { type: "integer" },
+            limit: { type: "integer" },
+            total: { type: "integer" },
+            totalPages: { type: "integer" }
+          }
+        },
+        Task: {
+          type: "object",
+          properties: {
+            id: { type: "string" },
+            name: { type: "string" },
+            description: { type: "string" },
+            status: { type: "string" },
+            enabled: { type: "boolean" },
+            manualRunnable: { type: "boolean" },
+            intervalMs: { type: ["integer", "null"] },
+            lastStartedAt: { type: ["string", "null"], format: "date-time" },
+            lastCompletedAt: { type: ["string", "null"], format: "date-time" },
+            nextRunAt: { type: ["string", "null"], format: "date-time" },
+            lastError: { type: ["string", "null"] }
+          }
+        },
+        ReleaseCalendarEntry: {
+          type: "object",
+          properties: {
+            id: { type: "string" },
+            type: { type: "string", enum: ["movie", "show", "episode"] },
+            title: { type: "string" },
+            releaseDate: { type: "string", format: "date" },
+            overview: { type: "string" },
+            mediaType: { type: "string", enum: ["movie", "tv"] },
+            year: { type: "integer" },
+            tmdbId: { type: "string" },
+            tvdbId: { type: "string" },
+            imdbId: { type: "string" },
+            seriesTitle: { type: "string" },
+            seasonNumber: { type: "integer" },
+            episodeNumber: { type: "integer" }
+          }
+        },
+        RequestProvider: {
+          type: "object",
+          properties: {
+            type: { type: "string", example: "seerr" },
+            name: { type: "string" },
+            baseUrl: { type: "string", format: "uri" },
+            apiKey: { type: "string" },
+            enabled: { type: "boolean" },
+            syncIntervalMinutes: { type: "integer" },
+            defaultMovieProfile: { type: "string" },
+            defaultTvProfile: { type: "string" }
+          },
+          required: ["name", "baseUrl", "apiKey"]
+        },
+        AddUrlInput: {
+          type: "object",
+          properties: {
+            url: { type: "string", format: "uri" },
+            title: { type: "string" }
+          },
+          required: ["url"]
+        },
+        AddNzbInput: {
+          type: "object",
+          properties: {
+            filename: { type: "string" },
+            title: { type: "string" },
+            content: { type: "string", description: "NZB XML text content." },
+            category: { type: "string" }
+          },
+          required: ["content"]
+        },
+        GraphqlBody: {
+          type: "object",
+          properties: {
+            query: { type: "string" },
+            variables: { type: "object", additionalProperties: true },
+            operationName: { type: "string" }
+          },
+          required: ["query"]
+        },
+        FrontendTokenState: {
+          type: "object",
+          properties: {
+            frontendApiToken: { type: "string" }
+          },
+          required: ["frontendApiToken"]
+        }
+      }
+    },
+    security: [{ apiTokenHeader: [], bearerAuth: [] }],
+    paths: {
+      "/api/status": {
+        get: {
+          tags: ["Status"],
+          summary: "Runtime service status",
+          responses: {
+            "200": {
+              description: "Current runtime status",
+              content: { "application/json": { schema: { $ref: "#/components/schemas/ApiStatus" } } }
+            }
+          }
+        }
+      },
+      "/api/diagnostics": {
+        get: {
+          tags: ["Status"],
+          summary: "Queue and policy diagnostics",
+          responses: {
+            "200": {
+              description: "Low-level runtime diagnostics"
+            }
+          }
+        }
+      },
+      "/api/debug/usenet": {
+        get: {
+          tags: ["Status"],
+          summary: "Usenet provider and pool debug state",
+          responses: { "200": { description: "Usenet debug state" } }
+        }
+      },
+      "/api/downloads/queue": {
+        get: {
+          tags: ["Downloads"],
+          summary: "Download queue summary",
+          responses: { "200": { description: "Queue items", content: { "application/json": { schema: { type: "array", items: { $ref: "#/components/schemas/Download" } } } } } }
+        }
+      },
+      "/api/downloads/queue/page": {
+        get: {
+          tags: ["Downloads"],
+          summary: "Paginated download queue",
+          parameters: [
+            { name: "page", in: "query", schema: { type: "integer", default: 1 } },
+            { name: "limit", in: "query", schema: { type: "integer", default: 25, maximum: 100 } }
+          ],
+          responses: { "200": { description: "Paginated queue", content: { "application/json": { schema: { $ref: "#/components/schemas/DownloadPage" } } } } }
+        }
+      },
+      "/api/downloads/history/page": {
+        get: {
+          tags: ["Downloads"],
+          summary: "Paginated download history",
+          parameters: [
+            { name: "page", in: "query", schema: { type: "integer", default: 1 } },
+            { name: "limit", in: "query", schema: { type: "integer", default: 25, maximum: 100 } }
+          ],
+          responses: { "200": { description: "Paginated history" } }
+        }
+      },
+      "/api/downloads/add-url": {
+        post: {
+          tags: ["Downloads"],
+          summary: "Queue an NZB by URL",
+          requestBody: {
+            required: true,
+            content: { "application/json": { schema: { $ref: "#/components/schemas/AddUrlInput" } } }
+          },
+          responses: { "200": { description: "Queued download", content: { "application/json": { schema: { $ref: "#/components/schemas/Download" } } } } }
+        }
+      },
+      "/api/downloads/add-nzb": {
+        post: {
+          tags: ["Downloads"],
+          summary: "Upload and queue raw NZB XML",
+          requestBody: {
+            required: true,
+            content: { "application/json": { schema: { $ref: "#/components/schemas/AddNzbInput" } } }
+          },
+          responses: { "200": { description: "Queued download" } }
+        }
+      },
+      "/api/downloads/test-nzb-url": {
+        post: {
+          tags: ["Downloads"],
+          summary: "Test an NZB URL without committing it",
+          requestBody: {
+            required: true,
+            content: { "application/json": { schema: { $ref: "#/components/schemas/AddUrlInput" } } }
+          },
+          responses: { "200": { description: "NZB URL validation result" } }
+        }
+      },
+      "/api/requests": {
+        get: {
+          tags: ["Requests"],
+          summary: "List synced/manual requests",
+          responses: { "200": { description: "Request list" } }
+        },
+        post: {
+          tags: ["Requests"],
+          summary: "Create manual movie or TV request",
+          requestBody: {
+            required: true,
+            content: {
+              "application/json": {
+                schema: {
+                  type: "object",
+                  properties: {
+                    mediaType: { type: "string", enum: ["movie", "tv"] },
+                    title: { type: "string" },
+                    year: { type: "integer" },
+                    tmdbId: { type: "string" },
+                    tvdbId: { type: "string" },
+                    imdbId: { type: "string" }
+                  },
+                  required: ["mediaType", "title"]
+                }
+              }
+            }
+          },
+          responses: { "200": { description: "Created request" } }
+        }
+      },
+      "/api/requests/sync": {
+        post: {
+          tags: ["Requests"],
+          summary: "Run Seerr sync now",
+          responses: { "200": { description: "Sync result" } }
+        }
+      },
+      "/api/request-providers": {
+        get: {
+          tags: ["Requests"],
+          summary: "List request providers",
+          responses: { "200": { description: "Provider list" } }
+        },
+        post: {
+          tags: ["Requests"],
+          summary: "Create request provider",
+          requestBody: {
+            required: true,
+            content: { "application/json": { schema: { $ref: "#/components/schemas/RequestProvider" } } }
+          },
+          responses: { "200": { description: "Created provider" } }
+        }
+      },
+      "/api/webhooks/seerr": {
+        post: {
+          tags: ["Webhooks"],
+          summary: "Receive Seerr webhook events",
+          description: "Seerr test payloads and non-request events return success without forcing a full sync. Real request events with `request.request_id` trigger targeted sync and queue promotion.",
+          requestBody: {
+            required: true,
+            content: {
+              "application/json": {
+                schema: {
+                  type: "object",
+                  additionalProperties: true
+                }
+              }
+            }
+          },
+          responses: {
+            "200": {
+              description: "Webhook accepted"
+            }
+          }
+        }
+      },
+      "/api/library": {
+        get: {
+          tags: ["Library"],
+          summary: "List library items",
+          responses: { "200": { description: "Library items" } }
+        }
+      },
+      "/api/library/stats": {
+        get: {
+          tags: ["Library"],
+          summary: "Library status counts",
+          responses: { "200": { description: "Library statistics" } }
+        }
+      },
+      "/api/library/refresh": {
+        post: {
+          tags: ["Library"],
+          summary: "Refresh library projection",
+          responses: { "200": { description: "Library refresh result" } }
+        }
+      },
+      "/api/tasks": {
+        get: {
+          tags: ["Tasks"],
+          summary: "List scheduled/manual tasks",
+          responses: {
+            "200": {
+              description: "Task list",
+              content: { "application/json": { schema: { type: "object", properties: { tasks: { type: "array", items: { $ref: "#/components/schemas/Task" } } } } } }
+            }
+          }
+        }
+      },
+      "/api/tasks/{id}/run": {
+        post: {
+          tags: ["Tasks"],
+          summary: "Run a manual task now",
+          parameters: [{ name: "id", in: "path", required: true, schema: { type: "string" } }],
+          responses: { "200": { description: "Task result" } }
+        }
+      },
+      "/api/release-calendar": {
+        get: {
+          tags: ["Calendar"],
+          summary: "Get release calendar month data",
+          parameters: [
+            { name: "month", in: "query", schema: { type: "string", pattern: "^\\d{4}-\\d{2}$", example: "2026-05" } }
+          ],
+          responses: {
+            "200": {
+              description: "Calendar month",
+              content: {
+                "application/json": {
+                  schema: {
+                    type: "object",
+                    properties: {
+                      month: { type: "string" },
+                      startsOn: { type: "string", format: "date" },
+                      endsOn: { type: "string", format: "date" },
+                      entries: { type: "array", items: { $ref: "#/components/schemas/ReleaseCalendarEntry" } }
+                    }
+                  }
+                }
+              }
+            }
+          }
+        }
+      },
+      "/api/settings/frontend-token": {
+        get: {
+          tags: ["Settings"],
+          summary: "Read the Drakkar API token",
+          responses: { "200": { description: "Frontend token state", content: { "application/json": { schema: { $ref: "#/components/schemas/FrontendTokenState" } } } } }
+        }
+      },
+      "/api/settings/frontend-token/rotate": {
+        post: {
+          tags: ["Settings"],
+          summary: "Rotate the Drakkar API token",
+          responses: { "200": { description: "New token", content: { "application/json": { schema: { $ref: "#/components/schemas/FrontendTokenState" } } } } }
+        }
+      },
+      "/api/graphql": {
+        get: {
+          tags: ["GraphQL"],
+          summary: "GraphiQL 2 explorer",
+          responses: { "200": { description: "GraphiQL HTML" } }
+        },
+        post: {
+          tags: ["GraphQL"],
+          summary: "Run GraphQL query",
+          requestBody: {
+            required: true,
+            content: { "application/json": { schema: { $ref: "#/components/schemas/GraphqlBody" } } }
+          },
+          responses: { "200": { description: "GraphQL response" }, "400": { description: "GraphQL validation/execution error" } }
+        }
+      }
+    }
+  };
+}
+
 export async function graphqlRoutes(app: FastifyInstance): Promise<void> {
   const rootValue = {
+    me: (_args: unknown, context: { authUser?: { id: string; username: string; displayName?: string | null; isAdmin: boolean; mustChangePassword: boolean } }) => ({
+      id: context.authUser?.id ?? "",
+      username: context.authUser?.username ?? "",
+      displayName: context.authUser?.displayName ?? context.authUser?.username ?? "",
+      isAdmin: Boolean(context.authUser?.isAdmin),
+      mustChangePassword: Boolean(context.authUser?.mustChangePassword)
+    }),
     status: async () => {
       await prisma.$queryRaw`SELECT 1`;
       await redis.ping();
@@ -164,7 +642,8 @@ export async function graphqlRoutes(app: FastifyInstance): Promise<void> {
       source: body.query,
       rootValue,
       variableValues: body.variables,
-      operationName: body.operationName
+      operationName: body.operationName,
+      contextValue: { authUser: request.authUser }
     });
     if (result.errors?.length) reply.status(400);
     return result;
@@ -186,115 +665,85 @@ export async function graphqlRoutes(app: FastifyInstance): Promise<void> {
     <script crossorigin src="https://unpkg.com/react-dom@18/umd/react-dom.production.min.js"></script>
     <script crossorigin src="https://unpkg.com/graphiql@2/graphiql.min.js"></script>
     <script>
-      const defaultQuery = '{\\n  status { version backend postgresql valkey }\\n  downloads(limit: 5) { title status progress }\\n}';
+      const token = window.__DRAKKAR_CONFIG__?.FRONTEND_API_TOKEN || '';
+      const defaultQuery = '# Auth required: use your normal Drakkar session or the same Drakkar API token.\\nquery DashboardPreview {\\n  me { username displayName isAdmin }\\n  status { appName version backend postgresql valkey }\\n  downloads(limit: 5) { title status progress speedBytesSec }\\n  library(limit: 5) { title mediaType libraryStatus streamStatus updatedAt }\\n  settings { nzbhydraConfigured usenetConfigured requestProvidersConfigured plexConfigured }\\n}';
       const fetcher = GraphiQL.createFetcher({
         url: '/api/graphql',
         headers: {
           'content-type': 'application/json',
-          'x-api-token': window.__DRAKKAR_CONFIG__?.FRONTEND_API_TOKEN || ''
+          'x-api-token': token,
+          'authorization': token ? 'Bearer ' + token : ''
         },
         credentials: 'include'
       });
+      const header = React.createElement('div', {
+        style: {
+          display: 'flex',
+          justifyContent: 'space-between',
+          alignItems: 'center',
+          gap: '12px',
+          padding: '10px 14px',
+          borderBottom: '1px solid rgba(255,255,255,.08)',
+          background: '#081318',
+          color: '#d8fbff',
+          fontFamily: 'ui-sans-serif,system-ui,sans-serif',
+          fontSize: '13px'
+        }
+      }, [
+        React.createElement('div', { key: 'left' }, 'Drakkar GraphQL: same auth as the app. Session cookie works; token auth also works.'),
+        React.createElement('a', { key: 'right', href: '/api/docs', style: { color: '#4cead1', textDecoration: 'none', fontWeight: 600 } }, 'Open Swagger')
+      ]);
       ReactDOM.createRoot(document.getElementById('graphiql')).render(
-        React.createElement(GraphiQL, { fetcher, defaultQuery })
+        React.createElement(React.Fragment, null, [
+          header,
+          React.createElement('div', { key: 'graphiql-shell', style: { height: 'calc(100% - 46px)' } },
+            React.createElement(GraphiQL, { fetcher, defaultQuery })
+          )
+        ])
       );
     </script>
   </body>
 </html>`;
   });
 
+  app.get("/api/openapi.json", async () => openApiDocument());
+
   app.get("/api/docs", async (_request, reply) => {
     reply.type("text/html");
     return `<!doctype html>
 <html>
   <head>
-    <title>Drakkar API Docs</title>
+    <title>Drakkar API Swagger</title>
+    <link rel="stylesheet" href="https://unpkg.com/swagger-ui-dist@5/swagger-ui.css" />
     <style>
-      :root{color-scheme:dark}
-      *{box-sizing:border-box}
-      body{margin:0;font-family:ui-sans-serif,system-ui,sans-serif;background:#071014;color:#e8fbff}
-      main{max-width:1100px;margin:0 auto;padding:40px 24px 64px}
-      h1,h2,h3{margin:0 0 12px}
-      p{line-height:1.6;color:#abd1d8}
-      .hero{padding:28px;border:1px solid rgba(84,221,201,.24);border-radius:24px;background:linear-gradient(180deg,rgba(18,38,44,.92),rgba(8,18,21,.96))}
-      .grid{display:grid;gap:18px}
-      .cards{grid-template-columns:repeat(auto-fit,minmax(260px,1fr))}
-      .card{padding:18px;border-radius:18px;border:1px solid rgba(255,255,255,.08);background:rgba(255,255,255,.03)}
-      code,pre{font-family:ui-monospace,SFMono-Regular,Menlo,monospace}
-      code{background:rgba(255,255,255,.07);padding:2px 6px;border-radius:8px;color:#bffaf2}
-      pre{overflow:auto;padding:16px;border-radius:16px;background:#031014;border:1px solid rgba(255,255,255,.08);color:#d9fcff}
-      a{color:#4cead1;text-decoration:none}
-      a:hover{text-decoration:underline}
-      .pill{display:inline-block;margin-right:8px;margin-bottom:8px;padding:6px 10px;border-radius:999px;background:rgba(76,234,209,.12);color:#78f4df;font-size:12px;font-weight:700}
-      .muted{color:#86aeb5}
+      html, body { margin: 0; background: #071014; }
+      .swagger-ui .topbar { display: none; }
+      .swagger-ui .info, .swagger-ui .scheme-container { background: transparent; box-shadow: none; }
+      .swagger-ui, .swagger-ui .info .title, .swagger-ui .opblock-tag, .swagger-ui .opblock-summary-description, .swagger-ui .parameter__name, .swagger-ui .response-col_status { color: #e8fbff; }
+      .swagger-ui .opblock, .swagger-ui .scheme-container, .swagger-ui .info { border-color: rgba(255,255,255,.12); }
+      .swagger-ui .opblock { background: rgba(255,255,255,.03); }
+      .swagger-ui .markdown p, .swagger-ui .info p, .swagger-ui .info li, .swagger-ui .parameter__type, .swagger-ui .response-col_description { color: #9ec5cb; }
     </style>
   </head>
   <body>
-    <main class="grid">
-      <section class="hero">
-        <h1>Drakkar API Docs</h1>
-        <p>Drakkar exposes a browser-friendly GraphQL explorer and an authenticated REST API. The shared <code>Drakkar API Token</code> from <code>settings.json</code> can be used as both the frontend gateway token and the bearer token for admin API access.</p>
-        <div style="margin-top:16px">
-          <a class="pill" href="/api/graphql">Open GraphiQL</a>
-          <span class="pill">Version ${DRAKKAR_VERSION}</span>
-        </div>
-      </section>
-
-      <section class="grid cards">
-        <article class="card">
-          <h2>Authentication</h2>
-          <p>Use the same token twice for remote admin access:</p>
-<pre>curl -H 'x-api-token: YOUR_DRAKKAR_API_TOKEN' \\
-  -H 'Authorization: Bearer YOUR_DRAKKAR_API_TOKEN' \\
-  http://HOST:8080/api/status</pre>
-          <p class="muted">Browser sessions can also authenticate with login cookies.</p>
-        </article>
-
-        <article class="card">
-          <h2>GraphQL</h2>
-          <p>Use <a href="/api/graphql">GraphiQL</a> for interactive exploration.</p>
-<pre>{
-  status { version backend postgresql valkey }
-  downloads(limit: 5) { title status progress }
-  library(limit: 5) { title mediaType libraryStatus updatedAt }
-}</pre>
-        </article>
-
-        <article class="card">
-          <h2>Key REST endpoints</h2>
-          <p><code>GET /api/status</code> overall service state</p>
-          <p><code>GET /api/library</code> media library items</p>
-          <p><code>GET /api/requests</code> monitored requests</p>
-          <p><code>POST /api/webhooks/seerr</code> immediate Seerr request push</p>
-          <p><code>GET /api/downloads/queue/page</code> queue page</p>
-          <p><code>GET /api/tasks</code> scheduled task state</p>
-        </article>
-      </section>
-
-      <section class="card">
-        <h2>Examples</h2>
-<pre>curl -H 'x-api-token: YOUR_DRAKKAR_API_TOKEN' \\
-  -H 'Authorization: Bearer YOUR_DRAKKAR_API_TOKEN' \\
-  http://HOST:8080/api/requests
-
-curl -H 'x-api-token: YOUR_DRAKKAR_API_TOKEN' \\
-  -H 'Authorization: Bearer YOUR_DRAKKAR_API_TOKEN' \\
-  'http://HOST:8080/api/downloads/queue/page?page=1&limit=25'
-
-curl -H 'x-api-token: YOUR_DRAKKAR_API_TOKEN' \\
-  -H 'Authorization: Bearer YOUR_DRAKKAR_API_TOKEN' \\
-  http://HOST:8080/api/tasks
-
-curl -X POST \\
-  -H 'Authorization: Bearer YOUR_DRAKKAR_API_TOKEN' \\
-  -H 'content-type: application/json' \\
-  http://HOST:8080/api/webhooks/seerr \\
-  -d '{"notification_type":"MEDIA_AUTO_APPROVED","event":"Request Automatically Approved","request":{"request_id":"1234"},"media":{"tmdbId":"1399","tvdbId":"121361","imdbId":"tt0944947"}}'
-
-# Webhook-origin requests are promoted to the front of the waiting queue,
-# but the active download is not interrupted.</pre>
-      </section>
-    </main>
+    <div id="swagger-ui"></div>
+    <script src="/config.js"></script>
+    <script src="https://unpkg.com/swagger-ui-dist@5/swagger-ui-bundle.js"></script>
+    <script>
+      const token = window.__DRAKKAR_CONFIG__?.FRONTEND_API_TOKEN || '';
+      window.ui = SwaggerUIBundle({
+        url: '/api/openapi.json',
+        dom_id: '#swagger-ui',
+        deepLinking: true,
+        persistAuthorization: true,
+        tryItOutEnabled: true,
+        requestInterceptor: (req) => {
+          if (token && !req.headers['x-api-token']) req.headers['x-api-token'] = token;
+          if (token && !req.headers['Authorization']) req.headers['Authorization'] = 'Bearer ' + token;
+          return req;
+        }
+      });
+    </script>
   </body>
 </html>`;
   });

@@ -1,6 +1,7 @@
 import { z } from "zod";
 import { prisma } from "../db/prisma.js";
 import { invalidatePolicyCache } from "../policies/policyService.js";
+import { syncRuntimeSettingsFromDatabase } from "../settings/settingsStore.js";
 
 let usenetRuntimeVersion = 0;
 
@@ -30,20 +31,26 @@ function bumpUsenetRuntimeVersion() {
   usenetRuntimeVersion += 1;
 }
 
-export function createUsenetServer(input: unknown) {
+export async function createUsenetServer(input: unknown) {
   invalidatePolicyCache();
   bumpUsenetRuntimeVersion();
-  return prisma.usenetServer.create({ data: usenetServerSchema.parse(input) });
+  const server = await prisma.usenetServer.create({ data: usenetServerSchema.parse(input) });
+  await syncRuntimeSettingsFromDatabase();
+  return server;
 }
 
-export function updateUsenetServer(id: string, input: unknown) {
+export async function updateUsenetServer(id: string, input: unknown) {
   invalidatePolicyCache();
   bumpUsenetRuntimeVersion();
-  return prisma.usenetServer.update({ where: { id }, data: usenetServerSchema.partial().parse(input) });
+  const server = await prisma.usenetServer.update({ where: { id }, data: usenetServerSchema.partial().parse(input) });
+  await syncRuntimeSettingsFromDatabase();
+  return server;
 }
 
-export function deleteUsenetServer(id: string) {
+export async function deleteUsenetServer(id: string) {
   invalidatePolicyCache();
   bumpUsenetRuntimeVersion();
-  return prisma.usenetServer.delete({ where: { id } });
+  const server = await prisma.usenetServer.delete({ where: { id } });
+  await syncRuntimeSettingsFromDatabase();
+  return server;
 }

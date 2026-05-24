@@ -2,7 +2,7 @@ import { randomUUID } from "node:crypto";
 import cors from "@fastify/cors";
 import Fastify from "fastify";
 import { env } from "./config/env.js";
-import { getAuthUserByApiKey, getAuthUserById, getFirstAdminAuthUser } from "./auth/service.js";
+import { getAuthUserByApiKey, getAuthUserById } from "./auth/service.js";
 import { authCookieName, getSessionUserId, parseCookie } from "./auth/session.js";
 import { authRoutes } from "./routes/auth.js";
 import { settingsRoutes } from "./routes/settings.js";
@@ -56,8 +56,9 @@ export function buildApp() {
   app.addHook("onRequest", async (request, reply) => {
     if (request.method === "OPTIONS") return;
     if (!request.url.startsWith("/api/")) return;
+    if (request.url === "/api/health") return;
     const parsedUrl = new URL(request.url, env.APP_BASE_URL);
-    if (request.method === "GET" && ["/api/graphql", "/api/docs"].includes(parsedUrl.pathname) && !parsedUrl.searchParams.has("query")) return;
+    if (request.method === "GET" && ["/api/docs", "/api/openapi.json"].includes(parsedUrl.pathname) && !parsedUrl.searchParams.has("query")) return;
     const frontendToken = env.getFrontendApiToken(env.CONFIG_DIR);
     const authorization = request.headers.authorization;
     const bearerToken = authorization?.startsWith("Bearer ") ? authorization.slice("Bearer ".length).trim() : undefined;
@@ -73,14 +74,15 @@ export function buildApp() {
     if (!request.url.startsWith("/api/")) return;
     {
       const parsedUrl = new URL(request.url, env.APP_BASE_URL);
-      if (request.method === "GET" && ["/api/graphql", "/api/docs"].includes(parsedUrl.pathname) && !parsedUrl.searchParams.has("query")) return;
-    }
-    if (request.url.startsWith("/api/setup/status")) return;
-    if (request.url.startsWith("/api/setup/complete")) return;
-
-    const setup = await getSetupStatus();
-    if (!setup.completed) {
-      return reply.status(428).send({ message: "Setup must be completed before using Drakkar." });
+      if (request.method === "GET" && ["/api/docs", "/api/openapi.json"].includes(parsedUrl.pathname) && !parsedUrl.searchParams.has("query")) return;
+      if (parsedUrl.pathname === "/api/health") return;
+      if (parsedUrl.pathname === "/api/setup/status") return;
+      const setup = await getSetupStatus();
+      if (parsedUrl.pathname === "/api/setup/complete") {
+        if (!setup.completed) return;
+      } else if (!setup.completed) {
+        return reply.status(428).send({ message: "Setup must be completed before using Drakkar." });
+      }
     }
     if (request.url.startsWith("/api/auth/login")) return;
 
@@ -88,14 +90,11 @@ export function buildApp() {
     if (parsedUrl.pathname === "/api/webhooks/seerr") return;
     const authorization = request.headers.authorization;
     const bearerToken = authorization?.startsWith("Bearer ") ? authorization.slice("Bearer ".length).trim() : undefined;
-    const frontendToken = env.getFrontendApiToken(env.CONFIG_DIR);
     const sessionToken = parseCookie(request.headers.cookie, authCookieName);
     const sessionUserId = await getSessionUserId(sessionToken);
     const user = sessionUserId
       ? await getAuthUserById(sessionUserId)
-      : bearerToken === frontendToken
-        ? await getFirstAdminAuthUser()
-        : await getAuthUserByApiKey(bearerToken);
+      : await getAuthUserByApiKey(bearerToken);
 
     if (!user) return reply.status(401).send({ message: "Authentication required." });
     request.authUser = user;
@@ -103,10 +102,11 @@ export function buildApp() {
 
   app.setErrorHandler((error, request, reply) => {
     request.log.error({ err: error }, "request failed");
-    const statusCode = error.statusCode ?? 500;
+    const typedError = error as Error & { statusCode?: number };
+    const statusCode = typedError.statusCode ?? 500;
     reply.status(statusCode).send({
-      error: statusCode >= 500 ? "Internal Server Error" : error.name,
-      message: error.message,
+      error: statusCode >= 500 ? "Internal Server Error" : typedError.name,
+      message: typedError.message,
       requestId: request.id
     });
   });

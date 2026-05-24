@@ -19,7 +19,7 @@ export type ScheduledTask = TaskDefinition & {
 };
 
 const tasks = new Map<string, ScheduledTask>();
-const STALE_RUNNING_TASK_MS = 30 * 60_000;
+const STALE_RUNNING_TASK_MS = 10 * 60_000;
 
 function toIso(value: Date | string | null | undefined) {
   if (!value) return null;

@@ -1,6 +1,6 @@
 import { createHash, randomUUID } from "node:crypto";
-import { access, mkdir, readFile, writeFile } from "node:fs/promises";
-import { extname, join } from "node:path";
+import { access, mkdir, readFile, rename, rm, writeFile } from "node:fs/promises";
+import { basename, extname, join } from "node:path";
 import { Prisma } from "@prisma/client";
 import { prisma } from "../db/prisma.js";
 import { env } from "../config/env.js";
@@ -116,6 +116,19 @@ async function uniqueNzbName(name: string) {
     }
   }
   return `${base}-${randomUUID()}${ext}`;
+}
+
+async function pathExists(path: string) {
+  try {
+    await access(path);
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+function canonicalNzbStoragePath(path: string) {
+  return join(env.VFS_NZB_DIR, basename(path));
 }
 
 function contentHash(content: Buffer) {
@@ -377,6 +390,49 @@ export async function addUrl(url: string, title?: string) {
       data: { status: "failed", error: error instanceof Error ? error.message : "failed to fetch NZB URL" }
     });
   }
+}
+
+export async function normalizeNzbStoragePaths() {
+  await mkdir(env.VFS_NZB_DIR, { recursive: true });
+  const documents = await prisma.nzbDocument.findMany({
+    select: { id: true, path: true }
+  });
+
+  let scanned = 0;
+  let updated = 0;
+  let moved = 0;
+  let cleanedLegacy = 0;
+  let missing = 0;
+
+  for (const document of documents) {
+    scanned += 1;
+    if (!document.path || document.path.startsWith(`${env.VFS_NZB_DIR}/`)) continue;
+    const nextPath = canonicalNzbStoragePath(document.path);
+    const legacyExists = await pathExists(document.path);
+    const nextExists = await pathExists(nextPath);
+
+    if (legacyExists && !nextExists) {
+      await rename(document.path, nextPath).catch(() => undefined);
+      if (await pathExists(nextPath)) moved += 1;
+    } else if (legacyExists && nextExists) {
+      await rm(document.path, { force: true }).catch(() => undefined);
+      cleanedLegacy += 1;
+    }
+
+    const normalizedExists = await pathExists(nextPath);
+    if (!normalizedExists) {
+      missing += 1;
+      continue;
+    }
+
+    await prisma.nzbDocument.update({
+      where: { id: document.id },
+      data: { path: nextPath }
+    }).catch(() => undefined);
+    updated += 1;
+  }
+
+  return { scanned, updated, moved, cleanedLegacy, missing };
 }
 
 async function buildQueue() {

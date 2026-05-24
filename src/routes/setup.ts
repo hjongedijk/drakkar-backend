@@ -2,7 +2,7 @@ import type { FastifyInstance } from "fastify";
 import { z } from "zod";
 import { countAdminUsers, createInitialAdminUser } from "../auth/service.js";
 import { prisma } from "../db/prisma.js";
-import { getSettings, updateSettings } from "../settings/settingsStore.js";
+import { getSettings, syncRuntimeSettingsFromDatabase, updateSettings } from "../settings/settingsStore.js";
 
 export async function getSetupStatus() {
   const [settings, usenetServers, requestProviders, setupRow, adminUsers, firstUsenet, firstRequestProvider] = await Promise.all([
@@ -104,7 +104,9 @@ export async function setupRoutes(app: FastifyInstance): Promise<void> {
     return getSetupStatus();
   });
 
-  app.post("/api/setup/complete", async (request) => {
+  app.post("/api/setup/complete", async (request, reply) => {
+    const status = await getSetupStatus();
+    if (status.completed) return reply.status(409).send({ message: "Setup is already completed." });
     const input = completeSetupSchema.parse(request.body ?? {});
     const adminUsers = await countAdminUsers();
     if (adminUsers === 0) {
@@ -163,6 +165,7 @@ export async function setupRoutes(app: FastifyInstance): Promise<void> {
       update: { value: true },
       create: { key: "setup.completed", value: true }
     });
+    await syncRuntimeSettingsFromDatabase();
     return { ok: true, status: await getSetupStatus() };
   });
 }

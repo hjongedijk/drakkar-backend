@@ -7,6 +7,7 @@ declare module "fastify" {
       username: string;
       displayName: string;
       isAdmin: boolean;
+      mustChangePassword: boolean;
     };
   }
 }

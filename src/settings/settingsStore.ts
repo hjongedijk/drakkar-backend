@@ -1,5 +1,6 @@
 import { z } from "zod";
 import { prisma } from "../db/prisma.js";
+import { updateRuntimeSettings } from "../config/runtimeSettings.js";
 
 const DEFAULT_NZBHYDRA_CATEGORIES = ["2030", "2040", "2045", "2050", "2060", "5030", "5040", "5045", "5080"];
 
@@ -65,6 +66,74 @@ export async function getSettings(): Promise<AppSettings> {
   return value;
 }
 
+export async function syncRuntimeSettingsFromDatabase(settingsOverride?: AppSettings) {
+  const settings = settingsOverride ?? await getSettings();
+  const [usenetProviders, requestProviders] = await Promise.all([
+    prisma.usenetServer.findMany({ orderBy: [{ priority: "asc" }, { name: "asc" }] }),
+    prisma.requestProvider.findMany({ orderBy: { createdAt: "asc" } })
+  ]);
+  updateRuntimeSettings((current) => ({
+    ...current,
+    nzbhydra: {
+      ...current.nzbhydra,
+      enabled: Boolean(settings.nzbhydraUrl && settings.nzbhydraApiKey),
+      url: settings.nzbhydraUrl ?? "",
+      apiKey: settings.nzbhydraApiKey ?? "",
+      categories: settings.nzbhydraCategories,
+      timeoutMs: settings.nzbhydraTimeoutMs,
+      searchCacheTtlSeconds: settings.nzbhydraCacheTtlSeconds,
+      feedCacheTtlSeconds: settings.nzbhydraFeedCacheTtlSeconds,
+      feedMaxResults: settings.nzbhydraFeedMaxResults
+    },
+    plex: {
+      ...current.plex,
+      enabled: Boolean(settings.plexServerUrl && settings.plexToken),
+      serverUrl: settings.plexServerUrl ?? "",
+      token: settings.plexToken ?? "",
+      libraryPath: settings.plexLibraryPath,
+      sectionId: settings.plexSectionId ?? ""
+    },
+    metadata: {
+      ...current.metadata,
+      tmdbApiKey: settings.tmdbApiKey ?? "",
+      tvdbApiKey: settings.tvdbApiKey ?? "",
+      language: settings.metadataLanguage,
+      cacheTtlHours: settings.metadataCacheTtlHours
+    },
+    indexers: current.indexers.map((indexer, index) => index === 0 ? {
+      ...indexer,
+      type: "nzbhydra2",
+      enabled: Boolean(settings.nzbhydraUrl && settings.nzbhydraApiKey),
+      name: indexer.name || "NZBHydra2",
+      url: settings.nzbhydraUrl ?? "",
+      apiKey: settings.nzbhydraApiKey ?? ""
+    } : indexer),
+    usenetProviders: usenetProviders.map((server) => ({
+      enabled: server.enabled,
+      name: server.name,
+      host: server.host,
+      port: server.port,
+      ssl: server.ssl,
+      username: server.username ?? "",
+      password: server.password ?? "",
+      connections: server.connections,
+      priority: server.priority,
+      isBackup: server.isBackup,
+      retentionDays: server.retentionDays ?? undefined
+    })),
+    requestProviders: requestProviders.map((provider) => ({
+      type: provider.type === "seerr" ? "seerr" : "seerr",
+      enabled: provider.enabled,
+      name: provider.name,
+      baseUrl: provider.baseUrl,
+      apiKey: provider.apiKey,
+      syncIntervalMinutes: provider.syncIntervalMinutes,
+      defaultMovieProfile: provider.defaultMovieProfile ?? "",
+      defaultTvProfile: provider.defaultTvProfile ?? ""
+    }))
+  }));
+}
+
 export async function updateSettings(input: unknown): Promise<AppSettings> {
   const settings = settingsSchema.parse(input);
   await prisma.setting.upsert({
@@ -73,5 +142,6 @@ export async function updateSettings(input: unknown): Promise<AppSettings> {
     create: { key: SETTINGS_KEY, value: settings }
   });
   cachedSettings = { value: settings, expiresAt: Date.now() + SETTINGS_CACHE_MS };
+  await syncRuntimeSettingsFromDatabase(settings);
   return settings;
 }

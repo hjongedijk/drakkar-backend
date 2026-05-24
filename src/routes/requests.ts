@@ -92,11 +92,26 @@ function publicResult<T>(value: T): T {
 }
 
 export async function requestRoutes(app: FastifyInstance): Promise<void> {
-  app.get("/api/request-providers", async () => (await listProviders()).map(publicProvider));
-  app.post("/api/request-providers", async (request) => publicProvider(await createProvider(providerSchema.parse(request.body))));
-  app.put("/api/request-providers/:id", async (request) => publicProvider(await updateProvider(idParam(request), providerSchema.partial().parse(request.body))));
-  app.delete("/api/request-providers/:id", async (request) => publicProvider(await deleteProvider(idParam(request))));
-  app.post("/api/request-providers/:id/test", async (request) => testRequestProvider(idParam(request)));
+  app.get("/api/request-providers", async (request, reply) => {
+    if (!request.authUser?.isAdmin) return reply.status(403).send({ message: "Admin access required." });
+    return (await listProviders()).map(publicProvider);
+  });
+  app.post("/api/request-providers", async (request, reply) => {
+    if (!request.authUser?.isAdmin) return reply.status(403).send({ message: "Admin access required." });
+    return publicProvider(await createProvider(providerSchema.parse(request.body)));
+  });
+  app.put("/api/request-providers/:id", async (request, reply) => {
+    if (!request.authUser?.isAdmin) return reply.status(403).send({ message: "Admin access required." });
+    return publicProvider(await updateProvider(idParam(request), providerSchema.partial().parse(request.body)));
+  });
+  app.delete("/api/request-providers/:id", async (request, reply) => {
+    if (!request.authUser?.isAdmin) return reply.status(403).send({ message: "Admin access required." });
+    return publicProvider(await deleteProvider(idParam(request)));
+  });
+  app.post("/api/request-providers/:id/test", async (request, reply) => {
+    if (!request.authUser?.isAdmin) return reply.status(403).send({ message: "Admin access required." });
+    return testRequestProvider(idParam(request));
+  });
 
   app.get("/api/requests", async () => (await listRequests()).map(publicRequest));
   app.post("/api/requests", async (request) => publicResult(await createManualRequest(manualRequestSchema.parse(request.body))));

@@ -1,4 +1,4 @@
-import type { MediaRequest, Prisma, RequestProvider } from "@prisma/client";
+import { Prisma, type MediaRequest, type RequestProvider } from "@prisma/client";
 import { prisma } from "../../db/prisma.js";
 import { redis } from "../../db/redis.js";
 import { downloadNzb, refreshNzbhydraUpdateFeeds } from "../../indexers/nzbhydra/client.js";
@@ -6,6 +6,7 @@ import { refreshMediaLibrary } from "../../media-library/libraryService.js";
 import { fetchMediaDetails as fetchMetadataDetails, fetchSeasonEpisodes, fetchSeriesStructure } from "../../metadata/metadataService.js";
 import { runSearch } from "../../search/searchService.js";
 import { getSettings } from "../../settings/settingsStore.js";
+import { syncRuntimeSettingsFromDatabase } from "../../settings/settingsStore.js";
 import { addNzbFromPath, findReusableDownload, promoteDownloadPriority } from "../../downloads/downloadService.js";
 import { mediaIdentityKey, normalizeTitleForIdentity } from "../../media-library/identity.js";
 import { scoreRelease } from "../../quality/scoring.js";
@@ -184,7 +185,10 @@ export function createProvider(input: {
   defaultMovieProfile?: string;
   defaultTvProfile?: string;
 }) {
-  return prisma.requestProvider.create({ data: { ...input, type: "seerr" } });
+  return prisma.requestProvider.create({ data: { ...input, type: "seerr" } }).then(async (provider) => {
+    await syncRuntimeSettingsFromDatabase();
+    return provider;
+  });
 }
 
 export function updateProvider(
@@ -200,11 +204,17 @@ export function updateProvider(
     defaultTvProfile: string;
   }>
 ) {
-  return prisma.requestProvider.update({ where: { id }, data: input });
+  return prisma.requestProvider.update({ where: { id }, data: input }).then(async (provider) => {
+    await syncRuntimeSettingsFromDatabase();
+    return provider;
+  });
 }
 
 export function deleteProvider(id: string) {
-  return prisma.requestProvider.delete({ where: { id } });
+  return prisma.requestProvider.delete({ where: { id } }).then(async (provider) => {
+    await syncRuntimeSettingsFromDatabase();
+    return provider;
+  });
 }
 
 export async function syncRequests(providerId?: string) {
@@ -372,9 +382,12 @@ export async function syncRequestFromWebhook(payload: unknown, providerId?: stri
   }
 
   const externalId = extractWebhookRequestId(payload);
-  if (!externalId || !eventSuggestsSync(payload)) {
-    const sync = await syncRequests(effectiveProviderId);
-    return { ok: true, mode: "full-sync" as const, requestId: externalId ?? null, sync };
+  if (!eventSuggestsSync(payload)) {
+    return { ok: true, mode: "accepted" as const, requestId: externalId ?? null, reason: "non_request_event" as const };
+  }
+
+  if (!externalId) {
+    return { ok: true, mode: "accepted" as const, requestId: null, reason: "missing_request_id" as const };
   }
 
   for (const provider of providers) {
@@ -437,6 +450,80 @@ export async function recoverFailedRequestDownloads() {
   }
   await refreshMediaLibrary().catch(() => undefined);
   return { recovered: recovered.length, results: recovered };
+}
+
+export async function recoverSelectedReleaseDownloads() {
+  const requests = await prisma.mediaRequest.findMany({
+    where: {
+      downloadId: null,
+      selectedRelease: { not: Prisma.JsonNull },
+      status: { in: ["approved", "grabbed", "searching", "release_failed", "auto_grab_failed", "no_release_found", "import_failed"] }
+    },
+    orderBy: { updatedAt: "asc" },
+    take: 25
+  });
+
+  const recovered = [];
+  for (const request of requests) {
+    if (!request.selectedRelease || typeof request.selectedRelease !== "object") continue;
+    try {
+      const result = await grabReleaseForRequest(request.id, request.selectedRelease);
+      recovered.push({ requestId: request.id, result });
+    } catch {
+      continue;
+    }
+  }
+
+  if (recovered.length > 0) await refreshMediaLibrary().catch(() => undefined);
+  return { recovered: recovered.length, results: recovered };
+}
+
+export async function backfillPlaceholderRequestMetadata() {
+  const requests = await prisma.mediaRequest.findMany({
+    where: {
+      title: { startsWith: "Request " },
+      OR: [
+        { tmdbId: { not: null } },
+        { tvdbId: { not: null } },
+        { imdbId: { not: null } }
+      ]
+    },
+    orderBy: { updatedAt: "asc" },
+    take: 20
+  });
+
+  let updated = 0;
+  for (const request of requests) {
+    const hydrated = await enrichRequestMetadataFallback({
+      externalId: request.externalId,
+      mediaType: request.mediaType as "movie" | "tv",
+      title: request.title,
+      year: request.year ?? undefined,
+      tmdbId: request.tmdbId ?? undefined,
+      tvdbId: request.tvdbId ?? undefined,
+      imdbId: request.imdbId ?? undefined,
+      seasons: jsonValue(request.seasons) as ExternalMediaRequest["seasons"],
+      episodes: jsonValue(request.episodes) as ExternalMediaRequest["episodes"],
+      requestedBy: request.requestedBy ?? undefined,
+      requestedQuality: request.requestedQuality ?? undefined,
+      externalStatus: request.externalStatus ?? undefined
+    });
+    if (!hydrated.title || hydrated.title === request.title) continue;
+    await prisma.mediaRequest.update({
+      where: { id: request.id },
+      data: {
+        title: hydrated.title,
+        year: hydrated.year,
+        tmdbId: hydrated.tmdbId,
+        tvdbId: hydrated.tvdbId,
+        imdbId: hydrated.imdbId
+      }
+    }).catch(() => undefined);
+    updated += 1;
+  }
+
+  if (updated > 0) await refreshMediaLibrary().catch(() => undefined);
+  return { scanned: requests.length, updated };
 }
 
 async function grabForRequestMediaType(id: string, mediaType: string) {
