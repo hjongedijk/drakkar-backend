@@ -63,7 +63,7 @@ export async function taskRoutes(app: FastifyInstance): Promise<void> {
       case NAMING_MIGRATION_TASK_ID:
         result = await runTrackedTask(id, async () => {
           const migrated = await migrateImportsToCurrentNaming();
-          const repaired = await repairSuspiciousImports();
+          const repaired = await repairSuspiciousImports({ limit: 50 });
           return { migrated, repaired };
         });
         break;
@@ -72,7 +72,7 @@ export async function taskRoutes(app: FastifyInstance): Promise<void> {
           const symlinkCleanup = await cleanupSymlinks();
           const pruned = await pruneLibraryDirectories();
           const nzbPaths = await normalizeNzbStoragePaths();
-          const suspicious = await repairSuspiciousImports();
+          const suspicious = await repairSuspiciousImports({ limit: 50 });
           await refreshMediaLibrary();
           return { symlinkCleanup, pruned, nzbPaths, suspicious };
         });

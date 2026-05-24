@@ -477,15 +477,18 @@ export async function importMountedDownloadByExtraction(input: { downloadId: str
   }
 }
 
-export async function repairSuspiciousImports() {
+export async function repairSuspiciousImports(options: { limit?: number } = {}) {
   const settings = await getSettings();
+  const limit = Math.max(1, Math.min(options.limit ?? 50, 200));
   const imports = (await prisma.importItem.findMany({
-    include: { request: true, download: true, symlinks: true }
+    include: { request: true, download: true, symlinks: true },
+    orderBy: { updatedAt: "asc" },
+    take: limit * 4
   })).filter((item) => suspiciousImportTitle(item.title));
 
   let repaired = 0;
   let hidden = 0;
-  for (const item of imports) {
+  for (const item of imports.slice(0, limit)) {
     const requestInfo = item.requestId ? await requestMetadata(item.requestId) : {};
     const filename = normalizeMountedFilename(decodePathBasename(item.completedPath));
     const downloadFallback = !item.requestId && suspiciousImportTitle(inferMedia(filename).title)
@@ -533,7 +536,7 @@ export async function repairSuspiciousImports() {
   }
 
   await refreshMediaLibrary();
-  return { repaired, hidden };
+  return { scanned: Math.min(imports.length, limit), remainingEstimate: Math.max(0, imports.length - limit), repaired, hidden };
 }
 
 async function findWorkingImportByIdentity(media: Partial<ImportMedia>) {

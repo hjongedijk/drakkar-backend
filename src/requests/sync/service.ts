@@ -23,7 +23,7 @@ const TV_SEASONS_PER_MONITOR_PASS = 8;
 const TV_EPISODE_DOWNLOADS_PER_REQUEST_PASS = 4;
 const MONITORED_REQUESTS_MAX_DURATION_MS = 20_000;
 const REQUEST_SYNC_MAX_DURATION_MS = 60_000;
-const REQUEST_SYNC_AUTO_GRAB_LIMIT = 6;
+const REQUEST_SYNC_PROVIDER_MAX_REQUESTS = 200;
 const SEERR_WEBHOOK_PRIORITY = 900;
 
 function blockReasonFromFailure(message?: string | null) {
@@ -48,7 +48,10 @@ function intersectEpisodes(left: Set<number>, right: Set<number>) {
 }
 
 async function fetchProviderRequests(provider: RequestProvider) {
-  return fetchSeerrRequests(provider);
+  return fetchSeerrRequests(provider, {
+    maxRequests: REQUEST_SYNC_PROVIDER_MAX_REQUESTS,
+    includeDetails: false
+  });
 }
 
 type SyncRequestAction = "created" | "updated" | "skipped";
@@ -229,7 +232,6 @@ export async function syncRequests(providerId?: string) {
   let createdCount = 0;
   let updatedCount = 0;
   let skippedCount = 0;
-  let autoGrabbed = 0;
   let budgetExceeded = false;
 
   for (const provider of providers) {
@@ -276,33 +278,7 @@ export async function syncRequests(providerId?: string) {
         ok: true
       });
 
-      const autoGrabCandidates = [];
-      for (const synced of syncedRequests) {
-        if (await shouldAutoGrabSyncedRequest(synced)) autoGrabCandidates.push(synced);
-      }
-      if (autoGrabCandidates.length > 0) {
-        await refreshNzbhydraUpdateFeeds(await getSettings()).catch(() => undefined);
-      }
-      for (const synced of autoGrabCandidates) {
-        if (Date.now() - startedAt >= REQUEST_SYNC_MAX_DURATION_MS || autoGrabbed >= REQUEST_SYNC_AUTO_GRAB_LIMIT) {
-          budgetExceeded = true;
-          break;
-        }
-        try {
-          if (synced.mediaType === "tv") await grabMissingTvForRequest(synced.id);
-          else await grabBestForRequest(synced.id);
-          autoGrabbed += 1;
-        } catch (error) {
-          await prisma.mediaRequest.update({
-            where: { id: synced.id },
-            data: { status: "approved", downloadId: null }
-          }).catch(() => undefined);
-          await prisma.requestProvider.update({
-            where: { id: provider.id },
-            data: { lastError: error instanceof Error ? error.message : "automatic request grab failed" }
-          }).catch(() => undefined);
-        }
-      }
+      void syncedRequests;
     } catch (error) {
       const message = error instanceof Error ? error.message : "unknown sync error";
       await prisma.requestProvider.update({
@@ -331,7 +307,7 @@ export async function syncRequests(providerId?: string) {
     requests: imported,
     providerResults,
     failedProviders: providerResults.filter((item) => !item.ok).length,
-    autoGrabbed,
+    autoGrabbed: 0,
     budgetExceeded
   };
 }

@@ -48,6 +48,11 @@ type SeerrRequestDetails = SeerrRequest & {
   seasons?: unknown[];
 };
 
+type FetchSeerrRequestsOptions = {
+  maxRequests?: number;
+  includeDetails?: boolean;
+};
+
 function serviceName(provider: RequestProvider) {
   return `request-provider:${provider.id}`;
 }
@@ -89,12 +94,12 @@ async function fetchMediaDetails(provider: RequestProvider, request: SeerrReques
   return response.json() as Promise<SeerrMediaDetails>;
 }
 
-async function mapSeerrRequest(provider: RequestProvider, request: SeerrRequest): Promise<ExternalMediaRequest> {
+async function mapSeerrRequest(provider: RequestProvider, request: SeerrRequest, options: FetchSeerrRequestsOptions = {}): Promise<ExternalMediaRequest> {
   const mediaType = request.media?.mediaType ?? request.type ?? "movie";
   const title = mediaType === "movie" ? request.movie?.title : request.tv?.name;
   const date = mediaType === "movie" ? request.movie?.releaseDate : request.tv?.firstAirDate;
   const needsDetails = !title || !date || (!request.media?.imdbId && !request.media?.tvdbId);
-  const details = needsDetails ? await fetchMediaDetails(provider, request) : undefined;
+  const details = options.includeDetails !== false && needsDetails ? await fetchMediaDetails(provider, request) : undefined;
   const normalized = extractSeasonEpisodes(request.seasons);
   const effectiveDate = date ?? details?.releaseDate ?? details?.firstAirDate;
   let tvdbId: string | undefined;
@@ -213,33 +218,35 @@ async function fetchRequestPage(provider: RequestProvider, take: number, skip: n
   return response.json() as Promise<SeerrRequestPage>;
 }
 
-async function fetchAllRequestPages(provider: RequestProvider, pageSize = 100) {
+async function fetchAllRequestPages(provider: RequestProvider, pageSize = 100, options: FetchSeerrRequestsOptions = {}) {
   const requests: SeerrRequest[] = [];
   let skip = 0;
   let page = 0;
   let totalPages: number | undefined;
+  const maxRequests = options.maxRequests && options.maxRequests > 0 ? options.maxRequests : undefined;
 
   while (true) {
     const data = await fetchRequestPage(provider, pageSize, skip);
     const pageResults = data.results ?? [];
-    requests.push(...pageResults);
+    requests.push(...(maxRequests ? pageResults.slice(0, Math.max(0, maxRequests - requests.length)) : pageResults));
     page += 1;
     totalPages = data.pageInfo?.pages ?? totalPages;
 
+    const exhaustedByLimit = Boolean(maxRequests && requests.length >= maxRequests);
     const exhaustedByCount = pageResults.length < pageSize;
     const exhaustedByPageInfo = Boolean(totalPages && page >= totalPages);
     const exhaustedByResults = Boolean(data.pageInfo && typeof data.pageInfo.results === "number" && requests.length >= data.pageInfo.results);
-    if (exhaustedByCount || exhaustedByPageInfo || exhaustedByResults) break;
+    if (exhaustedByLimit || exhaustedByCount || exhaustedByPageInfo || exhaustedByResults) break;
     skip += pageSize;
   }
 
   return requests;
 }
 
-export async function fetchSeerrRequests(provider: RequestProvider): Promise<ExternalMediaRequest[]> {
+export async function fetchSeerrRequests(provider: RequestProvider, options: FetchSeerrRequestsOptions = {}): Promise<ExternalMediaRequest[]> {
   await assertServiceAllowed(serviceName(provider), providerConfigured(provider), `${provider.name} is not configured; request sync skipped`);
-  const requests = await fetchAllRequestPages(provider);
-  return mapWithConcurrency(requests, 6, async (request) => mapSeerrRequest(provider, request));
+  const requests = await fetchAllRequestPages(provider, 100, options);
+  return mapWithConcurrency(requests, 8, async (request) => mapSeerrRequest(provider, request, options));
 }
 
 export async function fetchSeerrRequestById(provider: RequestProvider, requestId: string): Promise<ExternalMediaRequest | null> {
