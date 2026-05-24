@@ -21,7 +21,9 @@ const REQUEST_RELEASE_CACHE_SECONDS = 6 * 60 * 60;
 const MONITOR_QUEUE_SEED_STATUSES = ["queued", "fetching_nzb", "verifying", "waiting_for_provider", "waiting_for_nzb", "downloading", "paused"];
 const TV_SEASONS_PER_MONITOR_PASS = 8;
 const TV_EPISODE_DOWNLOADS_PER_REQUEST_PASS = 4;
-const MONITORED_REQUESTS_MAX_DURATION_MS = 45_000;
+const MONITORED_REQUESTS_MAX_DURATION_MS = 20_000;
+const REQUEST_SYNC_MAX_DURATION_MS = 60_000;
+const REQUEST_SYNC_AUTO_GRAB_LIMIT = 6;
 const SEERR_WEBHOOK_PRIORITY = 900;
 
 function blockReasonFromFailure(message?: string | null) {
@@ -218,6 +220,7 @@ export function deleteProvider(id: string) {
 }
 
 export async function syncRequests(providerId?: string) {
+  const startedAt = Date.now();
   const providers = await prisma.requestProvider.findMany({
     where: { enabled: true, ...(providerId ? { id: providerId } : {}) }
   });
@@ -226,8 +229,14 @@ export async function syncRequests(providerId?: string) {
   let createdCount = 0;
   let updatedCount = 0;
   let skippedCount = 0;
+  let autoGrabbed = 0;
+  let budgetExceeded = false;
 
   for (const provider of providers) {
+    if (Date.now() - startedAt >= REQUEST_SYNC_MAX_DURATION_MS) {
+      budgetExceeded = true;
+      break;
+    }
     let fetchedForProvider = 0;
     let importedForProvider = 0;
     let updatedForProvider = 0;
@@ -237,6 +246,10 @@ export async function syncRequests(providerId?: string) {
       fetchedForProvider = requests.length;
       const syncedRequests: MediaRequest[] = [];
       for (const request of requests) {
+        if (Date.now() - startedAt >= REQUEST_SYNC_MAX_DURATION_MS) {
+          budgetExceeded = true;
+          break;
+        }
         const hydratedBase = await enrichRequestMetadataFallback(request);
         const hydrated = hydratedBase.mediaType === "tv"
           ? await enrichTvRequestWithStructure(hydratedBase)
@@ -274,9 +287,14 @@ export async function syncRequests(providerId?: string) {
         await refreshNzbhydraUpdateFeeds(await getSettings()).catch(() => undefined);
       }
       for (const synced of autoGrabCandidates) {
+        if (Date.now() - startedAt >= REQUEST_SYNC_MAX_DURATION_MS || autoGrabbed >= REQUEST_SYNC_AUTO_GRAB_LIMIT) {
+          budgetExceeded = true;
+          break;
+        }
         try {
           if (synced.mediaType === "tv") await grabMissingTvForRequest(synced.id);
           else await grabBestForRequest(synced.id);
+          autoGrabbed += 1;
         } catch (error) {
           await prisma.mediaRequest.update({
             where: { id: synced.id },
@@ -315,7 +333,9 @@ export async function syncRequests(providerId?: string) {
     fetched: createdCount + updatedCount + skippedCount,
     requests: imported,
     providerResults,
-    failedProviders: providerResults.filter((item) => !item.ok).length
+    failedProviders: providerResults.filter((item) => !item.ok).length,
+    autoGrabbed,
+    budgetExceeded
   };
 }
 
@@ -465,6 +485,18 @@ export async function recoverSelectedReleaseDownloads() {
 
   const recovered = [];
   for (const request of requests) {
+    const workingImport = await findWorkingImportForRequest(request).catch(() => null);
+    if (workingImport) {
+      await prisma.mediaRequest.update({
+        where: { id: request.id },
+        data: {
+          status: "available",
+          downloadId: workingImport.downloadId
+        }
+      }).catch(() => undefined);
+      recovered.push({ requestId: request.id, result: { grabbed: false, reason: "working import already exists", import: workingImport } });
+      continue;
+    }
     if (!request.selectedRelease || typeof request.selectedRelease !== "object") continue;
     try {
       const result = await grabReleaseForRequest(request.id, request.selectedRelease);
@@ -543,6 +575,9 @@ export async function ensureMonitoredRequests() {
   const queueSeedTarget = Math.max(1, settings.monitorQueueSeedTarget);
   const startedAt = Date.now();
   let pendingQueueItems = await monitoredQueuePendingCount();
+  if (pendingQueueItems >= queueSeedTarget) {
+    return { retried: 0, queueSeedTarget, pendingQueueItems, skippedBecauseQueueFull: 1, results: [] };
+  }
   const requests = await prisma.mediaRequest.findMany({
     where: {
       status: { in: ["approved", "grabbed", "available", "release_failed", "no_release_found", "auto_grab_failed"] }
@@ -554,6 +589,10 @@ export async function ensureMonitoredRequests() {
   let skippedBecauseQueueFull = 0;
   for (const request of requests) {
     if (Date.now() - startedAt >= MONITORED_REQUESTS_MAX_DURATION_MS) break;
+    if (pendingQueueItems >= queueSeedTarget) {
+      skippedBecauseQueueFull += 1;
+      break;
+    }
     if (request.mediaType === "tv") {
       const availability = await tvRequestAvailabilitySummary(request).catch(() => null);
       if (!availability) continue;
@@ -581,10 +620,6 @@ export async function ensureMonitoredRequests() {
         }).catch(() => undefined);
       }
       if (!hasMissingEpisodes) continue;
-      if (pendingQueueItems >= queueSeedTarget) {
-        skippedBecauseQueueFull += 1;
-        continue;
-      }
       const result = await grabMissingTvForRequest(request.id).catch(() => null);
       if (result) {
         retried.push({ requestId: request.id, result });
@@ -597,10 +632,6 @@ export async function ensureMonitoredRequests() {
     const workingImport = await findWorkingImportForRequest(request).catch(() => null);
     const activeDownload = await existingActiveDownload(request.downloadId).catch(() => null);
     if (workingImport || activeDownload) continue;
-    if (pendingQueueItems >= queueSeedTarget) {
-      skippedBecauseQueueFull += 1;
-      continue;
-    }
     const result = await grabBestForRequest(request.id).catch(() => null);
     if (result) {
       retried.push({ requestId: request.id, result });

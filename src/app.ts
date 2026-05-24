@@ -58,7 +58,7 @@ export function buildApp() {
     if (!request.url.startsWith("/api/")) return;
     if (request.url === "/api/health") return;
     const parsedUrl = new URL(request.url, env.APP_BASE_URL);
-    if (request.method === "GET" && ["/api/docs", "/api/openapi.json"].includes(parsedUrl.pathname) && !parsedUrl.searchParams.has("query")) return;
+    if (request.method === "GET" && ["/api/docs", "/api/openapi.json", "/api/graphql"].includes(parsedUrl.pathname) && !parsedUrl.searchParams.has("query")) return;
     const frontendToken = env.getFrontendApiToken(env.CONFIG_DIR);
     const authorization = request.headers.authorization;
     const bearerToken = authorization?.startsWith("Bearer ") ? authorization.slice("Bearer ".length).trim() : undefined;
@@ -74,7 +74,7 @@ export function buildApp() {
     if (!request.url.startsWith("/api/")) return;
     {
       const parsedUrl = new URL(request.url, env.APP_BASE_URL);
-      if (request.method === "GET" && ["/api/docs", "/api/openapi.json"].includes(parsedUrl.pathname) && !parsedUrl.searchParams.has("query")) return;
+      if (request.method === "GET" && ["/api/docs", "/api/openapi.json", "/api/graphql"].includes(parsedUrl.pathname) && !parsedUrl.searchParams.has("query")) return;
       if (parsedUrl.pathname === "/api/health") return;
       if (parsedUrl.pathname === "/api/setup/status") return;
       const setup = await getSetupStatus();

@@ -656,7 +656,7 @@ export async function graphqlRoutes(app: FastifyInstance): Promise<void> {
   <head>
     <title>Drakkar GraphQL</title>
     <link rel="stylesheet" href="https://unpkg.com/graphiql@2/graphiql.min.css" />
-    <style>html,body,#graphiql{height:100%;margin:0;background:#061012;color:#e7fbff}</style>
+    <style>html,body,#graphiql{height:100%;margin:0}</style>
   </head>
   <body>
     <div id="graphiql">Loading GraphiQL...</div>
@@ -683,15 +683,15 @@ export async function graphqlRoutes(app: FastifyInstance): Promise<void> {
           alignItems: 'center',
           gap: '12px',
           padding: '10px 14px',
-          borderBottom: '1px solid rgba(255,255,255,.08)',
-          background: '#081318',
-          color: '#d8fbff',
+          borderBottom: '1px solid rgba(15,23,42,.12)',
+          background: '#f8fafc',
+          color: '#0f172a',
           fontFamily: 'ui-sans-serif,system-ui,sans-serif',
           fontSize: '13px'
         }
       }, [
         React.createElement('div', { key: 'left' }, 'Drakkar GraphQL: same auth as the app. Session cookie works; token auth also works.'),
-        React.createElement('a', { key: 'right', href: '/api/docs', style: { color: '#4cead1', textDecoration: 'none', fontWeight: 600 } }, 'Open Swagger')
+        React.createElement('a', { key: 'right', href: '/api/docs', style: { color: '#0f766e', textDecoration: 'none', fontWeight: 600 } }, 'Open Swagger')
       ]);
       ReactDOM.createRoot(document.getElementById('graphiql')).render(
         React.createElement(React.Fragment, null, [
@@ -716,13 +716,9 @@ export async function graphqlRoutes(app: FastifyInstance): Promise<void> {
     <title>Drakkar API Swagger</title>
     <link rel="stylesheet" href="https://unpkg.com/swagger-ui-dist@5/swagger-ui.css" />
     <style>
-      html, body { margin: 0; background: #071014; }
+      html, body { margin: 0; background: #ffffff; }
       .swagger-ui .topbar { display: none; }
-      .swagger-ui .info, .swagger-ui .scheme-container { background: transparent; box-shadow: none; }
-      .swagger-ui, .swagger-ui .info .title, .swagger-ui .opblock-tag, .swagger-ui .opblock-summary-description, .swagger-ui .parameter__name, .swagger-ui .response-col_status { color: #e8fbff; }
-      .swagger-ui .opblock, .swagger-ui .scheme-container, .swagger-ui .info { border-color: rgba(255,255,255,.12); }
-      .swagger-ui .opblock { background: rgba(255,255,255,.03); }
-      .swagger-ui .markdown p, .swagger-ui .info p, .swagger-ui .info li, .swagger-ui .parameter__type, .swagger-ui .response-col_description { color: #9ec5cb; }
+      .swagger-ui .scheme-container { box-shadow: none; }
     </style>
   </head>
   <body>

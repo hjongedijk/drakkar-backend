@@ -91,6 +91,8 @@ export async function runRequestSyncCycle(logger: FastifyBaseLogger) {
         imported: sync.imported,
         updated: sync.updated,
         skipped: sync.skipped,
+        autoGrabbed: sync.autoGrabbed,
+        budgetExceeded: sync.budgetExceeded,
         failedProviders: sync.failedProviders,
         providers: sync.providerResults.map((provider) => ({
           name: provider.providerName,
