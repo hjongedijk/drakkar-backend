@@ -21,6 +21,15 @@ describe("inferMediaIdentity", () => {
     });
   });
 
+  it("detects multi-episode titles using the first episode as identity anchor", () => {
+    assert.deepEqual(inferMediaIdentity("Example.Show.S02E12E13.1080p.BluRay.x264-GROUP"), {
+      mediaType: "tv",
+      title: "Example Show",
+      season: 2,
+      episode: 12
+    });
+  });
+
   it("detects season packs without pretending they are one episode", () => {
     assert.deepEqual(inferMediaIdentity("Example.Show.S04.1080p.WEB-DL-GROUP"), {
       mediaType: "tv",

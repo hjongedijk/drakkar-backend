@@ -82,6 +82,16 @@ export function mediaIdentityKey(input: {
 
 export function inferMediaIdentity(rawTitle: string) {
   const normalized = cleanTitle(rawTitle);
+  const multiEpisode = normalized.match(/\bS(\d{1,2})E(\d{1,3})(?:E(\d{1,3})|[- .]E?(\d{1,3}))\b/i);
+  if (multiEpisode) {
+    return {
+      mediaType: "tv",
+      title: canonicalizeDisplayTitle(trimAtQuality(normalized.slice(0, multiEpisode.index)).trim() || normalized),
+      season: Number(multiEpisode[1]),
+      episode: Number(multiEpisode[2])
+    };
+  }
+
   const episode = normalized.match(/\bS(\d{1,2})E(\d{1,3})\b/i);
   if (episode) {
     return {

@@ -8,6 +8,7 @@ export const QUEUE_RECONCILE_TASK_ID = "download-queue-reconcile";
 export const IMPORT_RECONCILE_TASK_ID = "import-reconcile";
 export const INTERRUPTED_RECOVERY_TASK_ID = "interrupted-download-recovery";
 export const NAMING_MIGRATION_TASK_ID = "library-naming-migration";
+export const LIBRARY_CLEANUP_TASK_ID = "library-cleanup";
 export const LOG_PRUNE_TASK_ID = "log-prune";
 
 export const REQUEST_SYNC_INTERVAL_MS = 60_000;
@@ -68,6 +69,14 @@ export function registerCoreTasks() {
     id: NAMING_MIGRATION_TASK_ID,
     name: "Library Naming Migration",
     description: "Move existing imports and symlinks to the current movie/TV naming format.",
+    intervalMs: null,
+    enabled: true,
+    manualRunnable: true
+  });
+  registerTask({
+    id: LIBRARY_CLEANUP_TASK_ID,
+    name: "Library Cleanup",
+    description: "Prune orphaned links, remove empty library directories, and refresh library state without forcing a full naming migration.",
     intervalMs: null,
     enabled: true,
     manualRunnable: true

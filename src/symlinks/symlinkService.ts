@@ -44,7 +44,7 @@ function lookupTitleVariants(value: string, year?: number | null) {
   );
 }
 
-async function mediaFromImport(item: ImportItem) {
+export async function resolveImportMedia(item: ImportItem) {
   const request = item.requestId ? await prisma.mediaRequest.findUnique({ where: { id: item.requestId } }) : null;
   const download = item.downloadId ? await prisma.download.findUnique({ where: { id: item.downloadId } }) : null;
   const compactTitle = item.title.trim();
@@ -251,17 +251,38 @@ function plexLog(level: "info" | "warn", message: string, fields: Record<string,
   console[level](`\x1b[2m${new Date().toISOString()}\x1b[0m ${color}${level.toUpperCase().padEnd(5)}\x1b[0m ${message}${suffix ? ` \x1b[2m${suffix}\x1b[0m` : ""}`);
 }
 
-function validateMediaForLibraryPath(item: ImportItem, media: Awaited<ReturnType<typeof mediaFromImport>>) {
-  if (media.mediaType !== "tv") return;
-  if (
-    !Number.isInteger(media.season) ||
-    !Number.isInteger(media.episode) ||
-    media.season === undefined ||
-    media.episode === undefined ||
-    media.season < 0 ||
-    media.episode <= 0
-  ) {
-    throw new Error(`TV import ${item.id} cannot be symlinked without a valid season and episode`);
+function inferTvEpisodeTargets(item: ImportItem, media: Awaited<ReturnType<typeof resolveImportMedia>>) {
+  if (media.mediaType !== "tv") return [media];
+  const searchSpace = [item.sourcePath, item.completedPath, item.title].filter(Boolean).join(" ");
+  const multiEpisode = searchSpace.match(/\bS(?<season>\d{1,2})E(?<episode1>\d{1,3})(?:E(?<episode2a>\d{1,3})|[- .]E?(?<episode2b>\d{1,3}))\b/i);
+  if (multiEpisode?.groups) {
+    const season = media.season ?? Number(multiEpisode.groups.season);
+    const firstEpisode = Number(multiEpisode.groups.episode1);
+    const lastEpisode = Number(multiEpisode.groups.episode2a ?? multiEpisode.groups.episode2b);
+    if (Number.isInteger(season) && Number.isInteger(firstEpisode) && Number.isInteger(lastEpisode) && firstEpisode > 0 && lastEpisode >= firstEpisode && lastEpisode - firstEpisode <= 20) {
+      return Array.from({ length: lastEpisode - firstEpisode + 1 }, (_unused, index) => ({
+        ...media,
+        season,
+        episode: firstEpisode + index
+      }));
+    }
+  }
+  return [media];
+}
+
+function validateMediaForLibraryPath(item: ImportItem, targets: Array<Awaited<ReturnType<typeof resolveImportMedia>>>) {
+  for (const media of targets) {
+    if (media.mediaType !== "tv") continue;
+    if (
+      !Number.isInteger(media.season) ||
+      !Number.isInteger(media.episode) ||
+      media.season === undefined ||
+      media.episode === undefined ||
+      media.season < 0 ||
+      media.episode <= 0
+    ) {
+      throw new Error(`TV import ${item.id} cannot be symlinked without a valid season and episode`);
+    }
   }
 }
 
@@ -272,16 +293,15 @@ export async function createLibraryEntryForImport(
   const policies = await getPolicySettings();
   const naming = await getNamingSettings();
   const strategy = policies.importStrategy;
-  const media = await mediaFromImport(item);
-  validateMediaForLibraryPath(item, media);
-  const linkPath = libraryPathFor({ media, completedPath: item.completedPath, naming, strategy });
-  await mkdir(dirname(linkPath), { recursive: true });
-  const existingLink = await prisma.symlink.findUnique({ where: { linkPath } }).catch(() => null);
+  const media = await resolveImportMedia(item);
+  const targets = inferTvEpisodeTargets(item, media);
+  validateMediaForLibraryPath(item, targets);
+  const desiredLinkPaths = targets.map((target) => libraryPathFor({ media: target, completedPath: item.completedPath, naming, strategy }));
 
   const staleLinks = await prisma.symlink.findMany({
     where: {
       importId: item.id,
-      NOT: { linkPath }
+      NOT: { linkPath: { in: desiredLinkPaths } }
     }
   });
   let refreshRequired = staleLinks.length > 0;
@@ -291,55 +311,68 @@ export async function createLibraryEntryForImport(
     await prisma.symlink.delete({ where: { id: stale.id } }).catch(() => undefined);
   }
 
-  let persistedSourcePath = sourcePathForImport(item);
-  if (strategy === "copy") {
-    if (item.completedPath.startsWith("/mounted/")) throw new Error("mounted streaming imports cannot use copy strategy");
-    const existed = await lstat(linkPath).then((stats) => stats.isFile()).catch(() => false);
-    refreshRequired = refreshRequired
-      || !existed
-      || existingLink?.sourcePath !== persistedSourcePath
-      || existingLink?.importId !== item.id
-      || existingLink?.status !== strategy;
-    await removeExisting(linkPath);
-    await copyFile(item.completedPath, linkPath);
-  } else if (strategy === "strm") {
-    const nextContents = strmContents(item);
-    const contents = await readFile(linkPath, "utf8").catch(() => null);
-    refreshRequired = refreshRequired
-      || contents !== nextContents
-      || existingLink?.sourcePath !== persistedSourcePath
-      || existingLink?.importId !== item.id
-      || existingLink?.status !== strategy;
-    await removeExisting(linkPath);
-    await writeFile(linkPath, nextContents);
-  } else {
-    const sourcePath = await stagedSourcePathForImport(item);
-    persistedSourcePath = sourcePath;
-    const target = relative(dirname(linkPath), sourcePath);
-    const existingTarget = await currentSymlinkTarget(linkPath);
-    refreshRequired = refreshRequired
-      || existingTarget !== target
-      || existingLink?.sourcePath !== persistedSourcePath
-      || existingLink?.importId !== item.id
-      || existingLink?.status !== strategy;
-    await ensureSymlinkTarget(linkPath, target);
-  }
+  let stagedSourcePath: string | null = null;
+  const links = [];
+  for (let index = 0; index < desiredLinkPaths.length; index += 1) {
+    const linkPath = desiredLinkPaths[index]!;
+    const targetMedia = targets[index]!;
+    await mkdir(dirname(linkPath), { recursive: true });
+    const existingLink = await prisma.symlink.findUnique({ where: { linkPath } }).catch(() => null);
+    let persistedSourcePath = sourcePathForImport(item);
+    let linkRefreshRequired = false;
 
-  const link = await prisma.symlink.upsert({
-    where: { linkPath },
-    update: { sourcePath: persistedSourcePath, importId: item.id, status: strategy },
-    create: { sourcePath: persistedSourcePath, linkPath, importId: item.id, status: strategy }
-  });
-  if (refreshRequired) options?.changedPaths?.add(link.linkPath);
-  if ((options?.refreshPlex ?? true) && refreshRequired) {
-    void refreshPlexPath(link.linkPath)
-      .then((result) => {
-        if (!result.skipped) plexLog("info", "plex targeted refresh triggered", result);
-        else if (result.reason !== "not_configured" && result.reason !== "deduped") plexLog("warn", "plex targeted refresh skipped", result);
-      })
-      .catch((error) => plexLog("warn", "plex targeted refresh failed", { error: error instanceof Error ? error.message : error }));
+    if (strategy === "copy") {
+      if (item.completedPath.startsWith("/mounted/")) throw new Error("mounted streaming imports cannot use copy strategy");
+      const existed = await lstat(linkPath).then((stats) => stats.isFile()).catch(() => false);
+      linkRefreshRequired = !existed
+        || existingLink?.sourcePath !== persistedSourcePath
+        || existingLink?.importId !== item.id
+        || existingLink?.status !== strategy;
+      await removeExisting(linkPath);
+      await copyFile(item.completedPath, linkPath);
+    } else if (strategy === "strm") {
+      const nextContents = strmContents({
+        ...item,
+        episode: targetMedia.episode ?? item.episode,
+        season: targetMedia.season ?? item.season
+      });
+      const contents = await readFile(linkPath, "utf8").catch(() => null as string | null);
+      linkRefreshRequired = contents !== nextContents
+        || existingLink?.sourcePath !== persistedSourcePath
+        || existingLink?.importId !== item.id
+        || existingLink?.status !== strategy;
+      await removeExisting(linkPath);
+      await writeFile(linkPath, nextContents);
+    } else {
+      stagedSourcePath ??= await stagedSourcePathForImport(item);
+      persistedSourcePath = stagedSourcePath;
+      const target = relative(dirname(linkPath), stagedSourcePath);
+      const existingTarget = await currentSymlinkTarget(linkPath);
+      linkRefreshRequired = existingTarget !== target
+        || existingLink?.sourcePath !== persistedSourcePath
+        || existingLink?.importId !== item.id
+        || existingLink?.status !== strategy;
+      await ensureSymlinkTarget(linkPath, target);
+    }
+
+    const link = await prisma.symlink.upsert({
+      where: { linkPath },
+      update: { sourcePath: persistedSourcePath, importId: item.id, status: strategy },
+      create: { sourcePath: persistedSourcePath, linkPath, importId: item.id, status: strategy }
+    });
+    links.push(link);
+    refreshRequired = refreshRequired || linkRefreshRequired;
+    if (linkRefreshRequired) options?.changedPaths?.add(link.linkPath);
+    if ((options?.refreshPlex ?? true) && linkRefreshRequired) {
+      void refreshPlexPath(link.linkPath)
+        .then((result) => {
+          if (!result.skipped) plexLog("info", "plex targeted refresh triggered", result);
+          else if (result.reason !== "not_configured" && result.reason !== "deduped") plexLog("warn", "plex targeted refresh skipped", result);
+        })
+        .catch((error) => plexLog("warn", "plex targeted refresh failed", { error: error instanceof Error ? error.message : error }));
+    }
   }
-  return link;
+  return links[0]!;
 }
 
 export const createSymlinkForImport = createLibraryEntryForImport;
@@ -365,8 +398,18 @@ export async function listSymlinks() {
 export async function repairSymlinks() {
   const imports = await prisma.importItem.findMany();
   const repaired = [];
-  for (const item of imports) repaired.push(await createLibraryEntryForImport(item, { refreshPlex: false }));
-  return { repaired: repaired.length };
+  const skipped: Array<{ importId: string; reason: string }> = [];
+  for (const item of imports) {
+    try {
+      repaired.push(await createLibraryEntryForImport(item, { refreshPlex: false }));
+    } catch (error) {
+      skipped.push({
+        importId: item.id,
+        reason: error instanceof Error ? error.message : String(error)
+      });
+    }
+  }
+  return { repaired: repaired.length, skipped: skipped.length, failures: skipped.slice(0, 50) };
 }
 
 export async function cleanupSymlinks() {

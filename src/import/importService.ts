@@ -9,7 +9,7 @@ import { inferMediaIdentity, mediaIdentityKey } from "../media-library/identity.
 import { refreshMediaLibrary } from "../media-library/libraryService.js";
 import { completedPathFor, getNamingSettings } from "../naming/namingService.js";
 import { getIgnoredPatterns, matchesIgnoredPattern } from "../policies/policyService.js";
-import { createLibraryEntryForImport } from "../symlinks/symlinkService.js";
+import { createLibraryEntryForImport, resolveImportMedia } from "../symlinks/symlinkService.js";
 import { filenameFromSubject } from "../usenet/filename.js";
 import { listMountedFiles } from "../vfs/mountedNzbService.js";
 import { readMountedFileRange } from "../streaming/mountedStream.service.js";
@@ -92,16 +92,27 @@ function suspiciousImportTitle(value: string) {
 
 function inferMedia(path: string) {
   const name = basename(path, extname(path));
+  const multiEpisode = name.match(/\bS(?<season>\d{1,2})E(?<episode>\d{1,3})(?:E\d{1,3}|[- .]E?\d{1,3})\b/i);
   const seasonEpisode = name.match(/\bS(?<season>\d{1,2})E(?<episode>\d{1,3})\b/i);
   const seasonOnly = name.match(/\bS(?<season>\d{1,2})\b/i);
   const year = name.match(/\b(19\d{2}|20\d{2})\b/)?.[1];
   const titleBase = name.split(/\b(19\d{2}|20\d{2}|S\d{1,2}(?:E\d{1,3})?)\b/i)[0] ?? name;
   return {
-    mediaType: seasonEpisode || seasonOnly ? "tv" : "movie",
+    mediaType: multiEpisode || seasonEpisode || seasonOnly ? "tv" : "movie",
     title: cleanTitle(titleBase),
     year: year ? Number(year) : undefined,
-    season: seasonEpisode?.groups?.season ? Number(seasonEpisode.groups.season) : seasonOnly?.groups?.season ? Number(seasonOnly.groups.season) : undefined,
-    episode: seasonEpisode?.groups?.episode ? Number(seasonEpisode.groups.episode) : undefined,
+    season: multiEpisode?.groups?.season
+      ? Number(multiEpisode.groups.season)
+      : seasonEpisode?.groups?.season
+        ? Number(seasonEpisode.groups.season)
+        : seasonOnly?.groups?.season
+          ? Number(seasonOnly.groups.season)
+          : undefined,
+    episode: multiEpisode?.groups?.episode
+      ? Number(multiEpisode.groups.episode)
+      : seasonEpisode?.groups?.episode
+        ? Number(seasonEpisode.groups.episode)
+        : undefined,
     tmdbId: undefined as string | undefined,
     tvdbId: undefined as string | undefined
   };
@@ -608,47 +619,56 @@ export async function migrateImportsToCurrentNaming(options?: { refreshPlex?: bo
   });
   let moved = 0;
   let relinked = 0;
+  const failures: Array<{ importId: string; reason: string }> = [];
 
   for (const item of imports) {
-    const media = {
-      mediaType: item.mediaType,
-      title: item.title,
-      year: item.year,
-      season: item.season,
-      episode: item.episode,
-      tmdbId: item.request?.tmdbId ?? undefined,
-      tvdbId: item.request?.tvdbId ?? undefined
-    };
+    try {
+      const resolvedMedia = await resolveImportMedia(item);
+      const media = {
+        mediaType: resolvedMedia.mediaType,
+        title: resolvedMedia.title,
+        year: resolvedMedia.year,
+        season: resolvedMedia.season,
+        episode: resolvedMedia.episode,
+        tmdbId: resolvedMedia.tmdbId ?? item.request?.tmdbId ?? undefined,
+        tvdbId: resolvedMedia.tvdbId ?? item.request?.tvdbId ?? undefined
+      };
 
-    let current = item.completedPath;
-    if (!item.completedPath.startsWith("/mounted/")) {
-      const target = completedPathFor({
-        media,
-        sourcePath: item.sourcePath || item.completedPath,
-        naming
-      });
-      if (target !== item.completedPath) {
-        await mkdir(dirname(target), { recursive: true });
-        await rename(item.completedPath, target).catch(() => undefined);
-        current = target;
-        moved += 1;
-      }
-    }
-
-    const updated = current === item.completedPath
-      ? item
-      : await prisma.importItem.update({
-          where: { id: item.id },
-          data: { completedPath: current }
+      let current = item.completedPath;
+      if (!item.completedPath.startsWith("/mounted/")) {
+        const target = completedPathFor({
+          media,
+          sourcePath: item.sourcePath || item.completedPath,
+          naming
         });
+        if (target !== item.completedPath) {
+          await mkdir(dirname(target), { recursive: true });
+          await rename(item.completedPath, target).catch(() => undefined);
+          current = target;
+          moved += 1;
+        }
+      }
 
-    await createLibraryEntryForImport(updated, {
-      refreshPlex: options?.refreshPlex ?? false,
-      changedPaths: options?.changedPaths
-    });
-    relinked += 1;
+      const updated = current === item.completedPath
+        ? item
+        : await prisma.importItem.update({
+            where: { id: item.id },
+            data: { completedPath: current }
+          });
+
+      await createLibraryEntryForImport(updated, {
+        refreshPlex: options?.refreshPlex ?? false,
+        changedPaths: options?.changedPaths
+      });
+      relinked += 1;
+    } catch (error) {
+      failures.push({
+        importId: item.id,
+        reason: error instanceof Error ? error.message : String(error)
+      });
+    }
   }
 
   await refreshMediaLibrary();
-  return { moved, relinked };
+  return { moved, relinked, skipped: failures.length, failures: failures.slice(0, 50) };
 }

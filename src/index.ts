@@ -82,8 +82,11 @@ try {
         () => migrateImportsToCurrentNaming({ refreshPlex: false, changedPaths: startupPlexRefreshPaths })
       );
       markTaskCompleted(NAMING_MIGRATION_TASK_ID);
-      if (namingMigration && (namingMigration.moved > 0 || namingMigration.relinked > 0)) {
+      if (namingMigration && (namingMigration.moved > 0 || namingMigration.relinked > 0 || namingMigration.skipped > 0)) {
         app.log.info({ namingMigration }, "library naming migration completed");
+      }
+      if (namingMigration?.skipped) {
+        app.log.warn({ skipped: namingMigration.skipped, failures: namingMigration.failures }, "library naming migration skipped invalid imports");
       }
       await pruneLibraryDirectories().catch(() => undefined);
       if (env.STARTUP_RECOVERY_ENABLED) {

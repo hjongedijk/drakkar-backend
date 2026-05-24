@@ -132,11 +132,14 @@ describe("parseReleaseTitle", () => {
   it("parses Sonarr-style SxxExx and 1x03 episode titles", () => {
     const sxxexx = parseReleaseTitle("The.Last.of.Us.S01E03.Long.Long.Time.2160p.WEB-DL-GROUP");
     const oneBy = parseReleaseTitle("The.Last.of.Us.1x03.Long.Long.Time.1080p.WEB-DL-GROUP");
+    const multi = parseReleaseTitle("Avatar.The.Last.Airbender.S02E12E13.1080p.BluRay.x264-CiNEFiLE");
 
     assert.equal(sxxexx.season, 1);
     assert.equal(sxxexx.episode, 3);
     assert.equal(oneBy.season, 1);
     assert.equal(oneBy.episode, 3);
+    assert.equal(multi.season, 2);
+    assert.equal(multi.episode, 12);
   });
 
   it("parses daily TV date as year metadata", () => {
