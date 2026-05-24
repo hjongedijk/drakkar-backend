@@ -607,7 +607,27 @@ export function getImport(id: string) {
 
 export async function reprocessImport(id: string) {
   const item = await getImport(id);
-  await createLibraryEntryForImport(item);
+  const resolved = await resolveImportMedia(item);
+  const updated = await prisma.importItem.update({
+    where: { id: item.id },
+    data: {
+      mediaType: resolved.mediaType,
+      title: resolved.title,
+      year: resolved.year,
+      season: resolved.season,
+      episode: resolved.episode
+    }
+  });
+  await writeImportMetadata({
+    importId: updated.id,
+    title: updated.title,
+    completedPath: updated.completedPath,
+    mediaType: updated.mediaType,
+    year: updated.year,
+    season: updated.season,
+    episode: updated.episode
+  }).catch(() => undefined);
+  await createLibraryEntryForImport(updated);
   await refreshMediaLibrary();
   return getImport(id);
 }

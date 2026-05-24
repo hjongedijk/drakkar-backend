@@ -27,9 +27,24 @@ let rssRunningStartedAt = 0;
 let logPruneRunning = false;
 let logPruneRunningStartedAt = 0;
 const STALE_SCHEDULER_GUARD_MS = 15 * 60_000;
+const REQUEST_SYNC_STEP_TIMEOUT_MS = 45_000;
 
 function schedulerFlagIsStale(startedAt: number) {
   return startedAt > 0 && Date.now() - startedAt > STALE_SCHEDULER_GUARD_MS;
+}
+
+async function withStepTimeout<T>(step: string, action: Promise<T>, timeoutMs = REQUEST_SYNC_STEP_TIMEOUT_MS): Promise<T> {
+  let timeoutId: NodeJS.Timeout | undefined;
+  try {
+    return await Promise.race([
+      action,
+      new Promise<T>((_, reject) => {
+        timeoutId = setTimeout(() => reject(new Error(`${step} exceeded ${timeoutMs}ms`)), timeoutMs);
+      })
+    ]);
+  } finally {
+    if (timeoutId) clearTimeout(timeoutId);
+  }
 }
 
 export async function runLogPruneCycle(logger: FastifyBaseLogger) {
@@ -85,7 +100,7 @@ export async function runRequestSyncCycle(logger: FastifyBaseLogger) {
   runningStartedAt = Date.now();
   try {
     await runTrackedTask(REQUEST_SYNC_TASK_ID, async () => {
-      const sync = await syncRequests();
+      const sync = await withStepTimeout("syncRequests", syncRequests());
       logger.info({
         fetched: sync.fetched,
         imported: sync.imported,
@@ -103,20 +118,20 @@ export async function runRequestSyncCycle(logger: FastifyBaseLogger) {
           ok: provider.ok
         }))
       }, "request sync completed");
-      const importReconcile = await reconcileAvailableDownloadsWithoutImports(logger);
+      const importReconcile = await withStepTimeout("reconcileAvailableDownloadsWithoutImports", reconcileAvailableDownloadsWithoutImports(logger));
       if (importReconcile.mountedFixed > 0 || importReconcile.materializedImported > 0 || importReconcile.requeued > 0 || importReconcile.failed > 0) {
         logger.info(importReconcile, "stale prepared/available imports reconciled");
       }
-      await recoverFailedRequestDownloads();
-      const selectedReleaseRecovery = await recoverSelectedReleaseDownloads();
+      await withStepTimeout("recoverFailedRequestDownloads", recoverFailedRequestDownloads());
+      const selectedReleaseRecovery = await withStepTimeout("recoverSelectedReleaseDownloads", recoverSelectedReleaseDownloads());
       if (selectedReleaseRecovery.recovered > 0) {
         logger.info({ recovered: selectedReleaseRecovery.recovered }, "selected releases without downloads were re-queued");
       }
-      const metadataBackfill = await backfillPlaceholderRequestMetadata();
+      const metadataBackfill = await withStepTimeout("backfillPlaceholderRequestMetadata", backfillPlaceholderRequestMetadata());
       if (metadataBackfill.updated > 0) {
         logger.info(metadataBackfill, "placeholder request titles backfilled from metadata");
       }
-      const monitored = await ensureMonitoredRequests();
+      const monitored = await withStepTimeout("ensureMonitoredRequests", ensureMonitoredRequests());
       if (monitored.retried > 0 || monitored.skippedBecauseQueueFull > 0) {
         logger.info({
           retried: monitored.retried,
@@ -125,7 +140,7 @@ export async function runRequestSyncCycle(logger: FastifyBaseLogger) {
           skippedBecauseQueueFull: monitored.skippedBecauseQueueFull
         }, "monitored request queue seeding completed");
       }
-      const cleanup = await cleanupDownloadHistory({ keepFailed: 0, keepCancelled: 0 });
+      const cleanup = await withStepTimeout("cleanupDownloadHistory", cleanupDownloadHistory({ keepFailed: 0, keepCancelled: 0 }));
       if (cleanup.deleted > 0 || cleanup.cleanedFailedJobs > 0) logger.info(cleanup, "download history auto-cleaned");
       return sync;
     });

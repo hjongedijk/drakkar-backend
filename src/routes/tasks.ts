@@ -11,8 +11,8 @@ import {
   REQUEST_SYNC_TASK_ID,
   registerCoreTasks
 } from "../tasks/coreTasks.js";
-import { getTask, listTasks, runTrackedTask } from "../tasks/taskRegistry.js";
-import { migrateImportsToCurrentNaming } from "../import/importService.js";
+import { getTask, isTaskStaleRunning, listTasks, runTrackedTask } from "../tasks/taskRegistry.js";
+import { migrateImportsToCurrentNaming, repairSuspiciousImports } from "../import/importService.js";
 import { runBackgroundRepairSweep } from "../repair/repairService.js";
 import { runLogPruneCycle, runNzbhydraRssSyncCycle, runRequestSyncCycle } from "../requests/sync/scheduler.js";
 import { refreshMediaLibrary } from "../media-library/libraryService.js";
@@ -38,7 +38,7 @@ export async function taskRoutes(app: FastifyInstance): Promise<void> {
     const task = getTask(id);
     if (!task) return reply.status(404).send({ message: "Task not found." });
     if (!task.manualRunnable) return reply.status(400).send({ message: "Task cannot be run manually." });
-    if (task.status === "running") return { task, skipped: true, reason: "already_running" };
+    if (task.status === "running" && !isTaskStaleRunning(id)) return { task, skipped: true, reason: "already_running" };
 
     let result: unknown;
     switch (id) {
@@ -61,15 +61,20 @@ export async function taskRoutes(app: FastifyInstance): Promise<void> {
         result = await runTrackedTask(id, () => recoverInterruptedDownloads(app.log));
         break;
       case NAMING_MIGRATION_TASK_ID:
-        result = await runTrackedTask(id, () => migrateImportsToCurrentNaming());
+        result = await runTrackedTask(id, async () => {
+          const migrated = await migrateImportsToCurrentNaming();
+          const repaired = await repairSuspiciousImports();
+          return { migrated, repaired };
+        });
         break;
       case LIBRARY_CLEANUP_TASK_ID:
         result = await runTrackedTask(id, async () => {
           const symlinkCleanup = await cleanupSymlinks();
           const pruned = await pruneLibraryDirectories();
           const nzbPaths = await normalizeNzbStoragePaths();
+          const suspicious = await repairSuspiciousImports();
           await refreshMediaLibrary();
-          return { symlinkCleanup, pruned, nzbPaths };
+          return { symlinkCleanup, pruned, nzbPaths, suspicious };
         });
         break;
       case LOG_PRUNE_TASK_ID:

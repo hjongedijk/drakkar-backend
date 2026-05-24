@@ -31,6 +31,10 @@ function isStaleRunningTask(task: Pick<ScheduledTask, "status" | "lastStartedAt"
   return Date.now() - new Date(task.lastStartedAt).getTime() > STALE_RUNNING_TASK_MS;
 }
 
+export function isTaskStaleRunning(id: string) {
+  return isStaleRunningTask(tasks.get(id));
+}
+
 export function registerTask(definition: TaskDefinition) {
   const existing = tasks.get(definition.id);
   const recoveredRunning = isStaleRunningTask(existing);
