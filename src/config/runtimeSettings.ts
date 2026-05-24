@@ -88,6 +88,7 @@ const runtimeSettingsSchema = z.object({
 });
 
 export type RuntimeSettings = z.infer<typeof runtimeSettingsSchema>;
+let cachedRuntimeSettings: RuntimeSettings | null = null;
 
 function defaultRuntimeSettings(): RuntimeSettings {
   return {
@@ -218,6 +219,7 @@ export function ensureRuntimeSettings(configDir = process.env.CONFIG_DIR || "/da
   if (!existsSync(path)) {
     const created = defaultRuntimeSettings();
     writeFileSync(path, `${JSON.stringify(created, null, 2)}\n`, { mode: 0o600 });
+    cachedRuntimeSettings = created;
     return created;
   }
 
@@ -239,5 +241,34 @@ export function ensureRuntimeSettings(configDir = process.env.CONFIG_DIR || "/da
   }
   const merged = runtimeSettingsSchema.parse({ ...defaultRuntimeSettings(), ...input });
   writeFileSync(path, `${JSON.stringify(merged, null, 2)}\n`, { mode: 0o600 });
+  cachedRuntimeSettings = merged;
   return merged;
+}
+
+export function getRuntimeSettings(configDir = process.env.CONFIG_DIR || "/data/config"): RuntimeSettings {
+  return cachedRuntimeSettings ?? ensureRuntimeSettings(configDir);
+}
+
+export function getFrontendApiToken(configDir = process.env.CONFIG_DIR || "/data/config") {
+  return getRuntimeSettings(configDir).frontendApiToken;
+}
+
+export function updateRuntimeSettings(
+  updater: (current: RuntimeSettings) => RuntimeSettings,
+  configDir = process.env.CONFIG_DIR || "/data/config"
+): RuntimeSettings {
+  const resolvedConfigDir = resolveConfigDir(configDir);
+  const current = ensureRuntimeSettings(resolvedConfigDir);
+  const next = runtimeSettingsSchema.parse(updater(current));
+  const path = runtimeSettingsPath(resolvedConfigDir);
+  writeFileSync(path, `${JSON.stringify(next, null, 2)}\n`, { mode: 0o600 });
+  cachedRuntimeSettings = next;
+  return next;
+}
+
+export function rotateFrontendApiToken(configDir = process.env.CONFIG_DIR || "/data/config") {
+  return updateRuntimeSettings((current) => ({
+    ...current,
+    frontendApiToken: `drakkar_${randomBytes(32).toString("base64url")}`
+  }), configDir);
 }

@@ -59,7 +59,7 @@ export function buildApp() {
     const parsedUrl = new URL(request.url, env.APP_BASE_URL);
     if (request.method === "GET" && parsedUrl.pathname === "/api/graphql" && !parsedUrl.searchParams.has("query")) return;
     const apiToken = request.headers["x-api-token"] ?? parsedUrl.searchParams.get("apiToken") ?? "";
-    if (apiToken !== env.FRONTEND_API_TOKEN) {
+    if (apiToken !== env.getFrontendApiToken(env.CONFIG_DIR)) {
       return reply.status(401).send({ message: "Invalid frontend API token." });
     }
   });

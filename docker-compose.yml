@@ -3,6 +3,7 @@ services:
     image: ghcr.io/hjongedijk/drakkar-backend:latest
     pull_policy: always
     restart: unless-stopped
+    user: 0:0
     init: true
     tty: true
     stdin_open: true
@@ -40,6 +41,7 @@ services:
     image: ghcr.io/hjongedijk/drakkar-frontend:latest
     pull_policy: always
     restart: unless-stopped
+    user: 0:0
     init: true
     tty: true
     stdin_open: true
@@ -67,6 +69,7 @@ services:
   postgres:
     image: postgres:16-alpine
     restart: unless-stopped
+    user: 0:0
     environment:
       POSTGRES_USER: postgres
       POSTGRES_PASSWORD: postgres
@@ -90,6 +93,7 @@ services:
   valkey:
     image: valkey/valkey:8-alpine
     restart: unless-stopped
+    user: 0:0
     command: ["valkey-server", "--appendonly", "no", "--save", "900", "1", "--save", "300", "10", "--save", "60", "10000"]
     volumes:
       - ./valkey-data:/data
@@ -110,6 +114,7 @@ services:
   valkey-insight:
     image: redis/redisinsight:latest
     restart: unless-stopped
+    user: 0:0
     profiles: ["debug"]
     depends_on:
       valkey:
@@ -129,7 +134,7 @@ services:
   seerr:
     image: ghcr.io/seerr-team/seerr:latest
     restart: unless-stopped
-    profiles: ["extras"]
+    user: 0:0
     depends_on:
       backend:
         condition: service_healthy
