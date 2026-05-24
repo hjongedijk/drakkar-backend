@@ -25,6 +25,7 @@ const TV_EPISODE_DOWNLOADS_PER_REQUEST_PASS = 4;
 const MONITORED_REQUESTS_MAX_DURATION_MS = 20_000;
 const REQUEST_SYNC_MAX_DURATION_MS = 35_000;
 const REQUEST_SYNC_PROVIDER_MAX_REQUESTS = 200;
+const FAILED_REQUEST_RECOVERY_MAX_PER_CYCLE = 12;
 const SEERR_WEBHOOK_PRIORITY = 900;
 
 function blockReasonFromFailure(message?: string | null) {
@@ -40,7 +41,8 @@ function blockReasonFromFailure(message?: string | null) {
 function scoreReleaseForRequest(
   request: Pick<MediaRequest, "mediaType" | "title" | "year">,
   release: Parameters<typeof scoreRelease>[0],
-  profile: Awaited<ReturnType<typeof resolveProfile>>
+  profile: Awaited<ReturnType<typeof resolveProfile>>,
+  options?: { rejectAmbiguousAnime?: boolean }
 ) {
   const decision = scoreRelease(release, profile);
   const reasons = [...decision.reasons];
@@ -49,6 +51,18 @@ function scoreReleaseForRequest(
   }
   if (request.mediaType === "movie" && request.year && decision.parsed.year && decision.parsed.year !== request.year) {
     reasons.push(`movie year ${decision.parsed.year} does not match requested year ${request.year}`);
+  }
+  if (
+    options?.rejectAmbiguousAnime &&
+    request.mediaType === "tv" &&
+    /\banime\b/i.test(release.category ?? "") &&
+    request.year &&
+    !new RegExp(`\\b${request.year}\\b`).test(release.title) &&
+    !release.imdbId &&
+    !release.tmdbId &&
+    !release.tvdbId
+  ) {
+    reasons.push("ambiguous anime-category release rejected for year-specific TV request");
   }
   const accepted = reasons.length === 0;
   return {
@@ -449,11 +463,18 @@ export async function recoverFailedRequestDownloads() {
     where: {
       downloadId: { not: null },
       status: { not: "available" }
-    }
+    },
+    orderBy: { updatedAt: "asc" },
+    take: FAILED_REQUEST_RECOVERY_MAX_PER_CYCLE
   });
+  const downloadIds = [...new Set(requests.flatMap((request) => request.downloadId ? [request.downloadId] : []))];
+  const downloads = downloadIds.length > 0
+    ? await prisma.download.findMany({ where: { id: { in: downloadIds } } })
+    : [];
+  const downloadMap = new Map(downloads.map((download) => [download.id, download]));
   const recovered = [];
   for (const request of requests) {
-    const download = request.downloadId ? await prisma.download.findUnique({ where: { id: request.downloadId } }) : null;
+    const download = request.downloadId ? downloadMap.get(request.downloadId) ?? null : null;
     if (!download) {
       await prisma.mediaRequest.update({ where: { id: request.id }, data: { status: "release_failed", downloadId: null } });
       recovered.push(await grabForRequestMediaType(request.id, request.mediaType));
@@ -464,8 +485,8 @@ export async function recoverFailedRequestDownloads() {
     await prisma.mediaRequest.update({ where: { id: request.id }, data: { status: "release_failed", downloadId: null } });
     recovered.push(await grabForRequestMediaType(request.id, request.mediaType));
   }
-  await refreshMediaLibrary().catch(() => undefined);
-  return { recovered: recovered.length, results: recovered };
+  if (recovered.length > 0) await refreshMediaLibrary().catch(() => undefined);
+  return { scanned: requests.length, recovered: recovered.length, results: recovered };
 }
 
 export async function recoverSelectedReleaseDownloads() {
@@ -1164,13 +1185,14 @@ export async function rankReleasesForRequest(id: string) {
     request.selectedProfileId ??
     (request.mediaType === "tv" ? request.provider?.defaultTvProfile ?? settings.defaultTvProfile : request.provider?.defaultMovieProfile ?? settings.defaultMovieProfile);
   const profile = await resolveProfile(configuredProfileId, request.mediaType);
+  const rejectAmbiguousAnime = request.mediaType === "tv" && Boolean(request.year);
   const { releases } = await searchForRequest(id);
   const ranked = await Promise.all(
     releases.map(async (release) => ({
       release,
       decision: (await isReleaseBlocklisted(release))
-        ? { ...scoreReleaseForRequest(request, release, profile), accepted: false, score: -1000, reasons: ["release is blocklisted"] }
-        : scoreReleaseForRequest(request, release, profile)
+        ? { ...scoreReleaseForRequest(request, release, profile, { rejectAmbiguousAnime }), accepted: false, score: -1000, reasons: ["release is blocklisted"] }
+        : scoreReleaseForRequest(request, release, profile, { rejectAmbiguousAnime })
     }))
   );
   ranked.sort((a, b) => b.decision.score - a.decision.score);
@@ -1183,6 +1205,7 @@ export async function rankTvEpisodeForRequest(id: string, season: number, episod
   const settings = await getSettings();
   const configuredProfileId = request.selectedProfileId ?? request.provider?.defaultTvProfile ?? settings.defaultTvProfile;
   const profile = await resolveProfile(configuredProfileId, request.mediaType);
+  const rejectAmbiguousAnime = Boolean(request.year);
   const releases = await runSearch({
     kind: "episode",
     query: request.title,
@@ -1196,8 +1219,8 @@ export async function rankTvEpisodeForRequest(id: string, season: number, episod
     releases.map(async (release) => ({
       release,
       decision: (await isReleaseBlocklisted(release))
-        ? { ...scoreReleaseForRequest(request, release, profile), accepted: false, score: -1000, reasons: ["release is blocklisted"] }
-        : scoreReleaseForRequest(request, release, profile)
+        ? { ...scoreReleaseForRequest(request, release, profile, { rejectAmbiguousAnime }), accepted: false, score: -1000, reasons: ["release is blocklisted"] }
+        : scoreReleaseForRequest(request, release, profile, { rejectAmbiguousAnime })
     }))
   );
   ranked.sort((a, b) => b.decision.score - a.decision.score);
@@ -1236,13 +1259,14 @@ export async function grabBestForRequest(id: string, options?: { priorityBoost?:
     request.selectedProfileId ??
     (request.mediaType === "tv" ? request.provider?.defaultTvProfile ?? settings.defaultTvProfile : request.provider?.defaultMovieProfile ?? settings.defaultMovieProfile);
   const profile = await resolveProfile(configuredProfileId, request.mediaType);
+  const rejectAmbiguousAnime = request.mediaType === "tv" && Boolean(request.year);
   const { releases } = await searchForRequest(id);
   const scored = await Promise.all(
     releases.map(async (release) => ({
       release,
       decision: (await isReleaseBlocklisted(release))
-        ? { ...scoreReleaseForRequest(request, release, profile), accepted: false, score: -1000, reasons: ["release is blocklisted"] }
-        : scoreReleaseForRequest(request, release, profile)
+        ? { ...scoreReleaseForRequest(request, release, profile, { rejectAmbiguousAnime }), accepted: false, score: -1000, reasons: ["release is blocklisted"] }
+        : scoreReleaseForRequest(request, release, profile, { rejectAmbiguousAnime })
     }))
   );
   const ranked = scored.filter((item) => item.decision.accepted).sort((a, b) => b.decision.score - a.decision.score);
@@ -1480,6 +1504,7 @@ async function grabBestTvSeasonForRequest(
   const settings = await getSettings();
   const configuredProfileId = request.selectedProfileId ?? request.provider?.defaultTvProfile ?? settings.defaultTvProfile;
   const profile = await resolveProfile(configuredProfileId, request.mediaType);
+  const rejectAmbiguousAnime = Boolean(request.year);
   const seriesStructure = await fetchSeriesStructure(settings, {
     mediaType: "tv",
     title: request.title,
@@ -1516,8 +1541,8 @@ async function grabBestTvSeasonForRequest(
     releases.map(async (release) => ({
       release,
       decision: (await isReleaseBlocklisted(release))
-        ? { ...scoreReleaseForRequest(request, release, profile), accepted: false, score: -1000, reasons: ["release is blocklisted"] }
-        : scoreReleaseForRequest(request, release, profile)
+        ? { ...scoreReleaseForRequest(request, release, profile, { rejectAmbiguousAnime }), accepted: false, score: -1000, reasons: ["release is blocklisted"] }
+        : scoreReleaseForRequest(request, release, profile, { rejectAmbiguousAnime })
     }))
   );
   const accepted = scored.filter((item) => item.decision.accepted).sort((a, b) => b.decision.score - a.decision.score);
@@ -1644,8 +1669,8 @@ async function searchEpisodesForSeason(
         releases.map(async (release) => ({
           release,
           decision: (await isReleaseBlocklisted(release))
-            ? { ...scoreReleaseForRequest(request, release, profile), accepted: false, score: -1000, reasons: ["release is blocklisted"] }
-            : scoreReleaseForRequest(request, release, profile)
+            ? { ...scoreReleaseForRequest(request, release, profile, { rejectAmbiguousAnime: Boolean(request.year) }), accepted: false, score: -1000, reasons: ["release is blocklisted"] }
+            : scoreReleaseForRequest(request, release, profile, { rejectAmbiguousAnime: Boolean(request.year) })
         }))
       );
       return scored

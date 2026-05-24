@@ -223,6 +223,7 @@ async function metadataCandidateMatchesMedia(
   }
 ) {
   if (media.mediaType === "movie") return !(media.year != null && candidate.year != null && media.year !== candidate.year);
+  if (media.mediaType === "tv" && media.year == null && candidate.year != null) return false;
   if (media.mediaType !== "tv" || media.season == null || media.episode == null) return true;
   if (!candidate.tmdbId && !candidate.tvdbId) return true;
   const structure = await fetchSeriesStructure(settings, {
