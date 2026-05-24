@@ -29,7 +29,7 @@ import { buildLineLogger } from "./logging/lineLogger.js";
 export function buildApp() {
   registerCoreTasks();
   const app = Fastify({
-    logger: buildLineLogger(env.LOG_LEVEL),
+    loggerInstance: buildLineLogger(env.LOG_LEVEL),
     disableRequestLogging: true,
     genReqId: (request) => {
       const header = request.headers["x-request-id"];
