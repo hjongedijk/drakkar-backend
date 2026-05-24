@@ -21,6 +21,7 @@ import {
   refreshRequest,
   setRequestStatus,
   syncRequests,
+  syncRequestFromWebhook,
   testRequestProvider,
   updateProvider
 } from "../requests/sync/service.js";
@@ -117,6 +118,18 @@ export async function requestRoutes(app: FastifyInstance): Promise<void> {
       monitored: { retried: 0, deferred: true },
       requests: result.requests.map(publicRequest)
     });
+  });
+  app.post("/api/webhooks/seerr", async (request) => {
+    const providerId = (request.body && typeof request.body === "object" && "providerId" in (request.body as Record<string, unknown>))
+      ? String((request.body as Record<string, unknown>).providerId ?? "")
+      : undefined;
+    const result = await syncRequestFromWebhook(request.body, providerId);
+    request.log.info({
+      mode: "mode" in result ? result.mode : "noop",
+      requestId: "requestId" in result ? result.requestId : undefined,
+      ok: result.ok
+    }, "seerr webhook processed");
+    return publicResult(result);
   });
   app.post("/api/requests/:id/approve", async (request) => publicRequest(await setRequestStatus(idParam(request), "approved")));
   app.post("/api/requests/:id/reject", async (request) => publicRequest(await setRequestStatus(idParam(request), "rejected")));

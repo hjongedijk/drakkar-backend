@@ -3,15 +3,15 @@ import { prisma } from "../../db/prisma.js";
 import { redis } from "../../db/redis.js";
 import { downloadNzb, refreshNzbhydraUpdateFeeds } from "../../indexers/nzbhydra/client.js";
 import { refreshMediaLibrary } from "../../media-library/libraryService.js";
-import { fetchSeasonEpisodes, fetchSeriesStructure } from "../../metadata/metadataService.js";
+import { fetchMediaDetails as fetchMetadataDetails, fetchSeasonEpisodes, fetchSeriesStructure } from "../../metadata/metadataService.js";
 import { runSearch } from "../../search/searchService.js";
 import { getSettings } from "../../settings/settingsStore.js";
-import { addNzbFromPath, findReusableDownload } from "../../downloads/downloadService.js";
+import { addNzbFromPath, findReusableDownload, promoteDownloadPriority } from "../../downloads/downloadService.js";
 import { mediaIdentityKey, normalizeTitleForIdentity } from "../../media-library/identity.js";
 import { scoreRelease } from "../../quality/scoring.js";
 import { ensureDefaultProfiles } from "../../quality/profileService.js";
 import { createBlocklistItem, isReleaseBlocklisted } from "../../policies/policyService.js";
-import { createSeerrRequest, fetchSeerrRequests, testSeerrConnection, updateSeerrAvailable } from "../seerr/client.js";
+import { createSeerrRequest, fetchSeerrRequestById, fetchSeerrRequests, testSeerrConnection, updateSeerrAvailable } from "../seerr/client.js";
 import type { ExternalMediaRequest } from "../types.js";
 
 const TV_ACTIVE_DOWNLOAD_STATUSES = ["queued", "fetching_nzb", "verifying", "prepared", "waiting_for_provider", "waiting_for_nzb", "downloading", "paused"];
@@ -20,6 +20,8 @@ const REQUEST_RELEASE_CACHE_SECONDS = 6 * 60 * 60;
 const MONITOR_QUEUE_SEED_STATUSES = ["queued", "fetching_nzb", "verifying", "waiting_for_provider", "waiting_for_nzb", "downloading", "paused"];
 const TV_SEASONS_PER_MONITOR_PASS = 8;
 const TV_EPISODE_DOWNLOADS_PER_REQUEST_PASS = 4;
+const MONITORED_REQUESTS_MAX_DURATION_MS = 45_000;
+const SEERR_WEBHOOK_PRIORITY = 900;
 
 function blockReasonFromFailure(message?: string | null) {
   const normalized = (message ?? "").toLowerCase();
@@ -94,7 +96,10 @@ async function enrichTvRequestWithStructure(request: ExternalMediaRequest) {
   }).catch(() => undefined);
   if (!structure) return request;
 
-  const requestedSeasonNumbers = requestedSeasons(request.seasons as Prisma.JsonValue | null | undefined);
+  const explicitRequestedEpisodes = requestedEpisodesBySeason(request.episodes as Prisma.JsonValue | null | undefined);
+  const requestedSeasonNumbers = explicitRequestedEpisodes.size > 0
+    ? requestedSeasons(request.seasons as Prisma.JsonValue | null | undefined)
+    : [];
   const enrichedSeasons =
     requestedSeasonNumbers.length > 0
       ? requestedSeasonNumbers.map((seasonNumber) => {
@@ -119,6 +124,34 @@ async function enrichTvRequestWithStructure(request: ExternalMediaRequest) {
     ...request,
     seasons: enrichedSeasons,
     episodes: request.episodes ?? undefined
+  };
+}
+
+function isPlaceholderRequestTitle(value?: string | null) {
+  return Boolean(value && /^Request \d+$/i.test(value.trim()));
+}
+
+async function enrichRequestMetadataFallback(request: ExternalMediaRequest) {
+  if (!request.tmdbId && !request.tvdbId && !request.imdbId) return request;
+  const needsMetadata = !request.title || isPlaceholderRequestTitle(request.title) || !request.year;
+  if (!needsMetadata) return request;
+  const settings = await getSettings();
+  const details = await fetchMetadataDetails(settings, {
+    mediaType: request.mediaType,
+    title: request.title,
+    year: request.year,
+    tmdbId: request.tmdbId,
+    tvdbId: request.tvdbId,
+    imdbId: request.imdbId
+  }).catch(() => undefined);
+  if (!details) return request;
+  return {
+    ...request,
+    title: isPlaceholderRequestTitle(request.title) || !request.title ? details.title ?? request.title : request.title,
+    year: request.year ?? details.year,
+    tmdbId: request.tmdbId ?? details.tmdbId,
+    tvdbId: request.tvdbId ?? details.tvdbId,
+    imdbId: request.imdbId ?? details.imdbId
   };
 }
 
@@ -194,7 +227,10 @@ export async function syncRequests(providerId?: string) {
       fetchedForProvider = requests.length;
       const syncedRequests: MediaRequest[] = [];
       for (const request of requests) {
-        const hydrated = await enrichTvRequestWithStructure(request);
+        const hydratedBase = await enrichRequestMetadataFallback(request);
+        const hydrated = hydratedBase.mediaType === "tv"
+          ? await enrichTvRequestWithStructure(hydratedBase)
+          : hydratedBase;
         const { request: synced, action } = await upsertRequest(provider, hydrated);
         imported.push(synced);
         syncedRequests.push(synced);
@@ -273,6 +309,112 @@ export async function syncRequests(providerId?: string) {
   };
 }
 
+function stringValue(value: unknown) {
+  if (typeof value === "string" && value.trim()) return value.trim();
+  if (typeof value === "number" && Number.isFinite(value)) return String(value);
+  return undefined;
+}
+
+function objectValue(value: unknown) {
+  return value && typeof value === "object" ? value as Record<string, unknown> : undefined;
+}
+
+function extractWebhookRequestId(payload: unknown) {
+  const root = objectValue(payload);
+  const request = objectValue(root?.request);
+  return (
+    stringValue(request?.request_id) ??
+    stringValue(request?.id) ??
+    stringValue(root?.request_id) ??
+    stringValue(root?.requestId)
+  );
+}
+
+function extractWebhookProviderId(payload: unknown) {
+  const root = objectValue(payload);
+  return stringValue(root?.providerId) ?? stringValue(root?.provider_id);
+}
+
+function eventSuggestsSync(payload: unknown) {
+  const root = objectValue(payload);
+  const event = `${stringValue(root?.notification_type) ?? ""} ${stringValue(root?.event) ?? ""}`.toLowerCase();
+  return /request/.test(event);
+}
+
+async function maybeAutoGrabWebhookRequest(provider: RequestProvider, synced: MediaRequest) {
+  if (!(await shouldAutoGrabSyncedRequest(synced))) return null;
+  await refreshNzbhydraUpdateFeeds(await getSettings()).catch(() => undefined);
+  try {
+    return synced.mediaType === "tv"
+      ? await grabMissingTvForRequest(synced.id, { priorityBoost: SEERR_WEBHOOK_PRIORITY })
+      : await grabBestForRequest(synced.id, { priorityBoost: SEERR_WEBHOOK_PRIORITY });
+  } catch (error) {
+    await prisma.mediaRequest.update({
+      where: { id: synced.id },
+      data: { status: "approved", downloadId: null }
+    }).catch(() => undefined);
+    await prisma.requestProvider.update({
+      where: { id: provider.id },
+      data: { lastError: error instanceof Error ? error.message : "automatic request grab failed" }
+    }).catch(() => undefined);
+    throw error;
+  }
+}
+
+export async function syncRequestFromWebhook(payload: unknown, providerId?: string) {
+  const effectiveProviderId = providerId ?? extractWebhookProviderId(payload);
+  const providers = await prisma.requestProvider.findMany({
+    where: { type: "seerr", enabled: true, ...(effectiveProviderId ? { id: effectiveProviderId } : {}) },
+    orderBy: { createdAt: "asc" }
+  });
+  if (providers.length === 0) {
+    return { ok: false, mode: "noop", reason: "no_enabled_seerr_provider" as const };
+  }
+
+  const externalId = extractWebhookRequestId(payload);
+  if (!externalId || !eventSuggestsSync(payload)) {
+    const sync = await syncRequests(effectiveProviderId);
+    return { ok: true, mode: "full-sync" as const, requestId: externalId ?? null, sync };
+  }
+
+  for (const provider of providers) {
+    try {
+      const request = await fetchSeerrRequestById(provider, externalId);
+      if (!request) continue;
+      const hydratedBase = await enrichRequestMetadataFallback(request);
+      const hydrated = hydratedBase.mediaType === "tv"
+        ? await enrichTvRequestWithStructure(hydratedBase)
+        : hydratedBase;
+      const result = await upsertRequest(provider, hydrated);
+      await prisma.requestProvider.update({
+        where: { id: provider.id },
+        data: { lastSyncAt: new Date(), lastError: null }
+      }).catch(() => undefined);
+      const grabbed = await maybeAutoGrabWebhookRequest(provider, result.request).catch((error) => ({
+        error: error instanceof Error ? error.message : "automatic request grab failed"
+      }));
+      await refreshMediaLibrary().catch(() => undefined);
+      return {
+        ok: true,
+        mode: "targeted" as const,
+        providerId: provider.id,
+        requestId: externalId,
+        action: result.action,
+        request: result.request,
+        grabbed: grabbed ?? null
+      };
+    } catch (error) {
+      await prisma.requestProvider.update({
+        where: { id: provider.id },
+        data: { lastError: error instanceof Error ? error.message : "webhook sync failed" }
+      }).catch(() => undefined);
+    }
+  }
+
+  const sync = await syncRequests(effectiveProviderId);
+  return { ok: true, mode: "full-sync" as const, requestId: externalId, sync };
+}
+
 export async function recoverFailedRequestDownloads() {
   const requests = await prisma.mediaRequest.findMany({
     where: {
@@ -312,6 +454,7 @@ async function monitoredQueuePendingCount() {
 export async function ensureMonitoredRequests() {
   const settings = await getSettings();
   const queueSeedTarget = Math.max(1, settings.monitorQueueSeedTarget);
+  const startedAt = Date.now();
   let pendingQueueItems = await monitoredQueuePendingCount();
   const requests = await prisma.mediaRequest.findMany({
     where: {
@@ -323,6 +466,7 @@ export async function ensureMonitoredRequests() {
   const retried = [];
   let skippedBecauseQueueFull = 0;
   for (const request of requests) {
+    if (Date.now() - startedAt >= MONITORED_REQUESTS_MAX_DURATION_MS) break;
     if (request.mediaType === "tv") {
       const availability = await tvRequestAvailabilitySummary(request).catch(() => null);
       if (!availability) continue;
@@ -383,7 +527,7 @@ export async function ensureMonitoredRequests() {
 }
 
 async function tvRequestAvailabilitySummary(request: MediaRequest) {
-  const seasons = requestedSeasons(request.seasons);
+  const seasons = await monitoredSeasonNumbersForRequest(request);
   if (seasons.length === 0) {
     const available = await prisma.importItem.count({ where: { requestId: request.id, mediaType: "tv" } });
     return { hasMissingEpisodes: available === 0, hasAvailableEpisodes: available > 0 };
@@ -552,9 +696,10 @@ export async function createManualRequest(input: {
     requestedBy: "Drakkar",
     externalStatus: externalResult?.ok ? "2" : "manual"
   };
+  const metadataEnriched = await enrichRequestMetadataFallback(manualRequest).catch(() => manualRequest);
   const enriched = input.mediaType === "tv"
-    ? await enrichTvRequestWithStructure(manualRequest).catch(() => manualRequest)
-    : manualRequest;
+    ? await enrichTvRequestWithStructure(metadataEnriched).catch(() => metadataEnriched)
+    : metadataEnriched;
 
   const existing = provider
     ? await prisma.mediaRequest.findUnique({ where: { providerId_externalId: { providerId: provider.id, externalId } } })
@@ -626,7 +771,7 @@ export async function getRequestMonitor(id: string) {
     imdbId: request.imdbId
   });
 
-  const requestedSeasonNumbers = requestedSeasons(request.seasons);
+  const requestedSeasonNumbers = await monitoredSeasonNumbersForRequest(request, structure);
   const requestedEpisodes = requestedEpisodesBySeason(request.episodes);
   const activeDownloads = await prisma.download.findMany({
     where: {
@@ -724,7 +869,8 @@ export async function searchForRequest(id: string) {
   const request = await getRequest(id);
   const cached = await cachedRequestReleases(request);
   if (cached) return { request, releases: cached };
-  const season = firstRequestedSeason(request.seasons);
+  const monitoredSeasons = await monitoredSeasonNumbersForRequest(request);
+  const season = requestedEpisodesBySeason(request.episodes).size > 0 ? monitoredSeasons[0] : undefined;
   const releases = await runSearch({
     kind: request.mediaType === "tv" && season ? "season" : request.mediaType === "tv" ? "tv" : "movie",
     query: request.title,
@@ -760,10 +906,6 @@ async function cacheRequestReleases(request: MediaRequest, releases: Awaited<Ret
   await redis.set(requestReleaseCacheKey(request), JSON.stringify(releases), "EX", REQUEST_RELEASE_CACHE_SECONDS).catch(() => undefined);
 }
 
-function firstRequestedSeason(value: Prisma.JsonValue | null | undefined) {
-  return requestedSeasons(value)[0];
-}
-
 function requestedSeasons(value: Prisma.JsonValue | null | undefined) {
   if (!Array.isArray(value)) return [];
   const seasons = new Set<number>();
@@ -779,6 +921,29 @@ function requestedSeasons(value: Prisma.JsonValue | null | undefined) {
     if (typeof season === "string" && Number.isFinite(Number(season))) seasons.add(Number(season));
   }
   return [...seasons].sort((a, b) => a - b);
+}
+
+async function monitoredSeasonNumbersForRequest(
+  request: Pick<MediaRequest, "title" | "year" | "tmdbId" | "tvdbId" | "imdbId" | "seasons" | "episodes" | "mediaType">,
+  structure?: Awaited<ReturnType<typeof fetchSeriesStructure>>
+) {
+  if (request.mediaType !== "tv") return requestedSeasons(request.seasons);
+  const explicitRequestedEpisodes = requestedEpisodesBySeason(request.episodes);
+  if (explicitRequestedEpisodes.size > 0) return requestedSeasons(request.seasons);
+  const resolvedStructure = structure ?? await getSettings()
+    .then((settings) => fetchSeriesStructure(settings, {
+      mediaType: "tv",
+      title: request.title,
+      year: request.year ?? undefined,
+      tmdbId: request.tmdbId ?? undefined,
+      tvdbId: request.tvdbId ?? undefined,
+      imdbId: request.imdbId ?? undefined
+    }))
+    .catch(() => undefined);
+  const fullSeriesSeasons = resolvedStructure?.seasons
+    .filter((season) => season.seasonNumber > 0)
+    .map((season) => season.seasonNumber) ?? [];
+  return fullSeriesSeasons.length > 0 ? fullSeriesSeasons : requestedSeasons(request.seasons);
 }
 
 export async function rankReleasesForRequest(id: string) {
@@ -840,7 +1005,7 @@ export async function grabTvEpisodeForRequest(id: string, season: number, episod
   return { season, episode, ...result };
 }
 
-export async function grabBestForRequest(id: string) {
+export async function grabBestForRequest(id: string, options?: { priorityBoost?: number }) {
   const request = await getRequest(id);
   const workingImport = await findWorkingImportForRequest(request);
   if (workingImport) {
@@ -849,7 +1014,12 @@ export async function grabBestForRequest(id: string) {
     return { grabbed: false, reason: "a working library item already exists", import: workingImport };
   }
   const existingDownload = await existingActiveDownload(request.downloadId);
-  if (existingDownload) return { grabbed: true, reason: "request already has an active download", download: existingDownload };
+  if (existingDownload) {
+    if (options?.priorityBoost && existingDownload.status !== "downloading") {
+      await promoteDownloadPriority(existingDownload.id, options.priorityBoost).catch(() => undefined);
+    }
+    return { grabbed: true, reason: "request already has an active download", download: existingDownload };
+  }
   const settings = await getSettings();
   const configuredProfileId =
     request.selectedProfileId ??
@@ -881,7 +1051,8 @@ export async function grabBestForRequest(id: string) {
       const nzb = await downloadNzb(settings, candidate.release);
       download = await addNzbFromPath(nzb.primaryPath, candidate.release.title, {
         guid: candidate.release.guid ? String(candidate.release.guid) : undefined,
-        requestId: id
+        requestId: id,
+        priority: options?.priorityBoost
       });
     } catch (error) {
       const message = error instanceof Error ? error.message : "failed to fetch or import NZB";
@@ -919,10 +1090,10 @@ export async function grabBestForRequest(id: string) {
   return { grabbed: false, reason: "all acceptable releases failed before queueing", rejected };
 }
 
-export async function grabMissingTvForRequest(id: string) {
+export async function grabMissingTvForRequest(id: string, options?: { priorityBoost?: number }) {
   const request = await getRequest(id);
   if (request.mediaType !== "tv") return grabBestForRequest(id);
-  const seasons = requestedSeasons(request.seasons);
+  const seasons = await monitoredSeasonNumbersForRequest(request);
   if (seasons.length === 0) return grabBestForRequest(id);
   const requestedEpisodes = requestedEpisodesBySeason(request.episodes);
   const seasonEpisodeCounts = new Map(
@@ -962,7 +1133,7 @@ export async function grabMissingTvForRequest(id: string) {
   }).catch(() => []);
   const results = [];
   for (const { season, existingEpisodes, requestedSeasonEpisodes } of seasonsForThisPass) {
-    const result = await grabBestTvSeasonForRequest(request, season, existingEpisodes, requestedSeasonEpisodes, broadReleases);
+    const result = await grabBestTvSeasonForRequest(request, season, existingEpisodes, requestedSeasonEpisodes, broadReleases, options);
     results.push({ season, result });
   }
 
@@ -1089,7 +1260,8 @@ async function grabBestTvSeasonForRequest(
   season: number,
   existingEpisodes = new Set<number>(),
   requestedEpisodes?: Set<number>,
-  releasePool?: Parameters<typeof scoreRelease>[0][]
+  releasePool?: Parameters<typeof scoreRelease>[0][],
+  options?: { priorityBoost?: number }
 ) {
   if (await seasonSearchCoolingDown(request.id, season)) {
     return { grabbed: false, reason: "season search cooling down after recent unsuccessful attempt", queued: [], rejected: [] };
@@ -1143,7 +1315,7 @@ async function grabBestTvSeasonForRequest(
   const rejected: string[] = [];
 
   for (const candidate of seasonPacks) {
-    const result = await queueReleaseForRequest(request.id, candidate);
+    const result = await queueReleaseForRequest(request.id, candidate, options);
     if (result.grabbed) {
       queued.push(result);
       return { grabbed: true, mode: "season_pack", queued, rejected };
@@ -1169,7 +1341,7 @@ async function grabBestTvSeasonForRequest(
       rejected.push(`stopped after ${TV_EPISODE_DOWNLOADS_PER_REQUEST_PASS} queued episode candidates; remaining episodes rotate next monitor pass`);
       break;
     }
-    const result = await queueReleaseForRequest(request.id, candidate);
+    const result = await queueReleaseForRequest(request.id, candidate, options);
     if (result.grabbed) queued.push(result);
     else rejected.push(`${candidate.release.title}: ${result.reason ?? "failed before queueing"}`);
   }
@@ -1392,17 +1564,24 @@ async function markSeasonSearchCooldown(requestId: string, season: number) {
 
 async function queueReleaseForRequest(
   requestId: string,
-  candidate: { release: Parameters<typeof scoreRelease>[0]; decision: ReturnType<typeof scoreRelease> }
+  candidate: { release: Parameters<typeof scoreRelease>[0]; decision: ReturnType<typeof scoreRelease> },
+  options?: { priorityBoost?: number }
 ) {
   const settings = await getSettings();
   const reusable = await reuseExistingReleaseDownload(requestId, candidate.release);
-  if (reusable) return { grabbed: true, release: candidate.release, decision: candidate.decision, download: reusable, reused: true };
+  if (reusable) {
+    if (options?.priorityBoost && reusable.status !== "downloading") {
+      await promoteDownloadPriority(reusable.id, options.priorityBoost).catch(() => undefined);
+    }
+    return { grabbed: true, release: candidate.release, decision: candidate.decision, download: reusable, reused: true };
+  }
   let download: Awaited<ReturnType<typeof addNzbFromPath>>;
   try {
     const nzb = await downloadNzb(settings, candidate.release);
     download = await addNzbFromPath(nzb.primaryPath, candidate.release.title, {
       guid: candidate.release.guid ? String(candidate.release.guid) : undefined,
-      requestId
+      requestId,
+      priority: options?.priorityBoost
     });
   } catch (error) {
     const message = error instanceof Error ? error.message : "failed to fetch or import NZB";

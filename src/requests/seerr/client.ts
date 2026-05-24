@@ -44,6 +44,10 @@ type SeerrMediaDetails = {
   };
 };
 
+type SeerrRequestDetails = SeerrRequest & {
+  seasons?: unknown[];
+};
+
 function serviceName(provider: RequestProvider) {
   return `request-provider:${provider.id}`;
 }
@@ -83,6 +87,33 @@ async function fetchMediaDetails(provider: RequestProvider, request: SeerrReques
   const response = await providerFetch(provider, `/api/v1/${mediaType}/${tmdbId}`);
   if (!response.ok) return undefined;
   return response.json() as Promise<SeerrMediaDetails>;
+}
+
+async function mapSeerrRequest(provider: RequestProvider, request: SeerrRequest): Promise<ExternalMediaRequest> {
+  const mediaType = request.media?.mediaType ?? request.type ?? "movie";
+  const title = mediaType === "movie" ? request.movie?.title : request.tv?.name;
+  const date = mediaType === "movie" ? request.movie?.releaseDate : request.tv?.firstAirDate;
+  const needsDetails = !title || !date || (!request.media?.imdbId && !request.media?.tvdbId);
+  const details = needsDetails ? await fetchMediaDetails(provider, request) : undefined;
+  const normalized = extractSeasonEpisodes(request.seasons);
+  const effectiveDate = date ?? details?.releaseDate ?? details?.firstAirDate;
+  let tvdbId: string | undefined;
+  if (request.media?.tvdbId) tvdbId = String(request.media.tvdbId);
+  else if (details?.externalIds?.tvdbId) tvdbId = String(details.externalIds.tvdbId);
+  return {
+    externalId: String(request.id),
+    mediaType,
+    title: title ?? details?.title ?? details?.name ?? `Request ${request.id}`,
+    year: effectiveDate ? Number(effectiveDate.slice(0, 4)) : undefined,
+    tmdbId: request.media?.tmdbId ? String(request.media.tmdbId) : undefined,
+    tvdbId,
+    imdbId: request.media?.imdbId ?? details?.imdbId ?? details?.externalIds?.imdbId,
+    seasons: normalized.seasons,
+    episodes: normalized.episodes,
+    requestedBy: request.requestedBy?.displayName ?? request.requestedBy?.username ?? request.requestedBy?.email,
+    requestedQuality: request.profileName ?? request.requestedQuality ?? (request.is4k ? "4K" : undefined),
+    externalStatus: String(request.status ?? request.media?.status ?? "unknown")
+  };
 }
 
 async function mapWithConcurrency<TInput, TOutput>(
@@ -208,32 +239,15 @@ async function fetchAllRequestPages(provider: RequestProvider, pageSize = 100) {
 export async function fetchSeerrRequests(provider: RequestProvider): Promise<ExternalMediaRequest[]> {
   await assertServiceAllowed(serviceName(provider), providerConfigured(provider), `${provider.name} is not configured; request sync skipped`);
   const requests = await fetchAllRequestPages(provider);
-  return mapWithConcurrency(requests, 6, async (request) => {
-    const mediaType = request.media?.mediaType ?? request.type ?? "movie";
-    const title = mediaType === "movie" ? request.movie?.title : request.tv?.name;
-    const date = mediaType === "movie" ? request.movie?.releaseDate : request.tv?.firstAirDate;
-    const needsDetails = !title || !date || (!request.media?.imdbId && !request.media?.tvdbId);
-    const details = needsDetails ? await fetchMediaDetails(provider, request) : undefined;
-    const normalized = extractSeasonEpisodes(request.seasons);
-    const effectiveDate = date ?? details?.releaseDate ?? details?.firstAirDate;
-    let tvdbId: string | undefined;
-    if (request.media?.tvdbId) tvdbId = String(request.media.tvdbId);
-    else if (details?.externalIds?.tvdbId) tvdbId = String(details.externalIds.tvdbId);
-    return {
-      externalId: String(request.id),
-      mediaType,
-      title: title ?? details?.title ?? details?.name ?? `Request ${request.id}`,
-      year: effectiveDate ? Number(effectiveDate.slice(0, 4)) : undefined,
-      tmdbId: request.media?.tmdbId ? String(request.media.tmdbId) : undefined,
-      tvdbId,
-      imdbId: request.media?.imdbId ?? details?.imdbId ?? details?.externalIds?.imdbId,
-      seasons: normalized.seasons,
-      episodes: normalized.episodes,
-      requestedBy: request.requestedBy?.displayName ?? request.requestedBy?.username ?? request.requestedBy?.email,
-      requestedQuality: request.profileName ?? request.requestedQuality ?? (request.is4k ? "4K" : undefined),
-      externalStatus: String(request.status ?? request.media?.status ?? "unknown")
-    };
-  });
+  return mapWithConcurrency(requests, 6, async (request) => mapSeerrRequest(provider, request));
+}
+
+export async function fetchSeerrRequestById(provider: RequestProvider, requestId: string): Promise<ExternalMediaRequest | null> {
+  await assertServiceAllowed(serviceName(provider), providerConfigured(provider), `${provider.name} is not configured; request sync skipped`);
+  const response = await providerFetch(provider, `/api/v1/request/${requestId}`);
+  if (!response.ok) return null;
+  const request = await response.json() as SeerrRequestDetails;
+  return mapSeerrRequest(provider, request);
 }
 
 export async function updateSeerrAvailable(provider: RequestProvider, requestId: string) {

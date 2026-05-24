@@ -4,7 +4,7 @@ The backend reads Drakkar defaults and app settings from `/data/config/settings.
 
 ## settings.json
 
-The backend creates `/data/config/settings.json` on first boot with a generated `frontendApiToken`, infrastructure defaults, and empty integration defaults. The setup wizard and Settings page should be used for:
+The backend creates `/data/config/settings.json` on first boot with a generated `frontendApiToken`, infrastructure defaults, and empty integration defaults. The Settings page presents this as the shared `Drakkar API Token`. The setup wizard and Settings page should be used for:
 
 - infrastructure defaults
 - NZBHydra2
@@ -19,13 +19,14 @@ Keep `/data/config/settings.json` with the database during backups and upgrades.
 ## Runtime Layout
 
 - `/data/config`: persisted settings
-- `/data/downloads`: active payload downloads
-- `/data/completed`: materialized completed content when required
-- `/data/nzb`: working NZB files
 - `/data/nzb-backup`: optional backup copies
+- `/mnt/downloads`: active payload downloads
+- `/mnt/completed`: materialized completed content when required
+- `/mnt/nzb`: working NZB files
 - `/mnt/media/movies`: movie library output
 - `/mnt/media/tv`: TV library output
 - `/mnt/fuse`: FUSE VFS mount for direct streaming
+- `/mnt/fuse/nzb`: virtual FUSE view of `/mnt/nzb`
 
 ## Default NZBHydra Categories
 

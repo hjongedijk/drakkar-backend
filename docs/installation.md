@@ -42,6 +42,14 @@ Drakkar expects:
 - `/data` for writable application state
 - `/mnt` inside the container for the shared host tree
 
+With current defaults:
+
+- `./data/config/settings.json` stores runtime config
+- `./data/nzb-backup` stores NZB backup copies
+- `/mnt/downloads`, `/mnt/completed`, and `/mnt/nzb` are the live working directories
+- `/mnt/fuse/nzb` is the virtual FUSE view of `/mnt/nzb`
+- NZB backups are not exposed at `/mnt/fuse/nzb-backups`
+
 Release compose uses:
 
 ```yaml
@@ -128,3 +136,46 @@ On first boot:
 - finish the setup wizard
 - create the first admin
 - fill the main NZBHydra2, Usenet, metadata, Seerr, and Plex values
+
+## Upgrading
+
+Recommended upgrade flow:
+
+```bash
+docker compose pull
+docker compose up -d --force-recreate
+docker compose ps
+```
+
+Why this is the preferred path:
+
+- `docker compose pull` fetches newer images first
+- `docker compose up -d --force-recreate` replaces containers cleanly without tearing down the whole network first
+- databases and mounted data stay in place because volumes are preserved
+
+Use a full stop/start only when needed:
+
+```bash
+docker compose down
+docker compose up -d
+```
+
+That is useful when:
+
+- you changed bind mounts
+- you changed low-level Docker settings and want a full container restart path
+- you are troubleshooting stale networking or mount state
+
+Best practice after upgrading:
+
+```bash
+docker compose logs --tail 200 backend
+docker compose ps
+```
+
+Check that:
+
+- backend is healthy
+- frontend is healthy
+- FUSE mounted correctly
+- no startup migration or mount errors are repeating

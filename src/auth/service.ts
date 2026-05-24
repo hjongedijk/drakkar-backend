@@ -69,6 +69,15 @@ export async function getAuthUserById(userId: string) {
   return user ? toAuthUser(user) : undefined;
 }
 
+export async function getFirstAdminAuthUser() {
+  const user = await prisma.user.findFirst({
+    where: { isAdmin: true },
+    orderBy: { createdAt: "asc" },
+    select: { id: true, email: true, displayName: true, isAdmin: true }
+  });
+  return user ? toAuthUser(user) : undefined;
+}
+
 export async function getAuthUserByApiKey(token: string | undefined) {
   if (!token) return undefined;
   const keyHash = apiKeyHash(token);

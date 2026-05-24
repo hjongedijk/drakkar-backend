@@ -2,7 +2,7 @@ import { randomUUID } from "node:crypto";
 import cors from "@fastify/cors";
 import Fastify from "fastify";
 import { env } from "./config/env.js";
-import { getAuthUserByApiKey, getAuthUserById } from "./auth/service.js";
+import { getAuthUserByApiKey, getAuthUserById, getFirstAdminAuthUser } from "./auth/service.js";
 import { authCookieName, getSessionUserId, parseCookie } from "./auth/session.js";
 import { authRoutes } from "./routes/auth.js";
 import { settingsRoutes } from "./routes/settings.js";
@@ -57,9 +57,13 @@ export function buildApp() {
     if (request.method === "OPTIONS") return;
     if (!request.url.startsWith("/api/")) return;
     const parsedUrl = new URL(request.url, env.APP_BASE_URL);
-    if (request.method === "GET" && parsedUrl.pathname === "/api/graphql" && !parsedUrl.searchParams.has("query")) return;
-    const apiToken = request.headers["x-api-token"] ?? parsedUrl.searchParams.get("apiToken") ?? "";
-    if (apiToken !== env.getFrontendApiToken(env.CONFIG_DIR)) {
+    if (request.method === "GET" && ["/api/graphql", "/api/docs"].includes(parsedUrl.pathname) && !parsedUrl.searchParams.has("query")) return;
+    const frontendToken = env.getFrontendApiToken(env.CONFIG_DIR);
+    const authorization = request.headers.authorization;
+    const bearerToken = authorization?.startsWith("Bearer ") ? authorization.slice("Bearer ".length).trim() : undefined;
+    const headerToken = Array.isArray(request.headers["x-api-token"]) ? request.headers["x-api-token"][0] : request.headers["x-api-token"];
+    const apiToken = headerToken ?? parsedUrl.searchParams.get("apiToken") ?? (bearerToken === frontendToken ? bearerToken : "");
+    if (apiToken !== frontendToken) {
       return reply.status(401).send({ message: "Invalid frontend API token." });
     }
   });
@@ -69,7 +73,7 @@ export function buildApp() {
     if (!request.url.startsWith("/api/")) return;
     {
       const parsedUrl = new URL(request.url, env.APP_BASE_URL);
-      if (request.method === "GET" && parsedUrl.pathname === "/api/graphql" && !parsedUrl.searchParams.has("query")) return;
+      if (request.method === "GET" && ["/api/graphql", "/api/docs"].includes(parsedUrl.pathname) && !parsedUrl.searchParams.has("query")) return;
     }
     if (request.url.startsWith("/api/setup/status")) return;
     if (request.url.startsWith("/api/setup/complete")) return;
@@ -80,13 +84,18 @@ export function buildApp() {
     }
     if (request.url.startsWith("/api/auth/login")) return;
 
+    const parsedUrl = new URL(request.url, env.APP_BASE_URL);
+    if (parsedUrl.pathname === "/api/webhooks/seerr") return;
     const authorization = request.headers.authorization;
     const bearerToken = authorization?.startsWith("Bearer ") ? authorization.slice("Bearer ".length).trim() : undefined;
+    const frontendToken = env.getFrontendApiToken(env.CONFIG_DIR);
     const sessionToken = parseCookie(request.headers.cookie, authCookieName);
     const sessionUserId = await getSessionUserId(sessionToken);
     const user = sessionUserId
       ? await getAuthUserById(sessionUserId)
-      : await getAuthUserByApiKey(bearerToken);
+      : bearerToken === frontendToken
+        ? await getFirstAdminAuthUser()
+        : await getAuthUserByApiKey(bearerToken);
 
     if (!user) return reply.status(401).send({ message: "Authentication required." });
     request.authUser = user;

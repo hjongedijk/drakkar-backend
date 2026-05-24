@@ -202,4 +202,100 @@ export async function graphqlRoutes(app: FastifyInstance): Promise<void> {
   </body>
 </html>`;
   });
+
+  app.get("/api/docs", async (_request, reply) => {
+    reply.type("text/html");
+    return `<!doctype html>
+<html>
+  <head>
+    <title>Drakkar API Docs</title>
+    <style>
+      :root{color-scheme:dark}
+      *{box-sizing:border-box}
+      body{margin:0;font-family:ui-sans-serif,system-ui,sans-serif;background:#071014;color:#e8fbff}
+      main{max-width:1100px;margin:0 auto;padding:40px 24px 64px}
+      h1,h2,h3{margin:0 0 12px}
+      p{line-height:1.6;color:#abd1d8}
+      .hero{padding:28px;border:1px solid rgba(84,221,201,.24);border-radius:24px;background:linear-gradient(180deg,rgba(18,38,44,.92),rgba(8,18,21,.96))}
+      .grid{display:grid;gap:18px}
+      .cards{grid-template-columns:repeat(auto-fit,minmax(260px,1fr))}
+      .card{padding:18px;border-radius:18px;border:1px solid rgba(255,255,255,.08);background:rgba(255,255,255,.03)}
+      code,pre{font-family:ui-monospace,SFMono-Regular,Menlo,monospace}
+      code{background:rgba(255,255,255,.07);padding:2px 6px;border-radius:8px;color:#bffaf2}
+      pre{overflow:auto;padding:16px;border-radius:16px;background:#031014;border:1px solid rgba(255,255,255,.08);color:#d9fcff}
+      a{color:#4cead1;text-decoration:none}
+      a:hover{text-decoration:underline}
+      .pill{display:inline-block;margin-right:8px;margin-bottom:8px;padding:6px 10px;border-radius:999px;background:rgba(76,234,209,.12);color:#78f4df;font-size:12px;font-weight:700}
+      .muted{color:#86aeb5}
+    </style>
+  </head>
+  <body>
+    <main class="grid">
+      <section class="hero">
+        <h1>Drakkar API Docs</h1>
+        <p>Drakkar exposes a browser-friendly GraphQL explorer and an authenticated REST API. The shared <code>Drakkar API Token</code> from <code>settings.json</code> can be used as both the frontend gateway token and the bearer token for admin API access.</p>
+        <div style="margin-top:16px">
+          <a class="pill" href="/api/graphql">Open GraphiQL</a>
+          <span class="pill">Version ${DRAKKAR_VERSION}</span>
+        </div>
+      </section>
+
+      <section class="grid cards">
+        <article class="card">
+          <h2>Authentication</h2>
+          <p>Use the same token twice for remote admin access:</p>
+<pre>curl -H 'x-api-token: YOUR_DRAKKAR_API_TOKEN' \\
+  -H 'Authorization: Bearer YOUR_DRAKKAR_API_TOKEN' \\
+  http://HOST:8080/api/status</pre>
+          <p class="muted">Browser sessions can also authenticate with login cookies.</p>
+        </article>
+
+        <article class="card">
+          <h2>GraphQL</h2>
+          <p>Use <a href="/api/graphql">GraphiQL</a> for interactive exploration.</p>
+<pre>{
+  status { version backend postgresql valkey }
+  downloads(limit: 5) { title status progress }
+  library(limit: 5) { title mediaType libraryStatus updatedAt }
+}</pre>
+        </article>
+
+        <article class="card">
+          <h2>Key REST endpoints</h2>
+          <p><code>GET /api/status</code> overall service state</p>
+          <p><code>GET /api/library</code> media library items</p>
+          <p><code>GET /api/requests</code> monitored requests</p>
+          <p><code>POST /api/webhooks/seerr</code> immediate Seerr request push</p>
+          <p><code>GET /api/downloads/queue/page</code> queue page</p>
+          <p><code>GET /api/tasks</code> scheduled task state</p>
+        </article>
+      </section>
+
+      <section class="card">
+        <h2>Examples</h2>
+<pre>curl -H 'x-api-token: YOUR_DRAKKAR_API_TOKEN' \\
+  -H 'Authorization: Bearer YOUR_DRAKKAR_API_TOKEN' \\
+  http://HOST:8080/api/requests
+
+curl -H 'x-api-token: YOUR_DRAKKAR_API_TOKEN' \\
+  -H 'Authorization: Bearer YOUR_DRAKKAR_API_TOKEN' \\
+  'http://HOST:8080/api/downloads/queue/page?page=1&limit=25'
+
+curl -H 'x-api-token: YOUR_DRAKKAR_API_TOKEN' \\
+  -H 'Authorization: Bearer YOUR_DRAKKAR_API_TOKEN' \\
+  http://HOST:8080/api/tasks
+
+curl -X POST \\
+  -H 'Authorization: Bearer YOUR_DRAKKAR_API_TOKEN' \\
+  -H 'content-type: application/json' \\
+  http://HOST:8080/api/webhooks/seerr \\
+  -d '{"notification_type":"MEDIA_AUTO_APPROVED","event":"Request Automatically Approved","request":{"request_id":"1234"},"media":{"tmdbId":"1399","tvdbId":"121361","imdbId":"tt0944947"}}'
+
+# Webhook-origin requests are promoted to the front of the waiting queue,
+# but the active download is not interrupted.</pre>
+      </section>
+    </main>
+  </body>
+</html>`;
+  });
 }

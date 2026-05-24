@@ -23,7 +23,6 @@ const rootFolders = [
   { name: "completed", path: "/completed", target: env.VFS_COMPLETED_DIR },
   { name: "nzb", path: "/nzb", target: env.VFS_NZB_DIR },
   { name: "media", path: "/media", target: null },
-  { name: "nzb-backups", path: "/nzb-backups", target: env.NZB_BACKUPS_DIR },
   { name: "releases", path: "/mounted/releases", target: null }
 ] as const;
 
@@ -63,7 +62,6 @@ function virtualPhysicalRoot(input = "/") {
     if (!media) return null;
     return { root: media.target, subPath: parts.slice(2).join("/"), virtualRoot: media.path };
   }
-  if (parts[0] === "nzb-backups") return { root: env.NZB_BACKUPS_DIR, subPath: parts.slice(1).join("/"), virtualRoot: "/nzb-backups" };
   return null;
 }
 

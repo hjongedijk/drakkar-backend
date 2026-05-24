@@ -27,7 +27,7 @@ export async function sabRoutes(app: FastifyInstance): Promise<void> {
         if (query.value) await setDownloadStatus(query.value, "cancelled");
         return { status: true };
       case "get_config":
-        return { config: { misc: { complete_dir: "/data/completed", download_dir: "/data/downloads" } } };
+        return { config: { misc: { complete_dir: "/mnt/completed", download_dir: "/mnt/downloads" } } };
       default:
         return { status: false, error: "unsupported mode" };
     }

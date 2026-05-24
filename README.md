@@ -16,21 +16,22 @@ Drakkar coordinates request sync, NZB search, download queueing, FUSE-mounted me
 
 ## Version
 
-Current backend version: `0.1.1`
+Current backend version: `0.1.7`
 
 ## Runtime layout
 
 Default container paths:
 
 - `/data/config` application config
-- `/data/downloads` active downloads
-- `/data/completed` completed payloads ready for import
-- `/data/nzb` working NZB files
 - `/data/nzb-backup` optional NZB backup copies
+- `/mnt/downloads` active downloads
+- `/mnt/completed` completed payloads ready for import
+- `/mnt/nzb` working NZB files
 - `/mnt/media/movies` movie library output
 - `/mnt/media/tv` TV library output
 
-FUSE is mounted under `/mnt`, so Plex/Jellyfin/Emby can point at `/mnt/media`.
+FUSE is mounted under `/mnt/fuse`, so Plex/Jellyfin/Emby can point at `/mnt/media` and the virtual NZB working view appears at `/mnt/fuse/nzb`.
+NZB backups stay only in `/data/nzb-backup` and are not exposed in the FUSE tree.
 
 ## Requirements
 
@@ -92,6 +93,16 @@ Public images are published to:
 - `ghcr.io/hjongedijk/drakkar-backend`
 - `ghcr.io/hjongedijk/drakkar-frontend`
 
+Upgrade running containers:
+
+```bash
+docker compose pull
+docker compose up -d --force-recreate
+docker compose ps
+```
+
+For a full stop/start cycle, see [docs/installation.md](docs/installation.md).
+
 ## Authentication
 
 There is no fixed default admin account anymore.
@@ -102,7 +113,9 @@ On first boot the setup wizard opens before login and creates the first admin pl
 Important endpoints:
 
 - `/health`
+- `/docs`
 - `/api/status`
+- `/api/docs`
 - `/api/graphql`
 - `/api/auth/login`
 - `/api/library`

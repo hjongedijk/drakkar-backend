@@ -71,6 +71,24 @@ export async function findReusableDownload(input: { guid?: string | null; title?
   });
 }
 
+export async function promoteDownloadPriority(id: string, priority: number) {
+  const normalizedPriority = Math.max(0, Math.min(999, Math.floor(priority)));
+  const download = await prisma.download.update({
+    where: { id },
+    data: { priority: normalizedPriority }
+  }).catch(() => null);
+  if (!download) return null;
+  const jobId = download.jobId ? String(download.jobId) : null;
+  if (jobId) {
+    const job = await nzbDownloadQueue.getJob(jobId).catch(() => null);
+    if (job) {
+      await job.changePriority({ priority: 1000 - normalizedPriority }).catch(() => undefined);
+    }
+  }
+  invalidateDownloadViewCache();
+  return download;
+}
+
 async function attachExistingDownloadToRequest(requestId: string | undefined, downloadId: string, title?: string) {
   if (!requestId) return;
   const request = await prisma.mediaRequest.findUnique({ where: { id: requestId } });
@@ -268,7 +286,7 @@ export async function addNzbUpload(input: { filename?: string; content: string |
   return prisma.download.update({ where: { id: download.id }, data: { jobId: job.id } });
 }
 
-export async function addNzbFromPath(path: string, title?: string, options?: { queueDownload?: boolean; guid?: string; requestId?: string }) {
+export async function addNzbFromPath(path: string, title?: string, options?: { queueDownload?: boolean; guid?: string; requestId?: string; priority?: number }) {
   const policies = await getPolicySettings();
   const existingByGuid = await existingDownloadForGuid(options?.guid);
   if (existingByGuid && policies.duplicateNzbBehavior !== "replace_existing" && policies.duplicateNzbBehavior !== "download_again_with_suffix") {
@@ -286,7 +304,8 @@ export async function addNzbFromPath(path: string, title?: string, options?: { q
     data: {
       title: title ?? path.split("/").pop() ?? "NZB upload",
       source: "nzb",
-      status: options?.queueDownload === false ? "mounted" : "queued"
+      status: options?.queueDownload === false ? "mounted" : "queued",
+      priority: options?.priority ?? 0
     }
   });
   let nzbDocument;
