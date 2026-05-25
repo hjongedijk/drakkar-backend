@@ -262,7 +262,7 @@ async function metadataCandidateMatchesMedia(
   if (!titleMatches) return false;
   if (media.mediaType === "movie") return !(media.year != null && candidate.year != null && media.year !== candidate.year);
   if (media.mediaType !== "tv" || media.season == null || media.episode == null) return true;
-  if (!candidate.tmdbId && !candidate.tvdbId) return true;
+  if (media.year != null && candidate.year != null && media.year !== candidate.year) return false;
   const structure = await fetchSeriesStructure(settings, {
     mediaType: "tv",
     title: candidate.title ?? media.title,
@@ -272,7 +272,8 @@ async function metadataCandidateMatchesMedia(
     season: media.season,
     episode: media.episode
   }).catch(() => undefined);
-  return seriesStructureAllowsEpisode(media.season, media.episode, structure);
+  if (structure) return seriesStructureAllowsEpisode(media.season, media.episode, structure);
+  return !candidate.tmdbId && !candidate.tvdbId && media.year != null && candidate.year != null && media.year === candidate.year;
 }
 
 async function removeExisting(path: string) {

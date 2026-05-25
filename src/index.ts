@@ -1,4 +1,6 @@
 import { env } from "./config/env.js";
+import { mkdir, readFile, writeFile } from "node:fs/promises";
+import { join } from "node:path";
 import { prisma } from "./db/prisma.js";
 import { redis } from "./db/redis.js";
 import { pipelineQueues } from "./queues/downloadQueue.js";
@@ -32,6 +34,29 @@ import { runTrackedTask } from "./tasks/taskRegistry.js";
 
 const app = buildApp();
 const STARTUP_PLEX_REFRESH_DELAY_MS = 120_000;
+const STARTUP_NAMING_MIGRATION_COOLDOWN_MS = 12 * 60 * 60 * 1000;
+const STARTUP_NAMING_MIGRATION_STAMP = join(env.CONFIG_DIR, "startup-naming-migration.json");
+
+async function shouldRunStartupNamingMigration() {
+  try {
+    const raw = await readFile(STARTUP_NAMING_MIGRATION_STAMP, "utf8");
+    const parsed = JSON.parse(raw) as { completedAt?: string };
+    const completedAt = parsed.completedAt ? new Date(parsed.completedAt).getTime() : 0;
+    if (completedAt > 0 && Date.now() - completedAt < STARTUP_NAMING_MIGRATION_COOLDOWN_MS) return false;
+  } catch {
+    return true;
+  }
+  return true;
+}
+
+async function markStartupNamingMigrationCompleted() {
+  await mkdir(env.CONFIG_DIR, { recursive: true });
+  await writeFile(
+    STARTUP_NAMING_MIGRATION_STAMP,
+    JSON.stringify({ completedAt: new Date().toISOString() }, null, 2),
+    "utf8"
+  );
+}
 
 function scheduleDeferredStartupPlexRefresh(paths: Set<string>) {
   if (paths.size === 0) return;
@@ -78,10 +103,13 @@ try {
   void (async () => {
     try {
       const startupPlexRefreshPaths = new Set<string>();
-      const namingMigration = await runTrackedTask(
-        NAMING_MIGRATION_TASK_ID,
-        () => migrateImportsToCurrentNaming({ refreshPlex: false, changedPaths: startupPlexRefreshPaths })
-      );
+      const runStartupNamingMigration = await shouldRunStartupNamingMigration();
+      const namingMigration = runStartupNamingMigration
+        ? await runTrackedTask(
+            NAMING_MIGRATION_TASK_ID,
+            () => migrateImportsToCurrentNaming({ refreshPlex: false, changedPaths: startupPlexRefreshPaths })
+          )
+        : undefined;
       const nzbPathNormalization = await normalizeNzbStoragePaths();
       if (nzbPathNormalization.updated > 0 || nzbPathNormalization.moved > 0 || nzbPathNormalization.cleanedLegacy > 0) {
         app.log.info({ nzbPathNormalization }, "legacy nzb storage paths normalized");
@@ -91,6 +119,13 @@ try {
       }
       if (namingMigration?.skipped) {
         app.log.warn({ skipped: namingMigration.skipped, failures: namingMigration.failures }, "library naming migration skipped invalid imports");
+      }
+      if (runStartupNamingMigration) {
+        await markStartupNamingMigrationCompleted().catch((error) => {
+          app.log.warn({ err: error }, "failed to persist startup naming migration stamp");
+        });
+      } else {
+        app.log.info({ cooldownHours: STARTUP_NAMING_MIGRATION_COOLDOWN_MS / 3_600_000 }, "startup naming migration skipped due to recent successful run");
       }
       await pruneLibraryDirectories().catch(() => undefined);
       if (env.STARTUP_RECOVERY_ENABLED) {

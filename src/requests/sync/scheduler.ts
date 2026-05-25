@@ -294,7 +294,7 @@ export function startRequestSyncSchedule(logger: FastifyBaseLogger) {
   if (!scheduleHandles.has(REQUEST_SYNC_TASK_ID)) {
     scheduleDynamicTask({
       taskId: REQUEST_SYNC_TASK_ID,
-      initialDelayMs: 30_000,
+      initialDelayMs: 3 * 60_000,
       fallbackIntervalMs: REQUEST_SYNC_INTERVAL_MS,
       runner: () => runRequestSyncCycle(logger)
     });
@@ -302,7 +302,7 @@ export function startRequestSyncSchedule(logger: FastifyBaseLogger) {
   if (!scheduleHandles.has(REQUEST_RECOVERY_TASK_ID)) {
     scheduleDynamicTask({
       taskId: REQUEST_RECOVERY_TASK_ID,
-      initialDelayMs: 45_000,
+      initialDelayMs: 90_000,
       fallbackIntervalMs: REQUEST_RECOVERY_INTERVAL_MS,
       runner: () => runDeferredRequestRecovery(logger).then(() => undefined)
     });
@@ -310,7 +310,7 @@ export function startRequestSyncSchedule(logger: FastifyBaseLogger) {
   if (!scheduleHandles.has(NZBHYDRA_RSS_SYNC_TASK_ID)) {
     scheduleDynamicTask({
       taskId: NZBHYDRA_RSS_SYNC_TASK_ID,
-      initialDelayMs: 15_000,
+      initialDelayMs: 10 * 60_000,
       fallbackIntervalMs: NZBHYDRA_RSS_SYNC_INTERVAL_MS,
       runner: () => runNzbhydraRssSyncCycle(logger)
     });
@@ -318,7 +318,7 @@ export function startRequestSyncSchedule(logger: FastifyBaseLogger) {
   if (!scheduleHandles.has(LOG_PRUNE_TASK_ID)) {
     scheduleDynamicTask({
       taskId: LOG_PRUNE_TASK_ID,
-      initialDelayMs: 60_000,
+      initialDelayMs: 10 * 60_000,
       fallbackIntervalMs: LOG_PRUNE_INTERVAL_MS,
       runner: () => runLogPruneCycle(logger)
     });
@@ -326,7 +326,7 @@ export function startRequestSyncSchedule(logger: FastifyBaseLogger) {
   if (!scheduleHandles.has(SUBTITLE_BACKFILL_TASK_ID)) {
     scheduleDynamicTask({
       taskId: SUBTITLE_BACKFILL_TASK_ID,
-      initialDelayMs: 75_000,
+      initialDelayMs: 15 * 60_000,
       fallbackIntervalMs: SUBTITLE_BACKFILL_INTERVAL_MS,
       runner: () => runSubtitleBackfillCycle(logger)
     });

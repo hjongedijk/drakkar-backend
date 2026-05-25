@@ -32,9 +32,22 @@ describe("health check helpers", () => {
       estimateHealthProgress({
         type: "par2-verify-repair",
         status: "running",
-        message: "running PAR2 verify/repair"
+        message: "running PAR2 verify/repair",
+        updatedAt: new Date()
       }),
       70
+    );
+  });
+
+  it("treats stale running repair jobs as not active", () => {
+    assert.equal(
+      estimateHealthProgress({
+        type: "background-mounted-healthcheck",
+        status: "running",
+        message: "stale mounted probe",
+        updatedAt: new Date(Date.now() - 11 * 60 * 1000)
+      }),
+      0
     );
   });
 });

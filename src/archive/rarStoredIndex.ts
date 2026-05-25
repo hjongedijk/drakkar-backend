@@ -55,6 +55,7 @@ type SharpCompressHeader = {
 };
 
 const ARCHIVE_INDEX_TTL_MS = 6 * 60 * 60 * 1000;
+const ARCHIVE_INDEX_FAILURE_TTL_MS = 15 * 60 * 1000;
 const RAR_HEADER_READ_BYTES = 384 * 1024;
 const RAR_HEADER_TIMEOUT_MS = 15_000;
 const ARCHIVE_PROBE_PATH = process.env.ARCHIVE_PROBE_PATH ?? "/app/archive-probe/Drakkar.ArchiveProbe";
@@ -63,6 +64,7 @@ function oneLineLog(value: string) {
   return value.replace(/\s+/g, " ").trim();
 }
 const archiveIndexCache = new Map<string, { value: ArchiveVirtualEntry[]; expiresAt: number }>();
+const archiveIndexFailureCache = new Map<string, { error: Error; expiresAt: number }>();
 const execFileAsync = promisify(execFile);
 const ARCHIVE_SEGMENT_BATCH_SIZE = 1000;
 
@@ -276,7 +278,7 @@ async function fetchArticleSlice(articleId: string, startOffset: number, length:
 }
 
 async function readDecodedRange(file: NzbFileWithSegments, start: number, length: number, servers: UsenetServer[], signal?: AbortSignal) {
-  const decoded = await buildDecodedYencSegments(file, servers, signal);
+  const decoded = await buildDecodedYencSegments(file, servers, signal, { mode: "fast" });
   const segments = decoded?.segments ?? file.segments.map((segment, index) => {
     const bytes = Math.floor(segment.bytes);
     const segmentStart = file.segments.slice(0, index).reduce((sum, item) => sum + Math.floor(item.bytes), 0);
@@ -301,7 +303,7 @@ async function readDecodedRange(file: NzbFileWithSegments, start: number, length
 }
 
 async function buildVirtualSegments(file: NzbFileWithSegments, dataStart: number, byteCount: number, entryStart: number, servers: UsenetServer[]) {
-  const decoded = await buildDecodedYencSegments(file, servers);
+  const decoded = await buildDecodedYencSegments(file, servers, undefined, { mode: "fast" });
   const segments = decoded?.segments ?? file.segments.map((segment, index) => {
     const bytes = Math.floor(segment.bytes);
     const segmentStart = file.segments.slice(0, index).reduce((sum, item) => sum + Math.floor(item.bytes), 0);
@@ -331,9 +333,12 @@ async function buildVirtualSegments(file: NzbFileWithSegments, dataStart: number
 export async function listStoredArchiveEntries(documentId: string): Promise<ArchiveVirtualEntry[]> {
   const cached = archiveIndexCache.get(documentId);
   if (cached && cached.expiresAt > Date.now()) return cached.value;
+  const cachedFailure = archiveIndexFailureCache.get(documentId);
+  if (cachedFailure && cachedFailure.expiresAt > Date.now()) throw cachedFailure.error;
   const persisted = await readPersistedArchiveEntries(documentId);
   if (persisted.length > 0) {
     archiveIndexCache.set(documentId, { value: persisted, expiresAt: Date.now() + ARCHIVE_INDEX_TTL_MS });
+    archiveIndexFailureCache.delete(documentId);
     return persisted;
   }
   const servers = await providers();
@@ -356,85 +361,96 @@ export async function listStoredArchiveEntries(documentId: string): Promise<Arch
     return [];
   }
 
-  const firstSignal = AbortSignal.timeout(RAR_HEADER_TIMEOUT_MS);
-  const firstHead = await readDecodedRange(firstRar.file, 0, Math.min(RAR_HEADER_READ_BYTES, Math.floor(firstRar.file.size)), servers, firstSignal);
-  const firstHeaders = await parseStoredRarHeadersWithSharpCompress(firstHead);
-  const hasStoredVideo = firstHeaders.some((header) => header.method === 0x30 && isVideoName(header.name));
-  if (!hasStoredVideo) {
-    const methodSummary = [...new Set(firstHeaders.map((header) => `0x${header.method.toString(16)}`))];
-    const videoHeaderCount = firstHeaders.filter((header) => isVideoName(header.name)).length;
-    if (firstHeaders.length > 0) {
-      console.info(
-        oneLineLog(
-          `[archive] ${document.title} has no direct-streamable stored video entries in scanned RAR headers; videoHeaders=${videoHeaderCount}; methods=${methodSummary.join(",") || "none"}`
-        )
-      );
-    } else {
-      console.info(oneLineLog(`[archive] ${document.title} has no readable RAR headers for direct-stream scan`));
+  try {
+    const firstSignal = AbortSignal.timeout(RAR_HEADER_TIMEOUT_MS);
+    const firstHead = await readDecodedRange(firstRar.file, 0, Math.min(RAR_HEADER_READ_BYTES, Math.floor(firstRar.file.size)), servers, firstSignal);
+    const firstHeaders = await parseStoredRarHeadersWithSharpCompress(firstHead);
+    const hasStoredVideo = firstHeaders.some((header) => header.method === 0x30 && isVideoName(header.name));
+    if (!hasStoredVideo) {
+      const methodSummary = [...new Set(firstHeaders.map((header) => `0x${header.method.toString(16)}`))];
+      const videoHeaderCount = firstHeaders.filter((header) => isVideoName(header.name)).length;
+      if (firstHeaders.length > 0) {
+        console.info(
+          oneLineLog(
+            `[archive] ${document.title} has no direct-streamable stored video entries in scanned RAR headers; videoHeaders=${videoHeaderCount}; methods=${methodSummary.join(",") || "none"}`
+          )
+        );
+      } else {
+        console.info(oneLineLog(`[archive] ${document.title} has no readable RAR headers for direct-stream scan`));
+      }
+      await persistArchiveEntries(documentId, []);
+      archiveIndexCache.set(documentId, { value: [], expiresAt: Date.now() + ARCHIVE_INDEX_TTL_MS });
+      archiveIndexFailureCache.delete(documentId);
+      return [];
     }
-    await persistArchiveEntries(documentId, []);
-    archiveIndexCache.set(documentId, { value: [], expiresAt: Date.now() + ARCHIVE_INDEX_TTL_MS });
-    return [];
-  }
 
-  const grouped = new Map<string, { name: string; expectedSize: number; modifiedAt: Date; parts: Array<{ partNumber: number; packedSize: number; segments: ArchiveVirtualSegment[] }> }>();
-  for (const { file, name: rarName } of rarFiles) {
-    const signal = AbortSignal.timeout(RAR_HEADER_TIMEOUT_MS);
-    const head = file.id === firstRar.file.id
-      ? firstHead
-      : await readDecodedRange(file, 0, Math.min(RAR_HEADER_READ_BYTES, Math.floor(file.size)), servers, signal);
-    const filePartNumber = rarPartNumber(rarName);
-    const headers = (await parseStoredRarHeadersWithSharpCompress(head))
-      .filter((header) => header.method === 0x30 && isVideoName(header.name))
-      .map((header) => ({ ...header, partNumber: filePartNumber }));
-    for (const header of headers) {
-      const virtualName = safeVirtualName(header.name, `${document.title}.mkv`);
-      const current = grouped.get(virtualName) ?? { name: virtualName, expectedSize: header.unpackedSize || 0, modifiedAt: file.date ?? document.createdAt, parts: [] };
-      const entryStart = current.parts.reduce((sum, part) => sum + part.packedSize, 0);
-      const segments = await buildVirtualSegments(file, header.dataStart, header.packedSize, entryStart, servers);
-      current.expectedSize = Math.max(current.expectedSize, header.unpackedSize || 0);
-      current.parts.push({ partNumber: header.partNumber, packedSize: header.packedSize, segments });
-      current.modifiedAt = file.date ?? current.modifiedAt;
-      grouped.set(virtualName, current);
+    const grouped = new Map<string, { name: string; expectedSize: number; modifiedAt: Date; parts: Array<{ partNumber: number; packedSize: number; segments: ArchiveVirtualSegment[] }> }>();
+    for (const { file, name: rarName } of rarFiles) {
+      const signal = AbortSignal.timeout(RAR_HEADER_TIMEOUT_MS);
+      const head = file.id === firstRar.file.id
+        ? firstHead
+        : await readDecodedRange(file, 0, Math.min(RAR_HEADER_READ_BYTES, Math.floor(file.size)), servers, signal);
+      const filePartNumber = rarPartNumber(rarName);
+      const headers = (await parseStoredRarHeadersWithSharpCompress(head))
+        .filter((header) => header.method === 0x30 && isVideoName(header.name))
+        .map((header) => ({ ...header, partNumber: filePartNumber }));
+      for (const header of headers) {
+        const virtualName = safeVirtualName(header.name, `${document.title}.mkv`);
+        const current = grouped.get(virtualName) ?? { name: virtualName, expectedSize: header.unpackedSize || 0, modifiedAt: file.date ?? document.createdAt, parts: [] };
+        const entryStart = current.parts.reduce((sum, part) => sum + part.packedSize, 0);
+        const segments = await buildVirtualSegments(file, header.dataStart, header.packedSize, entryStart, servers);
+        current.expectedSize = Math.max(current.expectedSize, header.unpackedSize || 0);
+        current.parts.push({ partNumber: header.partNumber, packedSize: header.packedSize, segments });
+        current.modifiedAt = file.date ?? current.modifiedAt;
+        grouped.set(virtualName, current);
+      }
+      if (grouped.size > 0 && !/\.part\d+\.rar$/i.test(rarName) && !/\.r\d{2,3}$/i.test(rarName)) break;
     }
-    if (grouped.size > 0 && !/\.part\d+\.rar$/i.test(rarName) && !/\.r\d{2,3}$/i.test(rarName)) break;
-  }
 
-  const used = new Map<string, number>();
-  const entries = [...grouped.values()].map((entry) => {
-    const count = used.get(entry.name) ?? 0;
-    used.set(entry.name, count + 1);
-    const name = count === 0 ? entry.name : entry.name.replace(/(\.[^.]+)?$/, `-${count + 1}$1`);
-    const partNumbers = entry.parts.map((part) => part.partNumber);
-    if (partNumbers.length !== new Set(partNumbers).size) throw new Error("Rar archive has duplicate volume numbers.");
-    const parts = entry.parts.sort((a, b) => a.partNumber - b.partNumber);
-    const totalPackedSize = parts.reduce((sum, part) => sum + part.packedSize, 0);
-    if (entry.expectedSize > 0 && Math.abs(totalPackedSize - entry.expectedSize) > 16) {
-      throw new Error("Missing rar volumes detected.");
-    }
-    let cursor = 0;
-    const segments = parts.flatMap((part) => {
-      const shifted = part.segments.map((segment) => ({
-        ...segment,
-        start: cursor + (segment.start - part.segments[0]!.start),
-        end: cursor + (segment.end - part.segments[0]!.start)
-      }));
-      cursor += part.packedSize;
-      return shifted;
+    const used = new Map<string, number>();
+    const entries = [...grouped.values()].map((entry) => {
+      const count = used.get(entry.name) ?? 0;
+      used.set(entry.name, count + 1);
+      const name = count === 0 ? entry.name : entry.name.replace(/(\.[^.]+)?$/, `-${count + 1}$1`);
+      const partNumbers = entry.parts.map((part) => part.partNumber);
+      if (partNumbers.length !== new Set(partNumbers).size) throw new Error("Rar archive has duplicate volume numbers.");
+      const parts = entry.parts.sort((a, b) => a.partNumber - b.partNumber);
+      const totalPackedSize = parts.reduce((sum, part) => sum + part.packedSize, 0);
+      if (entry.expectedSize > 0 && Math.abs(totalPackedSize - entry.expectedSize) > 16) {
+        throw new Error("Missing rar volumes detected.");
+      }
+      let cursor = 0;
+      const segments = parts.flatMap((part) => {
+        const shifted = part.segments.map((segment) => ({
+          ...segment,
+          start: cursor + (segment.start - part.segments[0]!.start),
+          end: cursor + (segment.end - part.segments[0]!.start)
+        }));
+        cursor += part.packedSize;
+        return shifted;
+      });
+      return {
+        documentId,
+        name,
+        path: `/mounted/releases/${documentId}/archive/${encodeURIComponent(name)}`,
+        size: entry.expectedSize || totalPackedSize,
+        modifiedAt: entry.modifiedAt,
+        segments: segments.sort((a, b) => a.start - b.start)
+      };
+    }).filter((entry) => entry.size > 0 && entry.segments.length > 0);
+
+    await persistArchiveEntries(documentId, entries);
+    archiveIndexCache.set(documentId, { value: entries, expiresAt: Date.now() + ARCHIVE_INDEX_TTL_MS });
+    archiveIndexFailureCache.delete(documentId);
+    return entries;
+  } catch (error) {
+    const failure = error instanceof Error ? error : new Error(String(error));
+    archiveIndexFailureCache.set(documentId, {
+      error: failure,
+      expiresAt: Date.now() + ARCHIVE_INDEX_FAILURE_TTL_MS
     });
-    return {
-      documentId,
-      name,
-      path: `/mounted/releases/${documentId}/archive/${encodeURIComponent(name)}`,
-      size: entry.expectedSize || totalPackedSize,
-      modifiedAt: entry.modifiedAt,
-      segments: segments.sort((a, b) => a.start - b.start)
-    };
-  }).filter((entry) => entry.size > 0 && entry.segments.length > 0);
-
-  await persistArchiveEntries(documentId, entries);
-  archiveIndexCache.set(documentId, { value: entries, expiresAt: Date.now() + ARCHIVE_INDEX_TTL_MS });
-  return entries;
+    throw failure;
+  }
 }
 
 export async function getStoredArchiveEntryByPath(path: string) {

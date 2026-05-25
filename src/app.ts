@@ -39,7 +39,9 @@ export function buildApp() {
   const app = Fastify({
     loggerInstance: buildLineLogger(env.LOG_LEVEL),
     disableRequestLogging: true,
-    ignoreTrailingSlash: true,
+    routerOptions: {
+      ignoreTrailingSlash: true
+    },
     genReqId: (request) => {
       const header = request.headers["x-request-id"];
       return Array.isArray(header) ? header[0] ?? randomUUID() : header ?? randomUUID();
@@ -104,9 +106,6 @@ export function buildApp() {
       : await getAuthUserByApiKey(bearerToken);
 
     if (!user) {
-      if (request.method === "GET" && ["/api/docs", "/api/graphql"].includes(parsedUrl.pathname) && !parsedUrl.searchParams.has("query")) {
-        return reply.redirect("/login");
-      }
       return reply.status(401).send({ message: "Authentication required." });
     }
     request.authUser = user;

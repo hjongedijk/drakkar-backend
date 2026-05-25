@@ -15,7 +15,7 @@ import { runTrackedTask, setTaskNextRun } from "../tasks/taskRegistry.js";
 const BACKGROUND_HEALTHCHECK_INITIAL_DELAY_MS = 5 * 60_000;
 const BACKGROUND_HEALTHCHECK_MIN_ITEM_INTERVAL_MS = 6 * 60 * 60_000;
 const BACKGROUND_HEALTHCHECK_MAX_ITEM_INTERVAL_MS = 7 * 24 * 60 * 60_000;
-const BACKGROUND_HEALTHCHECK_MAX_CHECKS_PER_SWEEP = 25;
+const BACKGROUND_HEALTHCHECK_MAX_CHECKS_PER_SWEEP = 8;
 const BACKGROUND_MOUNTED_HEALTHCHECK_TYPE = "background-mounted-healthcheck";
 
 async function toolAvailable(name: string) {

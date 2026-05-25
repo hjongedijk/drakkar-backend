@@ -113,16 +113,13 @@ async function finalizeMaterializedImport(input: { downloadId: string; requestId
     requestId: input.requestId
   });
   if (imported.length === 0) throw new Error("materialized download produced no importable media files");
-  await prisma.download.update({
-    where: { id: input.downloadId },
-    data: {
-      status: "available",
-      progress: 100,
-      speedBytesSec: 0,
-      etaSeconds: 0,
-      error: null,
-      completedAt: new Date()
-    }
+  await safeUpdateDownload(input.downloadId, {
+    status: "available",
+    progress: 100,
+    speedBytesSec: 0,
+    etaSeconds: 0,
+    error: null,
+    completedAt: new Date()
   });
   await reconcileRequestStatusAfterImport(input.requestId, input.downloadId);
   await rm(sourcePath, { recursive: true, force: true }).catch(() => undefined);
@@ -280,13 +277,10 @@ export function startDownloadWorkers(logger: FastifyBaseLogger) {
         const rawMessage = error instanceof Error ? error.message : "download worker failed";
         const message = humanizeDownloadError(rawMessage) ?? rawMessage;
         if (/too many connections/i.test(message)) {
-          await prisma.download.update({
-            where: { id: job.data.downloadId },
-            data: {
-              status: "waiting_for_provider",
-              error: "Usenet provider reports too many active connections; retrying automatically",
-              speedBytesSec: 0
-            }
+          await safeUpdateDownload(job.data.downloadId, {
+            status: "waiting_for_provider",
+            error: "Usenet provider reports too many active connections; retrying automatically",
+            speedBytesSec: 0
           });
           current = current ?? await prisma.download.findUnique({ where: { id: job.data.downloadId } });
           const retry = await queueDownloadJob(
@@ -305,7 +299,7 @@ export function startDownloadWorkers(logger: FastifyBaseLogger) {
             },
             { delay: 5 * 60 * 1000 }
           );
-          await prisma.download.update({ where: { id: job.data.downloadId }, data: { jobId: retry.id } });
+          await safeUpdateDownload(job.data.downloadId, { jobId: retry.id });
           logger.warn({ downloadId: job.data.downloadId, retryJobId: retry.id }, "provider connection limit reached; delayed retry queued");
           return { status: "waiting_for_provider", retryJobId: retry.id };
         }
@@ -326,15 +320,12 @@ export function startDownloadWorkers(logger: FastifyBaseLogger) {
               requestId: job.data.requestId
             }
           );
-          await prisma.download.update({
-            where: { id: job.data.downloadId },
-            data: {
-              status: "queued",
-              jobId: String(retry.id),
-              speedBytesSec: 0,
-              etaSeconds: null,
-              error: "Usenet provider settings changed. Download restarting with new connection pool."
-            }
+          await safeUpdateDownload(job.data.downloadId, {
+            status: "queued",
+            jobId: String(retry.id),
+            speedBytesSec: 0,
+            etaSeconds: null,
+            error: "Usenet provider settings changed. Download restarting with new connection pool."
           });
           logger.warn({ downloadId: job.data.downloadId, retryJobId: retry.id }, "download requeued after provider config change");
           return { status: "queued", retryJobId: retry.id };
@@ -371,14 +362,11 @@ export function startDownloadWorkers(logger: FastifyBaseLogger) {
     const job = await nzbDownloadQueue.getJob(jobId).catch(() => null);
     const downloadId = job?.data?.downloadId;
     if (!downloadId) return;
-    await prisma.download.update({
-      where: { id: downloadId },
-      data: {
-        status: "queued",
-        error: "Download worker stalled; job returned to queue automatically.",
-        speedBytesSec: 0,
-        etaSeconds: null
-      }
+    await safeUpdateDownload(downloadId, {
+      status: "queued",
+      error: "Download worker stalled; job returned to queue automatically.",
+      speedBytesSec: 0,
+      etaSeconds: null
     }).catch(() => undefined);
   });
 
@@ -437,14 +425,11 @@ export async function reconcileDownloadQueueState(logger: FastifyBaseLogger) {
         logger.warn({ downloadId: download.id, jobId: download.jobId, status: download.status }, "active-like download is still within orphan grace period");
         continue;
       }
-      await prisma.download.update({
-        where: { id: download.id },
-        data: {
-          status: "failed",
-          error: "Queued download is missing both NZB payload and worker job. Re-add or retry the release.",
-          speedBytesSec: 0,
-          etaSeconds: null
-        }
+      await safeUpdateDownload(download.id, {
+        status: "failed",
+        error: "Queued download is missing both NZB payload and worker job. Re-add or retry the release.",
+        speedBytesSec: 0,
+        etaSeconds: null
       }).catch(() => undefined);
       await prisma.mediaRequest.updateMany({
         where: { downloadId: download.id },
@@ -464,15 +449,12 @@ export async function reconcileDownloadQueueState(logger: FastifyBaseLogger) {
       title: download.title,
       requestId: linkedRequest?.id
     });
-    await prisma.download.update({
-      where: { id: download.id },
-      data: {
-        status: "queued",
-        jobId: String(job.id),
-        error: null,
-        speedBytesSec: 0,
-        etaSeconds: null
-      }
+    await safeUpdateDownload(download.id, {
+      status: "queued",
+      jobId: String(job.id),
+      error: null,
+      speedBytesSec: 0,
+      etaSeconds: null
     });
     requeued += 1;
   }
@@ -490,15 +472,12 @@ export async function recoverStaleActiveDownloadJobs(logger: FastifyBaseLogger) 
     const downloadId = job.data?.downloadId;
     if (!downloadId) continue;
     await job.remove().catch(() => undefined);
-    await prisma.download.update({
-      where: { id: downloadId },
-      data: {
-        status: "queued",
-        jobId: null,
-        error: "Download worker active job timed out; requeued.",
-        speedBytesSec: 0,
-        etaSeconds: null
-      }
+    await safeUpdateDownload(downloadId, {
+      status: "queued",
+      jobId: null,
+      error: "Download worker active job timed out; requeued.",
+      speedBytesSec: 0,
+      etaSeconds: null
     }).catch(() => undefined);
   }
 
@@ -572,15 +551,12 @@ export async function reconcileAvailableDownloadsWithoutImports(logger: FastifyB
           requestId: linkedRequest?.id
         }
       );
-      await prisma.download.update({
-        where: { id: download.id },
-        data: {
-          status: "queued",
-          jobId: String(job.id),
-          error: sourceStats ? null : "Recovering stale available download without imports",
-          speedBytesSec: 0,
-          etaSeconds: null
-        }
+      await safeUpdateDownload(download.id, {
+        status: "queued",
+        jobId: String(job.id),
+        error: sourceStats ? null : "Recovering stale available download without imports",
+        speedBytesSec: 0,
+        etaSeconds: null
       });
       requeued += 1;
     } catch (error) {
@@ -621,7 +597,7 @@ export async function recoverInterruptedDownloads(logger: FastifyBaseLogger) {
     const existingJob = await existingQueueJobForDownload(download);
     if (existingJob) {
       if (String(download.jobId ?? "") !== String(existingJob.id)) {
-        await prisma.download.update({ where: { id: download.id }, data: { jobId: String(existingJob.id) } });
+        await safeUpdateDownload(download.id, { jobId: String(existingJob.id) });
       }
       alreadyQueued += 1;
       continue;
@@ -640,15 +616,12 @@ export async function recoverInterruptedDownloads(logger: FastifyBaseLogger) {
       title: download.title,
       requestId: linkedRequest?.id
     });
-    await prisma.download.update({
-      where: { id: download.id },
-      data: {
-        status: "queued",
-        jobId: job.id,
-        error: null,
-        speedBytesSec: 0,
-        etaSeconds: null
-      }
+    await safeUpdateDownload(download.id, {
+      status: "queued",
+      jobId: job.id,
+      error: null,
+      speedBytesSec: 0,
+      etaSeconds: null
     });
     recovered += 1;
     logger.warn({ downloadId: download.id, jobId: job.id }, "download with missing worker job recovered and requeued");

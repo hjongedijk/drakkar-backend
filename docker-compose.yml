@@ -205,37 +205,7 @@ services:
         max-file: "3"
     networks:
       - drakkar
-
-  bazarr:
-    image: lscr.io/linuxserver/bazarr:latest
-    restart: unless-stopped
-    user: 0:0
-    depends_on:
-      backend:
-        condition: service_healthy
-    ports:
-      - "6767:6767"
-    environment:
-      - PUID=0
-      - PGID=0
-      - TZ=Europe/Amsterdam
-    volumes:
-      - ./bazarr:/config
-      - /mnt/drakkar:/mnt:rshared
-    healthcheck:
-      test: ["CMD", "curl", "-fsS", "http://127.0.0.1:6767"]
-      interval: 30s
-      timeout: 10s
-      retries: 5
-      start_period: 30s
-    logging:
-      driver: local
-      options:
-        max-size: "5m"
-        max-file: "3"
-    networks:
-      - drakkar
-
+      
 networks:
   drakkar:
     driver: bridge

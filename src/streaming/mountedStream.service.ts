@@ -530,9 +530,7 @@ async function getMountedFileManifest(path: string): Promise<MountedFileManifest
   if (!file) throw new Error("mounted NZB file not found");
 
   const segments: MountedFileSegment[] = [];
-  // nzbdav seeks by real yEnc part offsets, not by assuming constant part sizes.
-  // Use the exact decoded manifest here so FUSE and playback reads map to the correct decoded bytes.
-  const decoded = await buildDecodedYencSegments(file, await getProviders(), undefined, { mode: "exact" });
+  const decoded = await buildDecodedYencSegments(file, await getProviders(), undefined, { mode: "fast" });
   let fallbackCursor = 0;
   const sourceSegments = decoded?.segments ?? file.segments.map((segment) => {
     const bytes = Math.floor(segment.bytes);

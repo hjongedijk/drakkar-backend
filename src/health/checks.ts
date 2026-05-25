@@ -1,6 +1,7 @@
 import type { RepairJob, Symlink } from "@prisma/client";
 
 export type HealthOutcome = "healthy" | "repaired" | "deleted" | "unknown";
+const STALE_RUNNING_REPAIR_MS = 10 * 60 * 1000;
 
 export function classifyRepairOutcome(repair?: Pick<RepairJob, "type" | "status" | "message"> | null): HealthOutcome {
   if (!repair) return "unknown";
@@ -27,9 +28,16 @@ export function deriveImportHealth(input: {
   return "unknown";
 }
 
-export function estimateHealthProgress(repair?: Pick<RepairJob, "type" | "status" | "message"> | null) {
+export function healthRepairIsActive(repair?: Pick<RepairJob, "status" | "updatedAt" | "startedAt"> | null) {
+  if (!repair || repair.status !== "running") return false;
+  const lastTouch = repair.updatedAt ?? repair.startedAt;
+  if (!lastTouch) return false;
+  return Date.now() - new Date(lastTouch).getTime() < STALE_RUNNING_REPAIR_MS;
+}
+
+export function estimateHealthProgress(repair?: Pick<RepairJob, "type" | "status" | "message" | "updatedAt" | "startedAt"> | null) {
   if (!repair) return 0;
-  if (repair.status !== "running") return 0;
+  if (!healthRepairIsActive(repair)) return 0;
   const message = (repair.message ?? "").toLowerCase();
   const type = repair.type.toLowerCase();
   if (message.includes("par2") || type.includes("repair")) return 70;

@@ -1,7 +1,7 @@
 import type { FastifyInstance } from "fastify";
 import { prisma } from "../db/prisma.js";
 import { redis } from "../db/redis.js";
-import { classifyRepairOutcome, deriveImportHealth, estimateHealthProgress, isCompletedHealthJob } from "../health/checks.js";
+import { classifyRepairOutcome, deriveImportHealth, estimateHealthProgress, healthRepairIsActive, isCompletedHealthJob } from "../health/checks.js";
 import { DRAKKAR_VERSION } from "../version.js";
 
 export async function healthRoutes(app: FastifyInstance): Promise<void> {
@@ -90,6 +90,7 @@ export async function healthRoutes(app: FastifyInstance): Promise<void> {
       const primarySymlink = item.symlinks[0];
       const lastCheck = repair?.completedAt ?? repair?.updatedAt ?? null;
       const nextCheck = lastCheck ? new Date(lastCheck.getTime() + 10 * 60 * 1000) : null;
+      const repairActive = healthRepairIsActive(repair);
       const activeProgress = estimateHealthProgress(repair);
       return {
         id: item.id,
@@ -97,10 +98,10 @@ export async function healthRoutes(app: FastifyInstance): Promise<void> {
         path: primarySymlink?.linkPath ?? item.completedPath,
         createdAt: item.createdAt,
         lastCheckAt: lastCheck?.toISOString() ?? null,
-        nextCheckAt: activeProgress > 0 ? null : nextCheck?.toISOString() ?? null,
+        nextCheckAt: repairActive ? null : nextCheck?.toISOString() ?? null,
         progress: activeProgress,
         health: deriveImportHealth({ repair, primarySymlink }),
-        status: repair?.status ?? "scheduled"
+        status: repairActive ? "running" : "scheduled"
       };
     }).sort((a, b) => {
       const aDue = a.nextCheckAt ? Date.parse(a.nextCheckAt) : -1;

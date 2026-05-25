@@ -54,6 +54,10 @@ function isProviderConnectionLimit(message: string) {
   return /too many connections|502/i.test(message);
 }
 
+function isTransientProbeAbort(message: string) {
+  return /nntp operation aborted|abort/i.test(message);
+}
+
 function providerCoolingDown(providerId: string) {
   return (providerProbeCooldownUntil.get(providerId) ?? 0) > Date.now();
 }
@@ -103,7 +107,7 @@ async function fetchYencPartInfo(articleId: string, providers: UsenetServer[], s
     } catch (error) {
       const message = error instanceof Error ? error.message : "unknown error";
       errors.push(`${provider.name}: ${message}`);
-      if (isProviderConnectionLimit(message)) {
+      if (isProviderConnectionLimit(message) || isTransientProbeAbort(message)) {
         connectionLimited = true;
         providerProbeCooldownUntil.set(provider.id, Date.now() + YENC_PROBE_COOLDOWN_MS);
       }
