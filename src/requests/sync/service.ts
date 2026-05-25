@@ -25,7 +25,8 @@ const TV_EPISODE_DOWNLOADS_PER_REQUEST_PASS = 4;
 const MONITORED_REQUESTS_MAX_DURATION_MS = 20_000;
 const REQUEST_SYNC_MAX_DURATION_MS = 35_000;
 const REQUEST_SYNC_PROVIDER_MAX_REQUESTS = 200;
-const FAILED_REQUEST_RECOVERY_MAX_PER_CYCLE = 12;
+const FAILED_REQUEST_RECOVERY_MAX_PER_CYCLE = 2;
+const SELECTED_RELEASE_RECOVERY_MAX_PER_CYCLE = 2;
 const SEERR_WEBHOOK_PRIORITY = 900;
 
 function blockReasonFromFailure(message?: string | null) {
@@ -272,7 +273,7 @@ export async function syncRequests(providerId?: string, options: { full?: boolea
   let budgetExceeded = false;
 
   for (const provider of providers) {
-    if (Date.now() - startedAt >= REQUEST_SYNC_MAX_DURATION_MS) {
+    if (!options.full && Date.now() - startedAt >= REQUEST_SYNC_MAX_DURATION_MS) {
       budgetExceeded = true;
       break;
     }
@@ -285,7 +286,7 @@ export async function syncRequests(providerId?: string, options: { full?: boolea
       fetchedForProvider = requests.length;
       const syncedRequests: MediaRequest[] = [];
       for (const request of requests) {
-        if (Date.now() - startedAt >= REQUEST_SYNC_MAX_DURATION_MS) {
+        if (!options.full && Date.now() - startedAt >= REQUEST_SYNC_MAX_DURATION_MS) {
           budgetExceeded = true;
           break;
         }
@@ -458,14 +459,15 @@ export async function syncRequestFromWebhook(payload: unknown, providerId?: stri
   return { ok: true, mode: "full-sync" as const, requestId: externalId, sync };
 }
 
-export async function recoverFailedRequestDownloads() {
+export async function recoverFailedRequestDownloads(options: { limit?: number } = {}) {
+  const limit = Math.max(1, options.limit ?? FAILED_REQUEST_RECOVERY_MAX_PER_CYCLE);
   const requests = await prisma.mediaRequest.findMany({
     where: {
       downloadId: { not: null },
       status: { not: "available" }
     },
     orderBy: { updatedAt: "asc" },
-    take: FAILED_REQUEST_RECOVERY_MAX_PER_CYCLE
+    take: limit
   });
   const downloadIds = [...new Set(requests.flatMap((request) => request.downloadId ? [request.downloadId] : []))];
   const downloads = downloadIds.length > 0
@@ -489,7 +491,8 @@ export async function recoverFailedRequestDownloads() {
   return { scanned: requests.length, recovered: recovered.length, results: recovered };
 }
 
-export async function recoverSelectedReleaseDownloads() {
+export async function recoverSelectedReleaseDownloads(options: { limit?: number } = {}) {
+  const limit = Math.max(1, options.limit ?? SELECTED_RELEASE_RECOVERY_MAX_PER_CYCLE);
   const requests = await prisma.mediaRequest.findMany({
     where: {
       downloadId: null,
@@ -497,7 +500,7 @@ export async function recoverSelectedReleaseDownloads() {
       status: { in: ["approved", "grabbed", "searching", "release_failed", "auto_grab_failed", "no_release_found", "import_failed"] }
     },
     orderBy: { updatedAt: "asc" },
-    take: 25
+    take: limit
   });
 
   const recovered = [];
@@ -1865,7 +1868,9 @@ export async function grabReleaseForRequest(id: string, release: unknown) {
     });
     return { grabbed: false, reason: "release is blocklisted", release: typedRelease };
   }
-  const decision = scoreReleaseForRequest(request, typedRelease, profile);
+  const decision = scoreReleaseForRequest(request, typedRelease, profile, {
+    rejectAmbiguousAnime: request.mediaType === "tv" && Boolean(request.year)
+  });
   if (!decision.accepted) {
     await prisma.mediaRequest.update({
       where: { id },

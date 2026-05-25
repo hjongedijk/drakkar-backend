@@ -19,33 +19,22 @@ export type ScheduledTask = TaskDefinition & {
 };
 
 const tasks = new Map<string, ScheduledTask>();
-const STALE_RUNNING_TASK_MS = 10 * 60_000;
 
 function toIso(value: Date | string | null | undefined) {
   if (!value) return null;
   return value instanceof Date ? value.toISOString() : value;
 }
 
-function isStaleRunningTask(task: Pick<ScheduledTask, "status" | "lastStartedAt"> | undefined) {
-  if (!task || task.status !== "running" || !task.lastStartedAt) return false;
-  return Date.now() - new Date(task.lastStartedAt).getTime() > STALE_RUNNING_TASK_MS;
-}
-
-export function isTaskStaleRunning(id: string) {
-  return isStaleRunningTask(tasks.get(id));
-}
-
 export function registerTask(definition: TaskDefinition) {
   const existing = tasks.get(definition.id);
-  const recoveredRunning = isStaleRunningTask(existing);
   tasks.set(definition.id, {
     ...definition,
-    status: definition.enabled ? recoveredRunning ? "idle" : existing?.status ?? "idle" : "disabled",
+    status: definition.enabled ? existing?.status ?? "idle" : "disabled",
     lastStartedAt: existing?.lastStartedAt ?? null,
     lastCompletedAt: existing?.lastCompletedAt ?? null,
     lastDurationMs: existing?.lastDurationMs ?? null,
     nextRunAt: existing?.nextRunAt ?? null,
-    lastError: recoveredRunning ? "Recovered stale running task after restart." : existing?.lastError ?? null
+    lastError: existing?.lastError ?? null
   });
 }
 
@@ -79,13 +68,9 @@ export async function runTrackedTask<T>(id: string, action: () => Promise<T>): P
     task.status = "disabled";
     return undefined;
   }
-  if (task.status === "running" && !isStaleRunningTask(task)) return undefined;
-  if (task.status === "running" && isStaleRunningTask(task)) {
-    task.status = "failed";
-    task.lastError = "Recovered stale running task.";
-    task.lastCompletedAt = new Date().toISOString();
-    if (task.lastStartedAt) task.lastDurationMs = Date.now() - new Date(task.lastStartedAt).getTime();
-  }
+  // A long-running operation cannot be safely cancelled or duplicated in-process.
+  // Restarting the service is the recovery path for a genuinely hung task.
+  if (task.status === "running") return undefined;
 
   const startedAt = Date.now();
   task.status = "running";

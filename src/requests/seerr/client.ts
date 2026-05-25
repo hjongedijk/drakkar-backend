@@ -8,6 +8,7 @@ type SeerrRequest = {
   type?: "movie" | "tv";
   requestedBy?: { displayName?: string; username?: string; email?: string };
   media?: {
+    id?: number;
     mediaType?: "movie" | "tv";
     tmdbId?: number;
     tvdbId?: number;
@@ -251,14 +252,21 @@ export async function fetchSeerrRequests(provider: RequestProvider, options: Fet
 
 export async function fetchSeerrRequestById(provider: RequestProvider, requestId: string): Promise<ExternalMediaRequest | null> {
   await assertServiceAllowed(serviceName(provider), providerConfigured(provider), `${provider.name} is not configured; request sync skipped`);
-  const response = await providerFetch(provider, `/api/v1/request/${requestId}`);
+  const response = await providerFetch(provider, `/api/v1/request/${encodeURIComponent(requestId)}`);
   if (!response.ok) return null;
   const request = await response.json() as SeerrRequestDetails;
   return mapSeerrRequest(provider, request);
 }
 
 export async function updateSeerrAvailable(provider: RequestProvider, requestId: string) {
-  const response = await providerFetch(provider, `/api/v1/request/${requestId}/available`);
+  const requestResponse = await providerFetch(provider, `/api/v1/request/${encodeURIComponent(requestId)}`);
+  if (!requestResponse.ok) return { ok: false, status: requestResponse.status };
+  const request = await requestResponse.json() as SeerrRequest;
+  if (!request.media?.id) return { ok: false, status: 422, message: "Seerr request has no media ID." };
+  const response = await providerFetch(provider, `/api/v1/media/${request.media.id}/available`, {
+    method: "POST",
+    body: JSON.stringify({ is4k: Boolean(request.is4k) })
+  });
   return { ok: response.ok, status: response.status };
 }
 

@@ -1,6 +1,6 @@
 import { copyFile, lstat, mkdir, readFile, readdir, readlink, rm, rmdir, symlink, unlink, writeFile } from "node:fs/promises";
 import { dirname, extname, join, relative } from "node:path";
-import type { ImportItem } from "@prisma/client";
+import { Prisma, type ImportItem } from "@prisma/client";
 import { env } from "../config/env.js";
 import { prisma } from "../db/prisma.js";
 import { canonicalizeDisplayTitle, inferMediaIdentity, normalizeTitleForIdentity } from "../media-library/identity.js";
@@ -45,6 +45,18 @@ function lookupTitleVariants(value: string, year?: number | null) {
   );
 }
 
+function selectedReleaseIsAmbiguousAnime(
+  request: { mediaType: string; year?: number | null; selectedRelease?: unknown },
+  downloadTitle?: string | null
+) {
+  if (request.mediaType !== "tv" || !request.year || !request.selectedRelease || typeof request.selectedRelease !== "object") return false;
+  const release = request.selectedRelease as Record<string, unknown>;
+  const category = typeof release.category === "string" ? release.category : "";
+  const title = typeof release.title === "string" ? release.title : downloadTitle ?? "";
+  if (!/\banime\b/i.test(category) || new RegExp(`\\b${request.year}\\b`).test(title)) return false;
+  return !release.imdbId && !release.tmdbId && !release.tvdbId;
+}
+
 export async function resolveImportMedia(item: ImportItem) {
   const request = item.requestId ? await prisma.mediaRequest.findUnique({ where: { id: item.requestId } }) : null;
   const download = item.downloadId ? await prisma.download.findUnique({ where: { id: item.downloadId } }) : null;
@@ -84,11 +96,30 @@ export async function resolveImportMedia(item: ImportItem) {
     tmdbId: request.tmdbId ?? undefined,
     tvdbId: request.tvdbId ?? undefined
   } : null;
-  if (requestCandidate && await metadataCandidateMatchesMedia(settings, media, requestCandidate)) {
+  const requestCandidateMatches = requestCandidate
+    ? !selectedReleaseIsAmbiguousAnime(request!, download?.title) && await metadataCandidateMatchesMedia(settings, media, requestCandidate)
+    : false;
+  if (requestCandidate && requestCandidateMatches) {
     media.title = canonicalizeDisplayTitle(requestCandidate.title ?? media.title, requestCandidate.year ?? media.year);
     media.year = media.year ?? requestCandidate.year;
     media.tmdbId = requestCandidate.tmdbId ?? media.tmdbId;
     media.tvdbId = requestCandidate.tvdbId ?? media.tvdbId;
+  } else if (
+    request &&
+    request.downloadId &&
+    request.downloadId === item.downloadId &&
+    media.mediaType === "tv" &&
+    media.season != null &&
+    media.episode != null
+  ) {
+    await prisma.$transaction([
+      prisma.importItem.update({ where: { id: item.id }, data: { requestId: null } }),
+      prisma.mediaRequest.update({
+        where: { id: request.id },
+        data: { status: "approved", downloadId: null, selectedRelease: Prisma.JsonNull }
+      })
+    ]).catch(() => undefined);
+    item.requestId = null;
   }
 
   const knownMetadata = await findKnownMetadataForMedia(media, settings);
@@ -223,7 +254,6 @@ async function metadataCandidateMatchesMedia(
   }
 ) {
   if (media.mediaType === "movie") return !(media.year != null && candidate.year != null && media.year !== candidate.year);
-  if (media.mediaType === "tv" && media.year == null && candidate.year != null) return false;
   if (media.mediaType !== "tv" || media.season == null || media.episode == null) return true;
   if (!candidate.tmdbId && !candidate.tvdbId) return true;
   const structure = await fetchSeriesStructure(settings, {

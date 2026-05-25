@@ -1,6 +1,6 @@
 import { createHash } from "node:crypto";
-import { basename, dirname } from "node:path";
-import { stat } from "node:fs/promises";
+import { basename, dirname, resolve } from "node:path";
+import { readdir, stat } from "node:fs/promises";
 import type { FastifyInstance, FastifyRequest } from "fastify";
 import { prisma } from "../db/prisma.js";
 import { env } from "../config/env.js";
@@ -312,6 +312,29 @@ async function buildHistoryForRequest(requestId?: string | null) {
   };
 }
 
+async function browseCompatFilesystem(rootPath: string, requestedPath?: string | null) {
+  const cleaned = (requestedPath ?? "").trim();
+  const candidatePath = cleaned && cleaned !== "#"
+    ? resolve(cleaned)
+    : rootPath;
+  const resolvedRoot = resolve(rootPath);
+  const resolvedTarget = candidatePath.startsWith(resolvedRoot) ? candidatePath : resolvedRoot;
+  const entries = await readdir(resolvedTarget, { withFileTypes: true }).catch(() => []);
+  const directories = entries
+    .filter((entry) => entry.isDirectory())
+    .map((entry) => ({
+      name: entry.name,
+      path: resolve(resolvedTarget, entry.name)
+    }))
+    .sort((left, right) => left.name.localeCompare(right.name, undefined, { sensitivity: "base" }));
+
+  return {
+    path: resolvedTarget,
+    parentPath: dirname(resolvedTarget),
+    directories
+  };
+}
+
 export async function bazarrCompatRoutes(app: FastifyInstance): Promise<void> {
   app.addHook("preHandler", async (request, reply) => {
     if (!(await ensureCompatAuth(request))) {
@@ -332,6 +355,14 @@ export async function bazarrCompatRoutes(app: FastifyInstance): Promise<void> {
 
   app.get("/api/compat/sonarr/api/v3/rootfolder", async () => [{ id: stableInt(env.MEDIA_TV_DIR), path: env.MEDIA_TV_DIR }]);
   app.get("/api/compat/radarr/api/v3/rootfolder", async () => [{ id: stableInt(env.MEDIA_MOVIES_DIR), path: env.MEDIA_MOVIES_DIR }]);
+  app.get("/api/compat/sonarr/api/v3/filesystem", async (request) => {
+    const url = new URL(request.url, env.APP_BASE_URL);
+    return browseCompatFilesystem(env.MEDIA_TV_DIR, url.searchParams.get("path"));
+  });
+  app.get("/api/compat/radarr/api/v3/filesystem", async (request) => {
+    const url = new URL(request.url, env.APP_BASE_URL);
+    return browseCompatFilesystem(env.MEDIA_MOVIES_DIR, url.searchParams.get("path"));
+  });
 
   app.get("/api/compat/radarr/api/v3/qualityprofile", async () => (await buildRadarrData()).qualityProfiles);
 

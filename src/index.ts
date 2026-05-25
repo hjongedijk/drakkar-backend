@@ -28,7 +28,7 @@ import {
   NAMING_MIGRATION_TASK_ID,
   QUEUE_RECONCILE_TASK_ID
 } from "./tasks/coreTasks.js";
-import { markTaskCompleted, runTrackedTask } from "./tasks/taskRegistry.js";
+import { runTrackedTask } from "./tasks/taskRegistry.js";
 
 const app = buildApp();
 const STARTUP_PLEX_REFRESH_DELAY_MS = 120_000;
@@ -82,7 +82,6 @@ try {
         NAMING_MIGRATION_TASK_ID,
         () => migrateImportsToCurrentNaming({ refreshPlex: false, changedPaths: startupPlexRefreshPaths })
       );
-      markTaskCompleted(NAMING_MIGRATION_TASK_ID);
       const nzbPathNormalization = await normalizeNzbStoragePaths();
       if (nzbPathNormalization.updated > 0 || nzbPathNormalization.moved > 0 || nzbPathNormalization.cleanedLegacy > 0) {
         app.log.info({ nzbPathNormalization }, "legacy nzb storage paths normalized");

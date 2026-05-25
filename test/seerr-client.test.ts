@@ -1,7 +1,7 @@
 import { afterEach, describe, it } from "node:test";
 import assert from "node:assert/strict";
 import type { RequestProvider } from "@prisma/client";
-import { fetchSeerrRequests } from "../src/requests/seerr/client.js";
+import { fetchSeerrRequests, updateSeerrAvailable } from "../src/requests/seerr/client.js";
 
 const originalFetch = globalThis.fetch;
 
@@ -105,5 +105,26 @@ describe("fetchSeerrRequests", () => {
       { seasonNumber: 2, episodeNumber: 3 },
       { seasonNumber: 2, episodeNumber: 4 }
     ]);
+  });
+});
+
+describe("updateSeerrAvailable", () => {
+  it("updates the Seerr media status endpoint documented for availability", async () => {
+    const calls: Array<{ url: string; method?: string; body?: BodyInit | null }> = [];
+    globalThis.fetch = (async (input: string | URL | Request, init?: RequestInit) => {
+      calls.push({ url: String(input), method: init?.method, body: init?.body });
+      if (String(input).endsWith("/api/v1/request/42")) {
+        return new Response(JSON.stringify({ id: 42, is4k: false, media: { id: 77, mediaType: "movie" } }), { status: 200 });
+      }
+      return new Response(JSON.stringify({ id: 77, status: 5 }), { status: 200 });
+    }) as typeof fetch;
+
+    const result = await updateSeerrAvailable(provider(), "42");
+
+    assert.equal(result.ok, true);
+    assert.equal(calls[0]?.url, "http://seerr.local/api/v1/request/42");
+    assert.equal(calls[1]?.url, "http://seerr.local/api/v1/media/77/available");
+    assert.equal(calls[1]?.method, "POST");
+    assert.equal(calls[1]?.body, JSON.stringify({ is4k: false }));
   });
 });

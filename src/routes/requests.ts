@@ -14,12 +14,8 @@ import {
   listProviders,
   listRequests,
   markRequestAvailable,
-  backfillPlaceholderRequestMetadata,
   rankReleasesForRequest,
   rankTvEpisodeForRequest,
-  recoverFailedRequestDownloads,
-  recoverSelectedReleaseDownloads,
-  ensureMonitoredRequests,
   refreshRequest,
   setRequestStatus,
   syncRequests,
@@ -27,7 +23,7 @@ import {
   testRequestProvider,
   updateProvider
 } from "../requests/sync/service.js";
-import { refreshMediaLibrary } from "../media-library/libraryService.js";
+import { isRequestSyncRunning, runDeferredRequestRecovery, runFullRequestSyncRefresh } from "../requests/sync/scheduler.js";
 
 const providerSchema = z.object({
   type: z.literal("seerr").default("seerr"),
@@ -128,14 +124,7 @@ export async function requestRoutes(app: FastifyInstance): Promise<void> {
   app.post("/api/requests/sync", async (request) => {
     const body = syncRequestsSchema.parse(request.body ?? {});
     const result = await syncRequests(body.providerId, { full: body.full });
-    void (async () => {
-      try {
-        await recoverFailedRequestDownloads();
-        await ensureMonitoredRequests();
-      } catch (error) {
-        request.log.warn({ err: error }, "post-sync recovery/monitor refresh failed");
-      }
-    })();
+    void runDeferredRequestRecovery(request.log);
     return publicResult({
       ...result,
       recovery: { recovered: 0, deferred: true },
@@ -146,25 +135,11 @@ export async function requestRoutes(app: FastifyInstance): Promise<void> {
   app.post("/api/requests/full-sync-refresh", async (request, reply) => {
     if (!request.authUser?.isAdmin) return reply.status(403).send({ message: "Admin access required." });
     const body = syncRequestsSchema.parse(request.body ?? {});
-    const sync = await syncRequests(body.providerId, { full: true });
-    const [failedRecovery, selectedRecovery, metadataBackfill, monitored, library] = await Promise.all([
-      recoverFailedRequestDownloads(),
-      recoverSelectedReleaseDownloads(),
-      backfillPlaceholderRequestMetadata(),
-      ensureMonitoredRequests(),
-      refreshMediaLibrary()
-    ]);
-    return publicResult({
-      sync: {
-        ...sync,
-        requests: sync.requests.map(publicRequest)
-      },
-      recoverFailed: failedRecovery,
-      recoverSelected: selectedRecovery,
-      metadataBackfill,
-      monitored,
-      library
-    });
+    if (isRequestSyncRunning()) {
+      return reply.status(202).send({ accepted: true, alreadyRunning: true, message: "Request Sync is already running." });
+    }
+    void runFullRequestSyncRefresh(request.log, body.providerId);
+    return reply.status(202).send({ accepted: true, alreadyRunning: false, message: "Full resync queued. Check Request Sync task status for progress." });
   });
   app.post("/api/webhooks/seerr", async (request) => {
     const providerId = (request.body && typeof request.body === "object" && "providerId" in (request.body as Record<string, unknown>))

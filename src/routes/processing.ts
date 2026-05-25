@@ -3,7 +3,7 @@ import type { FastifyInstance } from "fastify";
 import { getImport, importCompletedPath, listImports, migrateImportsToCurrentNaming, reprocessImport } from "../import/importService.js";
 import { getNamingSettings, previewNaming, updateNamingSettings } from "../naming/namingService.js";
 import { refreshMediaLibrary } from "../media-library/libraryService.js";
-import { extractDownloadPath, listRepairJobs, runCompletedHealthcheck, runRepair } from "../repair/repairService.js";
+import { extractDownloadPath, listRepairJobs, runBackgroundRepairSweep, runRepair } from "../repair/repairService.js";
 import { cleanupSymlinks, listSymlinks, pruneLibraryDirectories, repairSymlinks } from "../symlinks/symlinkService.js";
 
 const reprocessSchema = z.object({
@@ -40,7 +40,10 @@ function idParam(request: { params: unknown }) {
 
 export async function processingRoutes(app: FastifyInstance): Promise<void> {
   app.get("/api/repair/jobs", async () => listRepairJobs());
-  app.post("/api/repair/healthcheck", async () => runCompletedHealthcheck());
+  app.post("/api/repair/healthcheck", async (_request, reply) => {
+    void runBackgroundRepairSweep(app.log);
+    return reply.status(202).send({ accepted: true, message: "Background health check queued." });
+  });
   app.post("/api/repair/:downloadId", async (request) => runRepair(idParam(request)));
   app.post("/api/extract", async (request) => extractDownloadPath(extractSchema.parse(request.body).sourcePath));
 

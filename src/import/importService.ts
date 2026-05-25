@@ -159,6 +159,8 @@ export async function reconcileRequestStatusAfterImport(requestId?: string, down
       where: { id: requestId },
       data: { status: "available", downloadId: downloadId ?? request.downloadId }
     }).catch(() => undefined);
+    const { markRequestAvailable } = await import("../requests/sync/service.js");
+    await markRequestAvailable(requestId).catch(() => undefined);
     return;
   }
 
@@ -191,6 +193,10 @@ export async function reconcileRequestStatusAfterImport(requestId?: string, down
         : downloadId ?? request.downloadId
     }
   }).catch(() => undefined);
+  if (nextStatus === "available") {
+    const { markRequestAvailable } = await import("../requests/sync/service.js");
+    await markRequestAvailable(requestId).catch(() => undefined);
+  }
 }
 
 function fallbackMediaTitle(value?: string | null) {

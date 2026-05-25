@@ -2,7 +2,6 @@ import { access, readdir, stat } from "node:fs/promises";
 import { join } from "node:path";
 import { env } from "../config/env.js";
 import { prisma } from "../db/prisma.js";
-import { repairQueue } from "../queues/downloadQueue.js";
 import { detectArchive } from "../extract/detect.js";
 import { extractArchivesInPath } from "../extract/extractService.js";
 import { importCompletedPath } from "../import/importService.js";
@@ -15,6 +14,7 @@ import { runTrackedTask, setTaskNextRun } from "../tasks/taskRegistry.js";
 const BACKGROUND_HEALTHCHECK_INITIAL_DELAY_MS = 5 * 60_000;
 const BACKGROUND_HEALTHCHECK_MIN_ITEM_INTERVAL_MS = 6 * 60 * 60_000;
 const BACKGROUND_HEALTHCHECK_MAX_ITEM_INTERVAL_MS = 7 * 24 * 60 * 60_000;
+const BACKGROUND_HEALTHCHECK_MAX_CHECKS_PER_SWEEP = 25;
 const BACKGROUND_MOUNTED_HEALTHCHECK_TYPE = "background-mounted-healthcheck";
 
 async function toolAvailable(name: string) {
@@ -57,12 +57,10 @@ export function listRepairJobs() {
 }
 
 export async function runRepair(downloadId: string) {
-  const download = await prisma.download.findUniqueOrThrow({ where: { id: downloadId }, include: { nzbDocument: true } });
+  await prisma.download.findUniqueOrThrow({ where: { id: downloadId }, select: { id: true } });
   const job = await prisma.repairJob.create({
     data: { downloadId, type: "post-download-healthcheck", status: "running", startedAt: new Date() }
   });
-  await repairQueue.add("manual-repair", { downloadId, title: download.title });
-
   const sourcePath = join(env.VFS_DOWNLOADS_DIR, downloadId);
   const messages: string[] = [];
   const outputs: string[] = [];
@@ -181,7 +179,8 @@ export async function runBackgroundRepairSweep(logger: { warn: (...args: unknown
       where: {
         status: { in: ["available", "completed"] }
       },
-      select: { id: true, createdAt: true }
+      select: { id: true, createdAt: true },
+      orderBy: { createdAt: "asc" }
     });
     const latestHealthJobs = await prisma.repairJob.findMany({
       where: {
@@ -197,6 +196,7 @@ export async function runBackgroundRepairSweep(logger: { warn: (...args: unknown
     let skipped = 0;
     let checked = 0;
     for (const download of downloads) {
+      if (checked >= BACKGROUND_HEALTHCHECK_MAX_CHECKS_PER_SWEEP) break;
       const latest = latestHealthJobByDownload.get(download.id);
       if (latest?.status === "running") {
         skipped += 1;
@@ -236,13 +236,6 @@ export function stopBackgroundRepairSchedule() {
   if (repairTimer) clearInterval(repairTimer);
   initialRepairTimer = undefined;
   repairTimer = undefined;
-}
-
-export async function runCompletedHealthcheck() {
-  const downloads = await prisma.download.findMany({ where: { status: { in: ["completed", "queued"] } } });
-  const jobs = [];
-  for (const download of downloads) jobs.push(await runRepair(download.id));
-  return { checked: jobs.length, jobs };
 }
 
 export async function blocklistFailedRelease(input: { title: string; guid?: string; reason: string; downloadId?: string }) {

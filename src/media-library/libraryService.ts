@@ -285,8 +285,8 @@ async function runLibraryRefreshCycle() {
   });
 
   const importItems = await mapWithConcurrency(imports, 12, async (item) => {
-    const request = item.requestId ? requestsById.get(item.requestId) ?? null : null;
     const resolved = await resolveImportMedia(item).catch(() => null);
+    const request = item.requestId ? requestsById.get(item.requestId) ?? null : null;
     const link = item.symlinks[0];
     const strategy = importStrategy(link?.status);
     const sourceKey = `import:${item.id}`;

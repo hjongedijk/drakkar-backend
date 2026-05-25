@@ -372,9 +372,16 @@ export function startDownloadWorkers(logger: FastifyBaseLogger) {
   return workers;
 }
 
-async function existingQueueJobForDownload(downloadId: string) {
+async function existingQueueJobForDownload(download: { id: string; jobId?: string | null }) {
+  if (download.jobId) {
+    const ownedJob = await nzbDownloadQueue.getJob(String(download.jobId)).catch(() => null);
+    if (ownedJob?.data?.downloadId === download.id) {
+      const state = await ownedJob.getState().catch(() => "unknown");
+      if (["active", "waiting", "delayed", "prioritized", "waiting-children"].includes(state)) return ownedJob;
+    }
+  }
   const jobs = await nzbDownloadQueue.getJobs(["active", "waiting", "delayed", "prioritized"], 0, 200, true);
-  return jobs.find((job) => job.data?.downloadId === downloadId) ?? null;
+  return jobs.find((job) => job.data?.downloadId === download.id) ?? null;
 }
 
 export async function reconcileDownloadQueueState(logger: FastifyBaseLogger) {
@@ -540,7 +547,7 @@ export async function reconcileAvailableDownloadsWithoutImports(logger: FastifyB
         continue;
       }
 
-      const existingJob = await existingQueueJobForDownload(download.id);
+      const existingJob = await existingQueueJobForDownload(download);
       const job = existingJob ?? await queueDownloadJob(
         download,
         "startup-materialized-recovery",
@@ -588,32 +595,32 @@ export async function reconcileAvailableDownloadsWithoutImports(logger: FastifyB
 export async function recoverInterruptedDownloads(logger: FastifyBaseLogger) {
   const interrupted = await prisma.download.findMany({
     where: {
-      status: { in: ["fetching_nzb", "verifying", "downloading"] }
+      status: { in: ["queued", "fetching_nzb", "verifying", "downloading", "waiting_for_provider", "waiting_for_nzb"] }
     },
     include: { nzbDocument: true }
   });
 
+  let recovered = 0;
+  let alreadyQueued = 0;
+  let withinGracePeriod = 0;
   for (const download of interrupted) {
-    const existingJob = await existingQueueJobForDownload(download.id);
+    const existingJob = await existingQueueJobForDownload(download);
     if (existingJob) {
-      await prisma.download.update({
-        where: { id: download.id },
-        data: {
-          status: "queued",
-          jobId: String(existingJob.id),
-          error: null,
-          speedBytesSec: 0,
-          etaSeconds: null
-        }
-      });
-      logger.warn({ downloadId: download.id, jobId: existingJob.id }, "interrupted download already had a queue job; duplicate recovery skipped");
+      if (String(download.jobId ?? "") !== String(existingJob.id)) {
+        await prisma.download.update({ where: { id: download.id }, data: { jobId: String(existingJob.id) } });
+      }
+      alreadyQueued += 1;
+      continue;
+    }
+    if (Date.now() - download.createdAt.getTime() < ORPHANED_QUEUE_GRACE_MS) {
+      withinGracePeriod += 1;
       continue;
     }
     const linkedRequest = await prisma.mediaRequest.findFirst({
       where: { downloadId: download.id },
       select: { id: true }
     });
-    const job = await nzbDownloadQueue.add("startup-recovery", {
+    const job = await queueDownloadJob(download, "missing-job-recovery", {
       downloadId: download.id,
       nzbDocumentId: download.nzbDocumentId ?? undefined,
       title: download.title,
@@ -629,10 +636,11 @@ export async function recoverInterruptedDownloads(logger: FastifyBaseLogger) {
         etaSeconds: null
       }
     });
-    logger.warn({ downloadId: download.id, jobId: job.id }, "interrupted download recovered and requeued");
+    recovered += 1;
+    logger.warn({ downloadId: download.id, jobId: job.id }, "download with missing worker job recovered and requeued");
   }
 
-  return interrupted.length;
+  return { scanned: interrupted.length, recovered, alreadyQueued, withinGracePeriod };
 }
 
 export async function stopDownloadWorkers() {

@@ -2,6 +2,7 @@ import { env } from "../config/env.js";
 import { registerTask } from "./taskRegistry.js";
 
 export const REQUEST_SYNC_TASK_ID = "request-sync";
+export const REQUEST_RECOVERY_TASK_ID = "request-download-recovery";
 export const NZBHYDRA_RSS_SYNC_TASK_ID = "nzbhydra-rss-sync";
 export const BACKGROUND_REPAIR_TASK_ID = "background-repair";
 export const QUEUE_RECONCILE_TASK_ID = "download-queue-reconcile";
@@ -20,8 +21,16 @@ export function registerCoreTasks() {
   registerTask({
     id: REQUEST_SYNC_TASK_ID,
     name: "Request Sync",
-    description: "Periodic bulk Seerr sync for large libraries. Single approved requests should arrive immediately through the Seerr webhook; this task handles wider reconciliation, recovery, and queue seeding.",
+    description: "Periodic bulk Seerr sync for large libraries. Single approved requests should arrive immediately through the Seerr webhook; this task handles wider request reconciliation.",
     intervalMs: REQUEST_SYNC_INTERVAL_MS,
+    enabled: env.REQUEST_SYNC_ENABLED,
+    manualRunnable: true
+  });
+  registerTask({
+    id: REQUEST_RECOVERY_TASK_ID,
+    name: "Request Download Recovery",
+    description: "Seed monitored missing requests into the queue and retry selected or failed request downloads in bounded batches.",
+    intervalMs: null,
     enabled: env.REQUEST_SYNC_ENABLED,
     manualRunnable: true
   });
@@ -44,10 +53,10 @@ export function registerCoreTasks() {
   registerTask({
     id: QUEUE_RECONCILE_TASK_ID,
     name: "Download Queue Reconcile",
-    description: "Rebuild active BullMQ download jobs from database state so stuck or hidden queue items are recovered.",
+    description: "Startup-only rebuild of BullMQ download jobs from database state before workers process queue items.",
     intervalMs: null,
     enabled: env.STARTUP_RECOVERY_ENABLED,
-    manualRunnable: true
+    manualRunnable: false
   });
   registerTask({
     id: IMPORT_RECONCILE_TASK_ID,
@@ -59,9 +68,9 @@ export function registerCoreTasks() {
   });
   registerTask({
     id: INTERRUPTED_RECOVERY_TASK_ID,
-    name: "Interrupted Download Recovery",
-    description: "Requeue downloads interrupted while fetching, verifying, or downloading.",
-    intervalMs: null,
+    name: "Missing Worker Job Recovery",
+    description: "Safely requeue active or queued downloads only when their recorded BullMQ worker job no longer exists.",
+    intervalMs: REQUEST_SYNC_INTERVAL_MS,
     enabled: env.STARTUP_RECOVERY_ENABLED,
     manualRunnable: true
   });

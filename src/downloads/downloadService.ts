@@ -486,25 +486,9 @@ async function buildQueue() {
         if (liveJob.state === "active" && download.status !== "paused") nextStatus = "downloading";
         if ((liveJob.state === "waiting" || liveJob.state === "delayed" || liveJob.state === "prioritized") && download.status !== "paused") nextStatus = "queued";
       } else if (download.status === "queued" || download.status === "downloading" || download.status === "fetching_nzb" || download.status === "verifying" || download.status === "waiting_for_provider" || download.status === "waiting_for_nzb") {
-        nextStatus = "queued";
-        nextJobId = null;
-        nextError = "Queue entry has no active worker job yet";
-        if (download.nzbDocumentId) {
-          const linkedRequest = await prisma.mediaRequest.findFirst({
-            where: { downloadId: download.id },
-            select: { id: true }
-          }).catch(() => null);
-          const job = await queueDownloadJob(download, "queue-view-recovery", {
-            downloadId: download.id,
-            nzbDocumentId: download.nzbDocumentId,
-            title: download.title,
-            requestId: linkedRequest?.id
-          }).catch(() => null);
-          if (job) {
-            nextJobId = String(job.id);
-            nextError = "Recovered queued download with missing worker job";
-            jobStateByDownloadId.set(download.id, { id: String(job.id), state: "waiting" });
-          }
+        if (!download.jobId) {
+          nextStatus = "queued";
+          nextError = "Queue entry has no active worker job yet; background recovery will retry it.";
         }
       }
 

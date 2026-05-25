@@ -487,9 +487,12 @@ function openApiDocument() {
       "/api/tasks/{id}/run": {
         post: {
           tags: ["Tasks"],
-          summary: "Run a manual task now",
+          summary: "Queue a manual task for background execution",
           parameters: [{ name: "id", in: "path", required: true, schema: { type: "string" } }],
-          responses: { "200": { description: "Task result" } }
+          responses: {
+            "200": { description: "Task was already running" },
+            "202": { description: "Task accepted for background execution" }
+          }
         }
       },
       "/api/release-calendar": {
