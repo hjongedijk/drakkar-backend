@@ -68,13 +68,10 @@ export async function healthRoutes(app: FastifyInstance): Promise<void> {
   });
 
   app.get("/api/health/checks", async () => {
-    const historyWindowStart = new Date(Date.now() - 30 * 24 * 60 * 60 * 1000);
     const [imports, repairJobs] = await Promise.all([
       prisma.importItem.findMany({
         include: {
-          symlinks: { orderBy: { updatedAt: "desc" } },
-          request: true,
-          download: true
+          symlinks: { orderBy: { updatedAt: "desc" }, take: 1 }
         },
         orderBy: { createdAt: "desc" }
       }),
@@ -111,16 +108,22 @@ export async function healthRoutes(app: FastifyInstance): Promise<void> {
       return aDue - bDue || Date.parse(a.createdAt.toISOString()) - Date.parse(b.createdAt.toISOString());
     });
 
+    const checkedItems = scheduleItems.filter((item) => item.lastCheckAt);
+    const totalChecked = checkedItems.length;
+    const healthyCount = checkedItems.filter((item) => item.health === "healthy").length;
+    const repairedCount = checkedItems.filter((item) => item.health === "repaired").length;
+    const deletedCount = checkedItems.filter((item) => item.health === "deleted").length;
+    const uncheckedCount = scheduleItems.length - totalChecked;
     const recentResults = repairJobs
       .filter((job) => isCompletedHealthJob(job))
-      .filter((job) => (job.completedAt ?? job.updatedAt) >= historyWindowStart)
-      .map((job) => classifyRepairOutcome(job))
-      .filter((outcome) => outcome !== "unknown");
-    const totalChecked = recentResults.length;
-    const healthyCount = recentResults.filter((item) => item === "healthy").length;
-    const repairedCount = recentResults.filter((item) => item === "repaired").length;
-    const deletedCount = recentResults.filter((item) => item === "deleted").length;
-    const uncheckedCount = scheduleItems.filter((item) => !item.lastCheckAt).length;
+      .slice(0, 25)
+      .map((job) => ({
+        id: job.id,
+        downloadId: job.downloadId,
+        completedAt: (job.completedAt ?? job.updatedAt).toISOString(),
+        outcome: classifyRepairOutcome(job),
+        message: job.message ?? ""
+      }));
 
     return {
       overview: {
@@ -130,7 +133,8 @@ export async function healthRoutes(app: FastifyInstance): Promise<void> {
         deleted: deletedCount
       },
       uncheckedCount,
-      schedule: scheduleItems.slice(0, 50)
+      schedule: scheduleItems.slice(0, 100),
+      recentResults
     };
   });
 }

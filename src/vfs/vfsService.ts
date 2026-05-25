@@ -1,6 +1,6 @@
 import { createReadStream } from "node:fs";
-import { open, readdir, stat, lstat, readlink } from "node:fs/promises";
-import { extname, join, normalize, relative } from "node:path";
+import { mkdir, open, readdir, stat, lstat, readlink, rename, rm, writeFile, readFile } from "node:fs/promises";
+import { dirname, extname, join, normalize, relative } from "node:path";
 import { env } from "../config/env.js";
 import { redis } from "../db/redis.js";
 import { getIgnoredPatterns, matchesIgnoredPattern } from "../policies/policyService.js";
@@ -252,7 +252,21 @@ export async function readVfsBytes(path: string, start: number, length: number, 
   const normalizedPath = normalize(`/${path}`).replace(/\/+$/, "") || "/";
   if (length <= 0) return Buffer.alloc(0);
   if (normalizedPath === "/mounted/releases" || normalizedPath.startsWith("/mounted/releases/") || isMountedPath(normalizedPath)) {
-    return readMountedFileRange({ path: normalizedPath, start, length, sessionId, source: "fuse" });
+    const chunks: Buffer[] = [];
+    let total = 0;
+    while (total < length) {
+      const chunk = await readMountedFileRange({
+        path: normalizedPath,
+        start: start + total,
+        length: length - total,
+        sessionId,
+        source: "fuse"
+      });
+      if (!chunk.length) break;
+      chunks.push(chunk);
+      total += chunk.length;
+    }
+    return chunks.length === 1 ? chunks[0]! : Buffer.concat(chunks, total);
   }
 
   const virtual = resolveVirtualPhysicalPath(normalizedPath);
@@ -260,7 +274,23 @@ export async function readVfsBytes(path: string, start: number, length: number, 
   const linkStats = await lstat(resolved);
   if (linkStats.isSymbolicLink()) {
     const mountedTarget = await mountedTargetForSymlink(resolved);
-    if (mountedTarget) return readMountedFileRange({ path: mountedTarget, start, length, sessionId, source: "fuse" });
+    if (mountedTarget) {
+      const chunks: Buffer[] = [];
+      let total = 0;
+      while (total < length) {
+        const chunk = await readMountedFileRange({
+          path: mountedTarget,
+          start: start + total,
+          length: length - total,
+          sessionId,
+          source: "fuse"
+        });
+        if (!chunk.length) break;
+        chunks.push(chunk);
+        total += chunk.length;
+      }
+      return chunks.length === 1 ? chunks[0]! : Buffer.concat(chunks, total);
+    }
   }
   const handle = await open(resolved, "r");
   try {
@@ -276,5 +306,76 @@ export async function refreshVfs() {
   const keys = await redis.keys("vfs:list:*");
   if (keys.length > 0) await redis.del(...keys);
   await redis.set("vfs:last-refresh", new Date().toISOString());
+  return { ok: true };
+}
+
+function assertEditableVfsPath(path: string) {
+  const normalizedPath = normalize(`/${path}`).replace(/\/+$/, "") || "/";
+  if (normalizedPath.startsWith("/mounted")) throw new Error("Mounted release paths are read-only.");
+  if (isMountedPath(normalizedPath)) throw new Error("Mounted release paths are read-only.");
+  return normalizedPath;
+}
+
+export async function createVfsFolder(path: string) {
+  const normalizedPath = assertEditableVfsPath(path);
+  const virtual = resolveVirtualPhysicalPath(normalizedPath);
+  const resolved = virtual?.resolved ?? resolveVfsPath(normalizedPath);
+  await mkdir(resolved, { recursive: true });
+  await refreshVfs();
+  return statVfs(normalizedPath);
+}
+
+export async function createVfsFile(path: string, content = "") {
+  const normalizedPath = assertEditableVfsPath(path);
+  const virtual = resolveVirtualPhysicalPath(normalizedPath);
+  const resolved = virtual?.resolved ?? resolveVfsPath(normalizedPath);
+  await mkdir(dirname(resolved), { recursive: true });
+  await writeFile(resolved, content, "utf8");
+  await refreshVfs();
+  return statVfs(normalizedPath);
+}
+
+export async function readVfsTextFile(path: string) {
+  const normalizedPath = assertEditableVfsPath(path);
+  const stats = await statVfs(normalizedPath);
+  if (stats.isDirectory) throw new Error("Cannot edit a directory.");
+  const virtual = resolveVirtualPhysicalPath(normalizedPath);
+  const resolved = virtual?.resolved ?? resolveVfsPath(normalizedPath);
+  return {
+    path: normalizedPath,
+    content: await readFile(resolved, "utf8")
+  };
+}
+
+export async function updateVfsFile(path: string, content: string) {
+  const normalizedPath = assertEditableVfsPath(path);
+  const stats = await statVfs(normalizedPath);
+  if (stats.isDirectory) throw new Error("Cannot edit a directory.");
+  const virtual = resolveVirtualPhysicalPath(normalizedPath);
+  const resolved = virtual?.resolved ?? resolveVfsPath(normalizedPath);
+  await writeFile(resolved, content, "utf8");
+  await refreshVfs();
+  return statVfs(normalizedPath);
+}
+
+export async function renameVfsPath(path: string, nextPath: string) {
+  const normalizedPath = assertEditableVfsPath(path);
+  const normalizedNextPath = assertEditableVfsPath(nextPath);
+  const sourceVirtual = resolveVirtualPhysicalPath(normalizedPath);
+  const targetVirtual = resolveVirtualPhysicalPath(normalizedNextPath);
+  const sourceResolved = sourceVirtual?.resolved ?? resolveVfsPath(normalizedPath);
+  const targetResolved = targetVirtual?.resolved ?? resolveVfsPath(normalizedNextPath);
+  await mkdir(dirname(targetResolved), { recursive: true });
+  await rename(sourceResolved, targetResolved);
+  await refreshVfs();
+  return statVfs(normalizedNextPath);
+}
+
+export async function deleteVfsPath(path: string) {
+  const normalizedPath = assertEditableVfsPath(path);
+  const virtual = resolveVirtualPhysicalPath(normalizedPath);
+  const resolved = virtual?.resolved ?? resolveVfsPath(normalizedPath);
+  await rm(resolved, { recursive: true, force: true });
+  await refreshVfs();
   return { ok: true };
 }

@@ -46,7 +46,26 @@ export async function bootstrapRuntimeConfiguredServices(log: Logger) {
     ...(hasConfiguredValue(runtime.metadata.tmdbApiKey) ? { tmdbApiKey: runtime.metadata.tmdbApiKey } : {}),
     ...(hasConfiguredValue(runtime.metadata.tvdbApiKey) ? { tvdbApiKey: runtime.metadata.tvdbApiKey } : {}),
     metadataLanguage: runtime.metadata.language || current.metadataLanguage,
-    metadataCacheTtlHours: runtime.metadata.cacheTtlHours || current.metadataCacheTtlHours
+    metadataCacheTtlHours: runtime.metadata.cacheTtlHours || current.metadataCacheTtlHours,
+    subtitlesEnabled: runtime.subtitles.enabled,
+    subtitleProviderOrder: runtime.subtitles.providerOrder?.length ? runtime.subtitles.providerOrder : current.subtitleProviderOrder,
+    subtitleProviders: {
+      subdl: {
+        enabled: runtime.subtitles.providers?.subdl?.enabled ?? current.subtitleProviders.subdl.enabled,
+        apiKey: runtime.subtitles.providers?.subdl?.apiKey || current.subtitleProviders.subdl.apiKey
+      },
+      opensubtitlescom: {
+        enabled: runtime.subtitles.providers?.opensubtitlescom?.enabled ?? current.subtitleProviders.opensubtitlescom.enabled,
+        apiKey: runtime.subtitles.providers?.opensubtitlescom?.apiKey || current.subtitleProviders.opensubtitlescom.apiKey,
+        username: runtime.subtitles.providers?.opensubtitlescom?.username || current.subtitleProviders.opensubtitlescom.username,
+        password: runtime.subtitles.providers?.opensubtitlescom?.password || current.subtitleProviders.opensubtitlescom.password
+      }
+    },
+    subtitlesProvider: current.subtitlesProvider,
+    subtitlesApiKey: current.subtitlesApiKey,
+    subtitlesUsername: current.subtitlesUsername,
+    subtitlesPassword: current.subtitlesPassword,
+    subtitleLanguages: runtime.subtitles.languages?.length ? runtime.subtitles.languages : current.subtitleLanguages
   };
   await updateSettings(nextSettings);
 

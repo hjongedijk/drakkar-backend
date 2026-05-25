@@ -484,6 +484,26 @@ function findSegmentIndex(segments: MountedFileSegment[], offset: number) {
   return Math.max(0, Math.min(low, segments.length - 1));
 }
 
+function shrinkManifestSegment(
+  segments: MountedFileSegment[],
+  index: number,
+  actualBytes: number
+) {
+  const segment = segments[index];
+  if (!segment) return;
+  const safeActualBytes = Math.max(0, Math.floor(actualBytes));
+  if (!Number.isFinite(safeActualBytes) || safeActualBytes <= 0 || safeActualBytes >= segment.bytes) return;
+  const delta = segment.bytes - safeActualBytes;
+  segment.bytes = safeActualBytes;
+  segment.end = segment.start + safeActualBytes - 1;
+  for (let cursor = index + 1; cursor < segments.length; cursor += 1) {
+    const next = segments[cursor];
+    if (!next) continue;
+    next.start -= delta;
+    next.end -= delta;
+  }
+}
+
 async function getMountedFileManifest(path: string): Promise<MountedFileManifest> {
   const archiveEntry = await getStoredArchiveEntryByPath(path);
   if (archiveEntry) {
@@ -510,7 +530,9 @@ async function getMountedFileManifest(path: string): Promise<MountedFileManifest
   if (!file) throw new Error("mounted NZB file not found");
 
   const segments: MountedFileSegment[] = [];
-  const decoded = await buildDecodedYencSegments(file, await getProviders());
+  // nzbdav seeks by real yEnc part offsets, not by assuming constant part sizes.
+  // Use the exact decoded manifest here so FUSE and playback reads map to the correct decoded bytes.
+  const decoded = await buildDecodedYencSegments(file, await getProviders(), undefined, { mode: "exact" });
   let fallbackCursor = 0;
   const sourceSegments = decoded?.segments ?? file.segments.map((segment) => {
     const bytes = Math.floor(segment.bytes);
@@ -694,6 +716,9 @@ async function readManifestWindow(input: {
       providers: input.providers,
       signal: input.signal
     });
+    if (decoded.length < segment.bytes) {
+      shrinkManifestSegment(input.manifest.segments, segmentIndex, decoded.length);
+    }
     const chunk = decoded.subarray(segmentOffset, segmentOffset + take);
     buffers.push(chunk);
     total += chunk.length;

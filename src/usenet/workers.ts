@@ -2,6 +2,7 @@ import { Worker, type Job } from "bullmq";
 import { rm, stat } from "node:fs/promises";
 import { join } from "node:path";
 import type { FastifyBaseLogger } from "fastify";
+import { Prisma } from "@prisma/client";
 import { redis } from "../db/redis.js";
 import { prisma } from "../db/prisma.js";
 import { importCompletedPath, makeMountedDownloadAvailable, reconcileRequestStatusAfterImport } from "../import/importService.js";
@@ -24,11 +25,28 @@ const ORPHANED_QUEUE_GRACE_MS = 60 * 1000;
 const STREAMING_BACKOFF_RETRY_MS = 5 * 60 * 1000;
 
 function downloadWorkerConcurrency() {
-  return 1;
+  return 2;
 }
 
 function requiresMaterializedImport(message: string) {
   return /no streamable video file|archive file/i.test(message);
+}
+
+function isMissingDownloadRecordError(error: unknown) {
+  return error instanceof Prisma.PrismaClientKnownRequestError && error.code === "P2025";
+}
+
+async function safeUpdateDownload(downloadId: string, data: Parameters<typeof prisma.download.update>[0]["data"]) {
+  try {
+    await prisma.download.update({
+      where: { id: downloadId },
+      data
+    });
+    return true;
+  } catch (error) {
+    if (isMissingDownloadRecordError(error)) return false;
+    throw error;
+  }
 }
 
 async function handleQueueDecisionFailure(input: {
@@ -44,14 +62,11 @@ async function handleQueueDecisionFailure(input: {
   const action = getQueueDecisionAction(policies, decisionKey);
   const terminalStatus = action === "remove" ? "cancelled" : "failed";
 
-  await prisma.download.update({
-    where: { id: input.downloadId },
-    data: {
-      status: terminalStatus,
-      error: input.publicMessage,
-      speedBytesSec: 0,
-      etaSeconds: null
-    }
+  await safeUpdateDownload(input.downloadId, {
+    status: terminalStatus,
+    error: input.publicMessage,
+    speedBytesSec: 0,
+    etaSeconds: null
   });
   await prisma.failedRelease.create({
     data: {
@@ -81,9 +96,8 @@ async function handleQueueDecisionFailure(input: {
   void recoverFailedDownloadForRequest(recoveryInput)
     .then(async (recovery) => {
       if (!recovery.recovered) return;
-      await prisma.download.update({
-        where: { id: input.downloadId },
-        data: { error: `${input.publicMessage} Replacement search queued automatically.` }
+      await safeUpdateDownload(input.downloadId, {
+        error: `${input.publicMessage} Replacement search queued automatically.`
       }).catch(() => undefined);
     })
     .catch(() => undefined);

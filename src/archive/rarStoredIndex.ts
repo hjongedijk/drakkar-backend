@@ -362,10 +362,15 @@ export async function listStoredArchiveEntries(documentId: string): Promise<Arch
   const hasStoredVideo = firstHeaders.some((header) => header.method === 0x30 && isVideoName(header.name));
   if (!hasStoredVideo) {
     const methodSummary = [...new Set(firstHeaders.map((header) => `0x${header.method.toString(16)}`))];
+    const videoHeaderCount = firstHeaders.filter((header) => isVideoName(header.name)).length;
     if (firstHeaders.length > 0) {
-      console.info(oneLineLog(`[archive] ${document.title} has RAR video entries but not stored/no-compression; methods=${methodSummary.join(",") || "none"}`));
+      console.info(
+        oneLineLog(
+          `[archive] ${document.title} has no direct-streamable stored video entries in scanned RAR headers; videoHeaders=${videoHeaderCount}; methods=${methodSummary.join(",") || "none"}`
+        )
+      );
     } else {
-      console.info(oneLineLog(`[archive] ${document.title} has no readable stored RAR video headers`));
+      console.info(oneLineLog(`[archive] ${document.title} has no readable RAR headers for direct-stream scan`));
     }
     await persistArchiveEntries(documentId, []);
     archiveIndexCache.set(documentId, { value: [], expiresAt: Date.now() + ARCHIVE_INDEX_TTL_MS });

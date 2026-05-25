@@ -135,9 +135,15 @@ function fuseOperations(): OPERATIONS {
           const handlePath = fileHandles.get(fd) ?? path;
           const policies = await getPolicySettings();
           const maxReadLength = Math.max(512 * 1024, Math.min(policies.streamChunkSizeBytes, 4 * 1024 * 1024));
-          const data = await readVfsBytes(handlePath, position, Math.min(length, maxReadLength), String(fd));
-          data.copy(buffer, 0, 0, data.length);
-          return data.length;
+          const targetLength = Math.min(length, maxReadLength);
+          let total = 0;
+          while (total < targetLength) {
+            const data = await readVfsBytes(handlePath, position + total, targetLength - total, String(fd));
+            if (!data.length) break;
+            data.copy(buffer, total, 0, data.length);
+            total += data.length;
+          }
+          return total;
         },
         (bytesRead) => callback(bytesRead),
         (code) => callback(code)

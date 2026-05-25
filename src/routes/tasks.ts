@@ -10,6 +10,7 @@ import {
   QUEUE_RECONCILE_TASK_ID,
   REQUEST_RECOVERY_TASK_ID,
   REQUEST_SYNC_TASK_ID,
+  SUBTITLE_BACKFILL_TASK_ID,
   registerCoreTasks
 } from "../tasks/coreTasks.js";
 import { getTask, listTasks, runTrackedTask } from "../tasks/taskRegistry.js";
@@ -19,9 +20,11 @@ import { runDeferredRequestRecovery, runImportReconcileCycle, runInterruptedReco
 import { refreshMediaLibrary } from "../media-library/libraryService.js";
 import { cleanupSymlinks, pruneLibraryDirectories, removeStaleLibraryFilesystemEntries } from "../symlinks/symlinkService.js";
 import { normalizeNzbStoragePaths } from "../downloads/downloadService.js";
+import { runSubtitleBackfill } from "../subtitles/subtitleService.js";
 import {
   reconcileDownloadQueueState,
 } from "../usenet/workers.js";
+import { getSettings } from "../settings/settingsStore.js";
 
 function taskId(request: { params: unknown }) {
   return (request.params as { id: string }).id;
@@ -37,7 +40,8 @@ const supportedManualTasks = new Set([
   INTERRUPTED_RECOVERY_TASK_ID,
   NAMING_MIGRATION_TASK_ID,
   LIBRARY_CLEANUP_TASK_ID,
-  LOG_PRUNE_TASK_ID
+  LOG_PRUNE_TASK_ID,
+  SUBTITLE_BACKFILL_TASK_ID
 ]);
 const exclusiveLibraryMaintenanceTasks = new Set([IMPORT_RECONCILE_TASK_ID, NAMING_MIGRATION_TASK_ID, LIBRARY_CLEANUP_TASK_ID]);
 
@@ -75,15 +79,20 @@ async function executeManualTask(id: string, app: FastifyInstance) {
       });
     case LOG_PRUNE_TASK_ID:
       return runLogPruneCycle(app.log);
+    case SUBTITLE_BACKFILL_TASK_ID:
+      return runSubtitleBackfill(app.log);
     default:
       throw new Error("Task runner not implemented.");
   }
 }
 
 export async function taskRoutes(app: FastifyInstance): Promise<void> {
-  registerCoreTasks();
+  registerCoreTasks(await getSettings().catch(() => undefined));
 
-  app.get("/api/tasks", async () => ({ tasks: listTasks() }));
+  app.get("/api/tasks", async () => {
+    registerCoreTasks(await getSettings().catch(() => undefined));
+    return { tasks: listTasks() };
+  });
 
   app.post("/api/tasks/:id/run", async (request, reply) => {
     const id = taskId(request);

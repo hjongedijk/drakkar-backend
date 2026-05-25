@@ -147,3 +147,114 @@ export async function revokeUserApiKey(userId: string, apiKeyId: string) {
   });
   return { ok: true };
 }
+
+export async function listUsers() {
+  const users = await prisma.user.findMany({
+    orderBy: [{ isAdmin: "desc" }, { createdAt: "asc" }],
+    select: {
+      id: true,
+      email: true,
+      displayName: true,
+      isAdmin: true,
+      mustChangePassword: true,
+      createdAt: true,
+      updatedAt: true
+    }
+  });
+  return users.map((user) => ({
+    ...toAuthUser(user),
+    createdAt: user.createdAt.toISOString(),
+    updatedAt: user.updatedAt.toISOString(),
+    group: user.isAdmin ? "Admin" : "Standard"
+  }));
+}
+
+export async function createUser(input: {
+  username: string;
+  displayName?: string;
+  password: string;
+  isAdmin?: boolean;
+  mustChangePassword?: boolean;
+}) {
+  const username = input.username.trim();
+  if (!username) throw new Error("username is required");
+  if (input.password.length < 8) throw new Error("password must be at least 8 characters");
+  const user = await prisma.user.create({
+    data: {
+      email: username,
+      displayName: input.displayName?.trim() || username,
+      passwordHash: hashPassword(input.password),
+      isAdmin: Boolean(input.isAdmin),
+      mustChangePassword: Boolean(input.mustChangePassword)
+    },
+    select: {
+      id: true,
+      email: true,
+      displayName: true,
+      isAdmin: true,
+      mustChangePassword: true,
+      createdAt: true,
+      updatedAt: true
+    }
+  });
+  return {
+    ...toAuthUser(user),
+    createdAt: user.createdAt.toISOString(),
+    updatedAt: user.updatedAt.toISOString(),
+    group: user.isAdmin ? "Admin" : "Standard"
+  };
+}
+
+export async function updateUserByAdmin(userId: string, input: {
+  username?: string;
+  displayName?: string;
+  isAdmin?: boolean;
+  mustChangePassword?: boolean;
+}) {
+  const user = await prisma.user.update({
+    where: { id: userId },
+    data: {
+      ...(input.username ? { email: input.username.trim() } : {}),
+      ...(input.displayName !== undefined ? { displayName: input.displayName.trim() || undefined } : {}),
+      ...(input.isAdmin !== undefined ? { isAdmin: input.isAdmin } : {}),
+      ...(input.mustChangePassword !== undefined ? { mustChangePassword: input.mustChangePassword } : {})
+    },
+    select: {
+      id: true,
+      email: true,
+      displayName: true,
+      isAdmin: true,
+      mustChangePassword: true,
+      createdAt: true,
+      updatedAt: true
+    }
+  });
+  return {
+    ...toAuthUser(user),
+    createdAt: user.createdAt.toISOString(),
+    updatedAt: user.updatedAt.toISOString(),
+    group: user.isAdmin ? "Admin" : "Standard"
+  };
+}
+
+export async function resetUserPasswordByAdmin(userId: string, newPassword: string) {
+  if (newPassword.length < 8) throw new Error("new password must be at least 8 characters");
+  await prisma.user.update({
+    where: { id: userId },
+    data: {
+      passwordHash: hashPassword(newPassword),
+      mustChangePassword: true
+    }
+  });
+  return { ok: true };
+}
+
+export async function deleteUserByAdmin(currentUserId: string, userId: string) {
+  if (currentUserId === userId) throw new Error("cannot delete the current user");
+  await prisma.apiKey.updateMany({
+    where: { userId, revokedAt: null },
+    data: { revokedAt: new Date() }
+  });
+  await prisma.user.delete({ where: { id: userId } });
+  return { ok: true };
+}

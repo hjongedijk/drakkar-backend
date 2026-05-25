@@ -55,6 +55,23 @@ const runtimeSettingsSchema = z.object({
     language: z.string().default("en-US"),
     cacheTtlHours: z.number().int().positive().default(168)
   }).default({}),
+  subtitles: z.object({
+    enabled: z.boolean().default(false),
+    providerOrder: z.array(z.enum(["subdl", "opensubtitlescom"])).default(["subdl", "opensubtitlescom"]),
+    providers: z.object({
+      subdl: z.object({
+        enabled: z.boolean().default(false),
+        apiKey: z.string().default("")
+      }).default({}),
+      opensubtitlescom: z.object({
+        enabled: z.boolean().default(false),
+        apiKey: z.string().default(""),
+        username: z.string().default(""),
+        password: z.string().default("")
+      }).default({})
+    }).default({}),
+    languages: z.array(z.string()).default(["EN"])
+  }).default({}),
   usenetProviders: z.array(z.object({
     enabled: z.boolean().default(false),
     name: z.string().default(""),
@@ -134,6 +151,23 @@ function defaultRuntimeSettings(): RuntimeSettings {
       tvdbApiKey: "",
       language: "en-US",
       cacheTtlHours: 168
+    },
+    subtitles: {
+      enabled: false,
+      providerOrder: ["subdl", "opensubtitlescom"],
+      providers: {
+        subdl: {
+          enabled: false,
+          apiKey: ""
+        },
+        opensubtitlescom: {
+          enabled: false,
+          apiKey: "",
+          username: "",
+          password: ""
+        }
+      },
+      languages: ["EN"]
     },
     usenetProviders: [
       {

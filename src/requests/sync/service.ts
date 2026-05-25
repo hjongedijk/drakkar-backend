@@ -21,19 +21,19 @@ const TV_ACTIVE_DOWNLOAD_STATUSES = ["queued", "fetching_nzb", "verifying", "pre
 const SEARCH_COOLDOWN_SECONDS = 300;
 const REQUEST_RELEASE_CACHE_SECONDS = 6 * 60 * 60;
 const MONITOR_QUEUE_SEED_STATUSES = ["queued", "fetching_nzb", "verifying", "waiting_for_provider", "waiting_for_nzb", "downloading", "paused"];
-const TV_SEASONS_PER_MONITOR_PASS = 8;
-const TV_EPISODE_DOWNLOADS_PER_REQUEST_PASS = 4;
+const TV_SEASONS_PER_MONITOR_PASS = 16;
+const TV_EPISODE_DOWNLOADS_PER_REQUEST_PASS = 6;
 const MOVIE_NZB_FETCH_ATTEMPTS_PER_PASS = 1;
-const TV_NZB_FETCH_ATTEMPTS_PER_SEASON_PASS = 1;
+const TV_NZB_FETCH_ATTEMPTS_PER_SEASON_PASS = 2;
 const REQUEST_GRAB_COOLDOWN_SECONDS = 30 * 60;
 const REQUEST_WANTED_SEARCH_COOLDOWN_SECONDS = 6 * 60 * 60;
 const MONITORED_REQUESTS_MAX_DURATION_MS = 60_000;
-const REQUEST_RECOVERY_MAX_DURATION_MS = 20_000;
+const REQUEST_RECOVERY_MAX_DURATION_MS = 45_000;
 const REQUEST_SYNC_MAX_DURATION_MS = 35_000;
 const REQUEST_SYNC_PROVIDER_MAX_REQUESTS = 200;
-const FAILED_REQUEST_RECOVERY_MAX_PER_CYCLE = 2;
-const SELECTED_RELEASE_RECOVERY_MAX_PER_CYCLE = 2;
-const ACTIVE_WANTED_SEARCHES_PER_CYCLE = 2;
+const FAILED_REQUEST_RECOVERY_MAX_PER_CYCLE = 8;
+const SELECTED_RELEASE_RECOVERY_MAX_PER_CYCLE = 8;
+const ACTIVE_WANTED_SEARCHES_PER_CYCLE = 8;
 const SEERR_WEBHOOK_PRIORITY = 900;
 
 function blockReasonFromFailure(message?: string | null) {
@@ -790,6 +790,34 @@ async function tvRequestAvailabilitySummary(request: MediaRequest) {
   return { hasMissingEpisodes, hasAvailableEpisodes };
 }
 
+async function summarizeTvRequestCounts(request: MediaRequest) {
+  const monitor = await getRequestMonitor(request.id).catch(() => null);
+  if (monitor?.seasons?.length) {
+    return monitor.seasons.reduce(
+      (summary, season) => ({
+        availableCount: summary.availableCount + season.availableCount,
+        missingCount: summary.missingCount + season.missingCount,
+        downloadingCount: summary.downloadingCount + season.downloadingCount
+      }),
+      { availableCount: 0, missingCount: 0, downloadingCount: 0 }
+    );
+  }
+
+  const availableCount = await prisma.importItem.count({ where: { requestId: request.id, mediaType: "tv" } });
+  const downloadingCount = await prisma.mediaLibraryItem.count({
+    where: {
+      requestId: request.id,
+      mediaType: "tv",
+      libraryStatus: { in: ["requested", "searching", "grabbed"] }
+    }
+  });
+  return {
+    availableCount,
+    missingCount: availableCount > 0 ? 0 : 1,
+    downloadingCount
+  };
+}
+
 function statusFromExternal(externalStatus?: string | null, mediaType?: string) {
   if (externalStatus === "2") return "approved";
   if (externalStatus === "3") return "rejected";
@@ -990,9 +1018,20 @@ export async function listRequests() {
     ? await prisma.download.findMany({ where: { id: { in: downloadIds } }, select: { id: true, status: true } })
     : [];
   const byId = new Map(downloads.map((download) => [download.id, download]));
+  const monitorSummaries = new Map<string, { availableCount: number; missingCount: number; downloadingCount: number }>();
+  await Promise.all(requests
+    .filter((request) => request.mediaType === "tv")
+    .map(async (request) => {
+      monitorSummaries.set(request.id, await summarizeTvRequestCounts(request).catch(() => ({
+        availableCount: 0,
+        missingCount: 0,
+        downloadingCount: 0
+      })));
+    }));
   return requests.map((request) => ({
     ...request,
-    download: request.downloadId ? byId.get(request.downloadId) ?? null : null
+    download: request.downloadId ? byId.get(request.downloadId) ?? null : null,
+    monitorSummary: request.mediaType === "tv" ? monitorSummaries.get(request.id) ?? null : null
   }));
 }
 

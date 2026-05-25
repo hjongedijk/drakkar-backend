@@ -1,5 +1,18 @@
 import type { FastifyInstance, FastifyReply, FastifyRequest } from "fastify";
-import { listVfs, readVfsBytes, refreshVfs, statVfs, streamVfsFile, treeVfs } from "../vfs/vfsService.js";
+import {
+  createVfsFile,
+  createVfsFolder,
+  deleteVfsPath,
+  listVfs,
+  readVfsBytes,
+  readVfsTextFile,
+  refreshVfs,
+  renameVfsPath,
+  statVfs,
+  streamVfsFile,
+  treeVfs,
+  updateVfsFile
+} from "../vfs/vfsService.js";
 import { listMounts } from "../vfs/mountedNzbService.js";
 import { getStreamMetrics, listActiveStreamSessions, stopStreamSession } from "../streaming/mountedStream.service.js";
 import { planMountedFileRange } from "../streaming/rangePlanner.service.js";
@@ -18,6 +31,7 @@ export async function vfsRoutes(app: FastifyInstance): Promise<void> {
   });
 
   app.get("/api/vfs/stat", async (request) => statVfs((request.query as { path?: string }).path));
+  app.get("/api/vfs/text", async (request) => readVfsTextFile((request.query as { path?: string }).path ?? "/"));
   app.get("/api/vfs/mounts", async () => listMounts());
   app.get("/api/vfs/streams", async () => listActiveStreamSessions());
   app.get("/api/vfs/streams/metrics", async () => getStreamMetrics());
@@ -60,6 +74,31 @@ export async function vfsRoutes(app: FastifyInstance): Promise<void> {
     return reply.send(toWebVtt(text));
   });
   app.post("/api/vfs/refresh", async () => refreshVfs());
+  app.post("/api/vfs/folder", async (request) => {
+    const body = request.body as { path?: string };
+    if (!body.path) throw new Error("path is required");
+    return createVfsFolder(body.path);
+  });
+  app.post("/api/vfs/file", async (request) => {
+    const body = request.body as { path?: string; content?: string };
+    if (!body.path) throw new Error("path is required");
+    return createVfsFile(body.path, body.content ?? "");
+  });
+  app.put("/api/vfs/file", async (request) => {
+    const body = request.body as { path?: string; content?: string };
+    if (!body.path) throw new Error("path is required");
+    return updateVfsFile(body.path, body.content ?? "");
+  });
+  app.post("/api/vfs/rename", async (request) => {
+    const body = request.body as { path?: string; nextPath?: string };
+    if (!body.path || !body.nextPath) throw new Error("path and nextPath are required");
+    return renameVfsPath(body.path, body.nextPath);
+  });
+  app.delete("/api/vfs/path", async (request) => {
+    const query = request.query as { path?: string };
+    if (!query.path) throw new Error("path is required");
+    return deleteVfsPath(query.path);
+  });
 }
 
 function toWebVtt(text: string) {

@@ -6,8 +6,9 @@ import { refreshMediaLibrary } from "../../media-library/libraryService.js";
 import { reconcileAvailableDownloadsWithoutImports, recoverInterruptedDownloads } from "../../usenet/workers.js";
 import { pruneLogData } from "../../logs/logPruneService.js";
 import { getSettings } from "../../settings/settingsStore.js";
-import { IMPORT_RECONCILE_TASK_ID, INTERRUPTED_RECOVERY_TASK_ID, LIBRARY_CLEANUP_TASK_ID, LOG_PRUNE_INTERVAL_MS, LOG_PRUNE_TASK_ID, NAMING_MIGRATION_TASK_ID, NZBHYDRA_RSS_SYNC_INTERVAL_MS, NZBHYDRA_RSS_SYNC_TASK_ID, REQUEST_RECOVERY_INTERVAL_MS, REQUEST_RECOVERY_TASK_ID, REQUEST_SYNC_INTERVAL_MS, REQUEST_SYNC_TASK_ID, registerCoreTasks } from "../../tasks/coreTasks.js";
+import { IMPORT_RECONCILE_TASK_ID, INTERRUPTED_RECOVERY_TASK_ID, LIBRARY_CLEANUP_TASK_ID, LOG_PRUNE_INTERVAL_MS, LOG_PRUNE_TASK_ID, NAMING_MIGRATION_TASK_ID, NZBHYDRA_RSS_SYNC_INTERVAL_MS, NZBHYDRA_RSS_SYNC_TASK_ID, REQUEST_RECOVERY_INTERVAL_MS, REQUEST_RECOVERY_TASK_ID, REQUEST_SYNC_INTERVAL_MS, REQUEST_SYNC_TASK_ID, SUBTITLE_BACKFILL_INTERVAL_MS, SUBTITLE_BACKFILL_TASK_ID, registerCoreTasks, resolveTaskIntervalMs } from "../../tasks/coreTasks.js";
 import { getTask, runTrackedTask, setTaskNextRun } from "../../tasks/taskRegistry.js";
+import { runSubtitleBackfill } from "../../subtitles/subtitleService.js";
 import {
   backfillPlaceholderRequestMetadata,
   ensureMonitoredRequests,
@@ -16,19 +17,52 @@ import {
   syncRequests
 } from "./service.js";
 
-let timer: NodeJS.Timeout | undefined;
-let initialTimer: NodeJS.Timeout | undefined;
-let recoveryTimer: NodeJS.Timeout | undefined;
-let recoveryInitialTimer: NodeJS.Timeout | undefined;
-let rssTimer: NodeJS.Timeout | undefined;
-let rssInitialTimer: NodeJS.Timeout | undefined;
-let logPruneTimer: NodeJS.Timeout | undefined;
-let logPruneInitialTimer: NodeJS.Timeout | undefined;
+const scheduleHandles = new Map<string, NodeJS.Timeout>();
 let running = false;
 let rssRunning = false;
 let logPruneRunning = false;
 const FULL_REQUEST_SYNC_BATCH_SIZE = 100;
-const REQUEST_RECOVERY_BATCH_LIMIT = 10;
+const REQUEST_RECOVERY_BATCH_LIMIT = 25;
+
+async function configuredTaskInterval(taskId: string, fallback: number | null) {
+  const settings = await getSettings().catch(() => null);
+  registerCoreTasks(settings ?? undefined);
+  return resolveTaskIntervalMs(taskId, settings) ?? fallback;
+}
+
+async function setDynamicTaskNextRun(taskId: string, fallback: number | null) {
+  const intervalMs = await configuredTaskInterval(taskId, fallback);
+  setTaskNextRun(taskId, intervalMs ? new Date(Date.now() + intervalMs) : null);
+  return intervalMs;
+}
+
+function clearScheduledTask(taskId: string) {
+  const handle = scheduleHandles.get(taskId);
+  if (handle) clearTimeout(handle);
+  scheduleHandles.delete(taskId);
+}
+
+function scheduleDynamicTask(input: {
+  taskId: string;
+  initialDelayMs: number;
+  fallbackIntervalMs: number | null;
+  runner: () => Promise<void>;
+}) {
+  clearScheduledTask(input.taskId);
+  const enqueue = (delayMs: number) => {
+    const handle = setTimeout(async () => {
+      try {
+        await input.runner();
+      } finally {
+        const nextInterval = await setDynamicTaskNextRun(input.taskId, input.fallbackIntervalMs);
+        if (nextInterval) enqueue(nextInterval);
+      }
+    }, delayMs);
+    scheduleHandles.set(input.taskId, handle);
+  };
+  setTaskNextRun(input.taskId, new Date(Date.now() + input.initialDelayMs));
+  enqueue(input.initialDelayMs);
+}
 
 function isLibraryMaintenanceRunning(id: string) {
   const task = getTask(id);
@@ -48,7 +82,14 @@ export async function runLogPruneCycle(logger: FastifyBaseLogger) {
     logger.warn({ err: error }, "log prune failed");
   } finally {
     logPruneRunning = false;
-    setTaskNextRun(LOG_PRUNE_TASK_ID, new Date(Date.now() + LOG_PRUNE_INTERVAL_MS));
+  }
+}
+
+export async function runSubtitleBackfillCycle(logger: FastifyBaseLogger) {
+  try {
+    await runSubtitleBackfill(logger);
+  } catch (error) {
+    logger.warn({ err: error }, "subtitle backfill failed");
   }
 }
 
@@ -65,7 +106,6 @@ export async function runNzbhydraRssSyncCycle(logger: FastifyBaseLogger) {
     logger.warn({ err: error }, "nzbhydra rss/update sync failed");
   } finally {
     rssRunning = false;
-    setTaskNextRun(NZBHYDRA_RSS_SYNC_TASK_ID, new Date(Date.now() + NZBHYDRA_RSS_SYNC_INTERVAL_MS));
   }
 }
 
@@ -95,8 +135,6 @@ export async function runDeferredRequestRecovery(logger: FastifyBaseLogger) {
   } catch (error) {
     logger.warn({ err: error }, "deferred request download recovery failed");
     return { started: true, error };
-  } finally {
-    setTaskNextRun(REQUEST_RECOVERY_TASK_ID, new Date(Date.now() + REQUEST_RECOVERY_INTERVAL_MS));
   }
 }
 
@@ -125,8 +163,6 @@ export async function runInterruptedRecoveryCycle(logger: FastifyBaseLogger) {
   } catch (error) {
     logger.warn({ err: error }, "missing worker job recovery failed");
     return undefined;
-  } finally {
-    setTaskNextRun(INTERRUPTED_RECOVERY_TASK_ID, new Date(Date.now() + REQUEST_SYNC_INTERVAL_MS));
   }
 }
 
@@ -206,9 +242,9 @@ export async function runFullRequestSyncRefresh(logger: FastifyBaseLogger, provi
   } catch (error) {
     logger.warn({ err: error }, "full request resync and library refresh failed");
     return { started: true, error };
-  } finally {
+  }
+  finally {
     running = false;
-    setTaskNextRun(REQUEST_SYNC_TASK_ID, new Date(Date.now() + REQUEST_SYNC_INTERVAL_MS));
   }
 }
 
@@ -250,69 +286,54 @@ export async function runRequestSyncCycle(logger: FastifyBaseLogger) {
     logger.warn({ err: error }, "request sync/recovery failed");
   } finally {
     running = false;
-    setTaskNextRun(REQUEST_SYNC_TASK_ID, new Date(Date.now() + REQUEST_SYNC_INTERVAL_MS));
   }
 }
 
 export function startRequestSyncSchedule(logger: FastifyBaseLogger) {
-  registerCoreTasks();
-  if (!timer && !initialTimer) {
-    setTaskNextRun(REQUEST_SYNC_TASK_ID, new Date(Date.now() + 30_000));
-    initialTimer = setTimeout(() => {
-      initialTimer = undefined;
-      void runRequestSyncCycle(logger);
-    }, 30_000);
-    timer = setInterval(() => {
-      void runRequestSyncCycle(logger);
-    }, REQUEST_SYNC_INTERVAL_MS);
+  void getSettings().then((settings) => registerCoreTasks(settings)).catch(() => registerCoreTasks());
+  if (!scheduleHandles.has(REQUEST_SYNC_TASK_ID)) {
+    scheduleDynamicTask({
+      taskId: REQUEST_SYNC_TASK_ID,
+      initialDelayMs: 30_000,
+      fallbackIntervalMs: REQUEST_SYNC_INTERVAL_MS,
+      runner: () => runRequestSyncCycle(logger)
+    });
   }
-  if (!recoveryTimer && !recoveryInitialTimer) {
-    setTaskNextRun(REQUEST_RECOVERY_TASK_ID, new Date(Date.now() + 45_000));
-    recoveryInitialTimer = setTimeout(() => {
-      recoveryInitialTimer = undefined;
-      void runDeferredRequestRecovery(logger);
-    }, 45_000);
-    recoveryTimer = setInterval(() => {
-      void runDeferredRequestRecovery(logger);
-    }, REQUEST_RECOVERY_INTERVAL_MS);
+  if (!scheduleHandles.has(REQUEST_RECOVERY_TASK_ID)) {
+    scheduleDynamicTask({
+      taskId: REQUEST_RECOVERY_TASK_ID,
+      initialDelayMs: 45_000,
+      fallbackIntervalMs: REQUEST_RECOVERY_INTERVAL_MS,
+      runner: () => runDeferredRequestRecovery(logger).then(() => undefined)
+    });
   }
-  if (!rssTimer && !rssInitialTimer) {
-    setTaskNextRun(NZBHYDRA_RSS_SYNC_TASK_ID, new Date(Date.now() + 15_000));
-    rssInitialTimer = setTimeout(() => {
-      rssInitialTimer = undefined;
-      void runNzbhydraRssSyncCycle(logger);
-    }, 15_000);
-    rssTimer = setInterval(() => {
-      void runNzbhydraRssSyncCycle(logger);
-    }, NZBHYDRA_RSS_SYNC_INTERVAL_MS);
+  if (!scheduleHandles.has(NZBHYDRA_RSS_SYNC_TASK_ID)) {
+    scheduleDynamicTask({
+      taskId: NZBHYDRA_RSS_SYNC_TASK_ID,
+      initialDelayMs: 15_000,
+      fallbackIntervalMs: NZBHYDRA_RSS_SYNC_INTERVAL_MS,
+      runner: () => runNzbhydraRssSyncCycle(logger)
+    });
   }
-  if (!logPruneTimer && !logPruneInitialTimer) {
-    setTaskNextRun(LOG_PRUNE_TASK_ID, new Date(Date.now() + 60_000));
-    logPruneInitialTimer = setTimeout(() => {
-      logPruneInitialTimer = undefined;
-      void runLogPruneCycle(logger);
-    }, 60_000);
-    logPruneTimer = setInterval(() => {
-      void runLogPruneCycle(logger);
-    }, LOG_PRUNE_INTERVAL_MS);
+  if (!scheduleHandles.has(LOG_PRUNE_TASK_ID)) {
+    scheduleDynamicTask({
+      taskId: LOG_PRUNE_TASK_ID,
+      initialDelayMs: 60_000,
+      fallbackIntervalMs: LOG_PRUNE_INTERVAL_MS,
+      runner: () => runLogPruneCycle(logger)
+    });
+  }
+  if (!scheduleHandles.has(SUBTITLE_BACKFILL_TASK_ID)) {
+    scheduleDynamicTask({
+      taskId: SUBTITLE_BACKFILL_TASK_ID,
+      initialDelayMs: 75_000,
+      fallbackIntervalMs: SUBTITLE_BACKFILL_INTERVAL_MS,
+      runner: () => runSubtitleBackfillCycle(logger)
+    });
   }
 }
 
 export function stopRequestSyncSchedule() {
-  if (initialTimer) clearTimeout(initialTimer);
-  if (timer) clearInterval(timer);
-  if (recoveryInitialTimer) clearTimeout(recoveryInitialTimer);
-  if (recoveryTimer) clearInterval(recoveryTimer);
-  if (rssInitialTimer) clearTimeout(rssInitialTimer);
-  if (rssTimer) clearInterval(rssTimer);
-  if (logPruneInitialTimer) clearTimeout(logPruneInitialTimer);
-  if (logPruneTimer) clearInterval(logPruneTimer);
-  initialTimer = undefined;
-  timer = undefined;
-  recoveryInitialTimer = undefined;
-  recoveryTimer = undefined;
-  rssInitialTimer = undefined;
-  rssTimer = undefined;
-  logPruneInitialTimer = undefined;
-  logPruneTimer = undefined;
+  for (const handle of scheduleHandles.values()) clearTimeout(handle);
+  scheduleHandles.clear();
 }

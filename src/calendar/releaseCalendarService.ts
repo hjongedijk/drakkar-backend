@@ -163,11 +163,37 @@ export async function fetchReleaseCalendar(month?: string): Promise<ReleaseCalen
       where: {
         OR: [{ sourceKey: { startsWith: "import:" } }, { sourceKey: { startsWith: "request:" } }]
       },
+      select: {
+        sourceKey: true,
+        title: true,
+        mediaType: true,
+        requestId: true,
+        tmdbId: true,
+        tvdbId: true,
+        imdbId: true,
+        posterUrl: true,
+        backdropUrl: true,
+        year: true,
+        season: true,
+        episode: true,
+        episodeTitle: true,
+        episodeOverview: true,
+        episodeAirDate: true,
+        overview: true
+      },
       orderBy: { title: "asc" }
     }),
     prisma.mediaRequest.findMany({
       where: {
         status: { not: "rejected" }
+      },
+      select: {
+        title: true,
+        mediaType: true,
+        year: true,
+        tmdbId: true,
+        tvdbId: true,
+        imdbId: true
       },
       orderBy: { title: "asc" }
     })

@@ -2,10 +2,15 @@ import type { FastifyInstance } from "fastify";
 import { z } from "zod";
 import {
   changeCurrentUserPassword,
+  createUser,
   createUserApiKey,
+  deleteUserByAdmin,
   listUserApiKeys,
+  listUsers,
   loginUser,
+  resetUserPasswordByAdmin,
   revokeUserApiKey,
+  updateUserByAdmin,
   updateCurrentUser
 } from "../auth/service.js";
 import { authCookieName, clearSessionCookie, createSession, destroySession, parseCookie, serializeSessionCookie } from "../auth/session.js";
@@ -27,6 +32,25 @@ const passwordSchema = z.object({
 
 const apiKeySchema = z.object({
   name: z.string().min(1)
+});
+
+const adminUserCreateSchema = z.object({
+  username: z.string().min(1),
+  displayName: z.string().optional(),
+  password: z.string().min(8),
+  isAdmin: z.boolean().default(false),
+  mustChangePassword: z.boolean().default(true)
+});
+
+const adminUserUpdateSchema = z.object({
+  username: z.string().min(1).optional(),
+  displayName: z.string().optional(),
+  isAdmin: z.boolean().optional(),
+  mustChangePassword: z.boolean().optional()
+});
+
+const adminPasswordResetSchema = z.object({
+  newPassword: z.string().min(8)
 });
 
 export async function authRoutes(app: FastifyInstance): Promise<void> {
@@ -71,5 +95,33 @@ export async function authRoutes(app: FastifyInstance): Promise<void> {
   app.delete("/api/auth/tokens/:id", async (request) => {
     const params = request.params as { id: string };
     return revokeUserApiKey(request.authUser!.id, params.id);
+  });
+
+  app.get("/api/auth/admin/users", async (request, reply) => {
+    if (!request.authUser?.isAdmin) return reply.status(403).send({ message: "Admin access required." });
+    return { users: await listUsers() };
+  });
+
+  app.post("/api/auth/admin/users", async (request, reply) => {
+    if (!request.authUser?.isAdmin) return reply.status(403).send({ message: "Admin access required." });
+    return { user: await createUser(adminUserCreateSchema.parse(request.body ?? {})) };
+  });
+
+  app.patch("/api/auth/admin/users/:id", async (request, reply) => {
+    if (!request.authUser?.isAdmin) return reply.status(403).send({ message: "Admin access required." });
+    const params = request.params as { id: string };
+    return { user: await updateUserByAdmin(params.id, adminUserUpdateSchema.parse(request.body ?? {})) };
+  });
+
+  app.post("/api/auth/admin/users/:id/reset-password", async (request, reply) => {
+    if (!request.authUser?.isAdmin) return reply.status(403).send({ message: "Admin access required." });
+    const params = request.params as { id: string };
+    return resetUserPasswordByAdmin(params.id, adminPasswordResetSchema.parse(request.body ?? {}).newPassword);
+  });
+
+  app.delete("/api/auth/admin/users/:id", async (request, reply) => {
+    if (!request.authUser?.isAdmin) return reply.status(403).send({ message: "Admin access required." });
+    const params = request.params as { id: string };
+    return deleteUserByAdmin(request.authUser.id, params.id);
   });
 }

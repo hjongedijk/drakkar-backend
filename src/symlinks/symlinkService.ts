@@ -9,6 +9,7 @@ import { completedPathToVfsPath, getNamingSettings, libraryPathFor } from "../na
 import { getPolicySettings } from "../policies/policyService.js";
 import { refreshPlexPath } from "../plex/plexService.js";
 import { getSettings } from "../settings/settingsStore.js";
+import { scheduleSubtitleSyncForLibraryPath } from "../subtitles/subtitleService.js";
 import type { AppSettings } from "../settings/settingsStore.js";
 
 function fallbackMediaTitle(value?: string | null) {
@@ -475,6 +476,15 @@ export async function createLibraryEntryForImport(
         })
         .catch((error) => plexLog("warn", "plex targeted refresh failed", { error: error instanceof Error ? error.message : error }));
     }
+    void scheduleSubtitleSyncForLibraryPath(link.linkPath, {
+      mediaType: targetMedia.mediaType === "tv" ? "tv" : "movie",
+      title: targetMedia.title,
+      year: targetMedia.year,
+      tmdbId: targetMedia.tmdbId,
+      tvdbId: targetMedia.tvdbId,
+      season: targetMedia.season,
+      episode: targetMedia.episode
+    });
   }
   return links[0]!;
 }

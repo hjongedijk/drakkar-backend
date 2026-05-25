@@ -8,7 +8,8 @@ import { importCompletedPath } from "../import/importService.js";
 import { verifyAndRepairPar2 } from "./par2Service.js";
 import { listMountedFiles } from "../vfs/mountedNzbService.js";
 import { readMountedFileRange } from "../streaming/mountedStream.service.js";
-import { BACKGROUND_REPAIR_INTERVAL_MS, BACKGROUND_REPAIR_TASK_ID, registerCoreTasks } from "../tasks/coreTasks.js";
+import { BACKGROUND_REPAIR_INTERVAL_MS, BACKGROUND_REPAIR_TASK_ID, registerCoreTasks, resolveTaskIntervalMs } from "../tasks/coreTasks.js";
+import { getSettings } from "../settings/settingsStore.js";
 import { runTrackedTask, setTaskNextRun } from "../tasks/taskRegistry.js";
 
 const BACKGROUND_HEALTHCHECK_INITIAL_DELAY_MS = 5 * 60_000;
@@ -43,13 +44,44 @@ function mountedVideoFiles(files: Awaited<ReturnType<typeof listMountedFiles>>) 
 }
 
 async function probeMountedVideo(path: string) {
-  const probe = await readMountedFileRange({
+  const head = await readMountedFileRange({
     path,
     start: 0,
     length: 64 * 1024,
     source: "api"
   });
-  return probe.length;
+  const fileSize = await stat(path).then((row) => row.size);
+  if (fileSize <= head.length) return head.length;
+
+  const midStart = Math.max(0, Math.floor(fileSize / 2) - 4096);
+  const tailStart = Math.max(0, fileSize - 64 * 1024);
+  const tinyTailStart = Math.max(0, fileSize - 8192);
+
+  const [mid, tail, tinyTail] = await Promise.all([
+    readMountedFileRange({
+      path,
+      start: midStart,
+      length: 8192,
+      source: "api"
+    }),
+    readMountedFileRange({
+      path,
+      start: tailStart,
+      length: Math.min(64 * 1024, fileSize - tailStart),
+      source: "api"
+    }),
+    readMountedFileRange({
+      path,
+      start: tinyTailStart,
+      length: Math.min(8192, fileSize - tinyTailStart),
+      source: "api"
+    })
+  ]);
+
+  if (mid.length < Math.min(8192, Math.max(0, fileSize - midStart))) throw new Error("mounted healthcheck short read in middle of file");
+  if (tail.length < Math.min(64 * 1024, Math.max(0, fileSize - tailStart))) throw new Error("mounted healthcheck short read at tail of file");
+  if (tinyTail.length < Math.min(8192, Math.max(0, fileSize - tinyTailStart))) throw new Error("mounted healthcheck short read at tiny tail window");
+  return head.length + mid.length + tail.length + tinyTail.length;
 }
 
 export function listRepairJobs() {
@@ -215,25 +247,34 @@ export async function runBackgroundRepairSweep(logger: { warn: (...args: unknown
   }).catch((error) => {
     logger.warn({ err: error }, "background repair sweep failed");
   });
-  setTaskNextRun(BACKGROUND_REPAIR_TASK_ID, new Date(Date.now() + BACKGROUND_REPAIR_INTERVAL_MS));
+  const settings = await getSettings().catch(() => null);
+  registerCoreTasks(settings ?? undefined);
+  const intervalMs = resolveTaskIntervalMs(BACKGROUND_REPAIR_TASK_ID, settings) ?? BACKGROUND_REPAIR_INTERVAL_MS;
+  setTaskNextRun(BACKGROUND_REPAIR_TASK_ID, new Date(Date.now() + intervalMs));
 }
 
 export function startBackgroundRepairSchedule(logger: { warn: (...args: unknown[]) => void }) {
   if (repairTimer || initialRepairTimer) return;
-  registerCoreTasks();
+  void getSettings().then((settings) => registerCoreTasks(settings)).catch(() => registerCoreTasks());
   setTaskNextRun(BACKGROUND_REPAIR_TASK_ID, new Date(Date.now() + BACKGROUND_HEALTHCHECK_INITIAL_DELAY_MS));
   initialRepairTimer = setTimeout(() => {
     initialRepairTimer = undefined;
     void runBackgroundRepairSweep(logger);
   }, BACKGROUND_HEALTHCHECK_INITIAL_DELAY_MS);
-  repairTimer = setInterval(() => {
-    void runBackgroundRepairSweep(logger);
-  }, BACKGROUND_REPAIR_INTERVAL_MS);
+  const scheduleNext = async () => {
+    const settings = await getSettings().catch(() => null);
+    const intervalMs = resolveTaskIntervalMs(BACKGROUND_REPAIR_TASK_ID, settings) ?? BACKGROUND_REPAIR_INTERVAL_MS;
+    repairTimer = setTimeout(async () => {
+      await runBackgroundRepairSweep(logger);
+      void scheduleNext();
+    }, intervalMs);
+  };
+  void scheduleNext();
 }
 
 export function stopBackgroundRepairSchedule() {
   if (initialRepairTimer) clearTimeout(initialRepairTimer);
-  if (repairTimer) clearInterval(repairTimer);
+  if (repairTimer) clearTimeout(repairTimer);
   initialRepairTimer = undefined;
   repairTimer = undefined;
 }

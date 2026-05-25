@@ -113,13 +113,17 @@ function serializeDate<T extends Record<string, unknown>>(row: T) {
   return Object.fromEntries(Object.entries(row).map(([key, value]) => [key, value instanceof Date ? value.toISOString() : value]));
 }
 
+function serializeScriptJson(value: unknown) {
+  return JSON.stringify(value).replace(/</g, "\\u003c");
+}
+
 function openApiDocument() {
   return {
     openapi: "3.1.0",
     info: {
       title: "Drakkar API",
       version: DRAKKAR_VERSION,
-      description: "Drakkar REST and GraphQL API. Use the same Drakkar API token as `x-api-token`, and for protected routes also as `Authorization: Bearer <token>`."
+      description: "Drakkar REST and GraphQL API. Browser users can rely on the normal Drakkar login session cookie. Scripts can use the Drakkar API token as `x-api-token`, and for protected routes also as `Authorization: Bearer <token>`."
     },
     servers: [
       { url: "/", description: "Current host via frontend proxy or direct backend" }
@@ -138,11 +142,17 @@ function openApiDocument() {
     ],
     components: {
       securitySchemes: {
+        sessionCookie: {
+          type: "apiKey",
+          in: "cookie",
+          name: "usenet_vfs_session",
+          description: "Normal Drakkar browser login session cookie."
+        },
         apiTokenHeader: {
           type: "apiKey",
           in: "header",
           name: "x-api-token",
-          description: "Required on every `/api/*` request."
+          description: "Drakkar API token for script and service access."
         },
         bearerAuth: {
           type: "http",
@@ -694,7 +704,7 @@ export async function graphqlRoutes(app: FastifyInstance): Promise<void> {
         }
       }, [
         React.createElement('div', { key: 'left' }, 'Drakkar GraphQL: same auth as the app. Session cookie works; token auth also works.'),
-        React.createElement('a', { key: 'right', href: '/api/docs', style: { color: '#0f766e', textDecoration: 'none', fontWeight: 600 } }, 'Open Swagger')
+        React.createElement('a', { key: 'right', href: '/api/docs', style: { color: '#0f766e', textDecoration: 'none', fontWeight: 600 } }, 'Open API Reference')
       ]);
       ReactDOM.createRoot(document.getElementById('graphiql')).render(
         React.createElement(React.Fragment, null, [
@@ -712,34 +722,49 @@ export async function graphqlRoutes(app: FastifyInstance): Promise<void> {
   app.get("/api/openapi.json", async () => openApiDocument());
 
   app.get("/api/docs", async (_request, reply) => {
+    const document = serializeScriptJson(openApiDocument());
     reply.type("text/html");
     return `<!doctype html>
 <html>
   <head>
-    <title>Drakkar API Swagger</title>
-    <link rel="stylesheet" href="https://unpkg.com/swagger-ui-dist@5/swagger-ui.css" />
+    <title>Drakkar API Reference</title>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
     <style>
-      html, body { margin: 0; background: #ffffff; }
-      .swagger-ui .topbar { display: none; }
-      .swagger-ui .scheme-container { box-shadow: none; }
+      html, body, #app { margin: 0; min-height: 100%; background: #0b1220; }
     </style>
   </head>
   <body>
-    <div id="swagger-ui"></div>
-    <script src="/config.js"></script>
-    <script src="https://unpkg.com/swagger-ui-dist@5/swagger-ui-bundle.js"></script>
+    <div id="app"></div>
+    <script src="https://cdn.jsdelivr.net/npm/@scalar/api-reference@1.57.5"></script>
     <script>
-      const token = window.__DRAKKAR_CONFIG__?.DRAKKAR_API_TOKEN || window.__DRAKKAR_CONFIG__?.FRONTEND_API_TOKEN || '';
-      window.ui = SwaggerUIBundle({
-        url: '/api/openapi.json',
-        dom_id: '#swagger-ui',
-        deepLinking: true,
-        persistAuthorization: true,
-        tryItOutEnabled: true,
-        requestInterceptor: (req) => {
-          if (token && !req.headers['x-api-token']) req.headers['x-api-token'] = token;
-          if (token && !req.headers['Authorization']) req.headers['Authorization'] = 'Bearer ' + token;
-          return req;
+      const content = ${document};
+      Scalar.createApiReference('#app', {
+        content,
+        layout: 'modern',
+        theme: 'saturn',
+        pageTitle: 'Drakkar API Reference',
+        hideDownloadButton: false,
+        withDefaultFonts: true,
+        darkMode: false,
+        authentication: {
+          preferredSecurityScheme: ['sessionCookie', 'apiTokenHeader', 'bearerAuth']
+        },
+        customCss: \`
+          .light-mode { --scalar-color-1: #0f172a; --scalar-background-1: #f8fafc; }
+          .scalar-api-reference { min-height: 100vh; }
+        \`,
+        fetch: (input, init) => {
+          return window.fetch(input, {
+            ...init,
+            credentials: 'include',
+            headers: {
+              ...(init?.headers || {})
+            }
+          })
+        },
+        onLoaded: () => {
+          document.title = 'Drakkar API Reference'
         }
       });
     </script>

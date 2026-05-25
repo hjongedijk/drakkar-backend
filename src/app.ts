@@ -24,7 +24,6 @@ import { plexRoutes } from "./routes/plex.js";
 import { getSetupStatus, setupRoutes } from "./routes/setup.js";
 import { registerCoreTasks } from "./tasks/coreTasks.js";
 import { graphqlRoutes } from "./routes/graphql.js";
-import { bazarrCompatRoutes } from "./routes/bazarrCompat.js";
 import { buildLineLogger } from "./logging/lineLogger.js";
 
 const API_TOKEN_AUTH_USER = {
@@ -40,6 +39,7 @@ export function buildApp() {
   const app = Fastify({
     loggerInstance: buildLineLogger(env.LOG_LEVEL),
     disableRequestLogging: true,
+    ignoreTrailingSlash: true,
     genReqId: (request) => {
       const header = request.headers["x-request-id"];
       return Array.isArray(header) ? header[0] ?? randomUUID() : header ?? randomUUID();
@@ -62,21 +62,17 @@ export function buildApp() {
     }
   });
 
-  app.addHook("onRequest", async (request, reply) => {
+  app.addHook("onRequest", async (request) => {
     if (request.method === "OPTIONS") return;
     if (!request.url.startsWith("/api/")) return;
     if (request.url === "/api/health") return;
-    if (request.url.startsWith("/api/compat/")) return;
     const parsedUrl = new URL(request.url, env.APP_BASE_URL);
-    if (request.method === "GET" && ["/api/docs", "/api/openapi.json", "/api/graphql"].includes(parsedUrl.pathname) && !parsedUrl.searchParams.has("query")) return;
     const drakkarApiToken = env.getDrakkarApiToken(env.CONFIG_DIR);
     const authorization = request.headers.authorization;
     const bearerToken = authorization?.startsWith("Bearer ") ? authorization.slice("Bearer ".length).trim() : undefined;
     const headerToken = Array.isArray(request.headers["x-api-token"]) ? request.headers["x-api-token"][0] : request.headers["x-api-token"];
     const apiToken = headerToken ?? parsedUrl.searchParams.get("apiToken") ?? (bearerToken === drakkarApiToken ? bearerToken : "");
-    if (apiToken !== drakkarApiToken) {
-      return reply.status(401).send({ message: "Invalid Drakkar API token." });
-    }
+    if (!apiToken || apiToken !== drakkarApiToken) return;
     request.authUser = { ...API_TOKEN_AUTH_USER };
   });
 
@@ -85,9 +81,7 @@ export function buildApp() {
     if (!request.url.startsWith("/api/")) return;
     {
       const parsedUrl = new URL(request.url, env.APP_BASE_URL);
-      if (request.method === "GET" && ["/api/docs", "/api/openapi.json", "/api/graphql"].includes(parsedUrl.pathname) && !parsedUrl.searchParams.has("query")) return;
       if (parsedUrl.pathname === "/api/health") return;
-      if (parsedUrl.pathname.startsWith("/api/compat/")) return;
       if (parsedUrl.pathname === "/api/setup/status") return;
       const setup = await getSetupStatus();
       if (parsedUrl.pathname === "/api/setup/complete") {
@@ -100,7 +94,6 @@ export function buildApp() {
     if (request.authUser) return;
 
     const parsedUrl = new URL(request.url, env.APP_BASE_URL);
-    if (parsedUrl.pathname.startsWith("/api/compat/")) return;
     if (parsedUrl.pathname === "/api/webhooks/seerr") return;
     const authorization = request.headers.authorization;
     const bearerToken = authorization?.startsWith("Bearer ") ? authorization.slice("Bearer ".length).trim() : undefined;
@@ -110,7 +103,12 @@ export function buildApp() {
       ? await getAuthUserById(sessionUserId)
       : await getAuthUserByApiKey(bearerToken);
 
-    if (!user) return reply.status(401).send({ message: "Authentication required." });
+    if (!user) {
+      if (request.method === "GET" && ["/api/docs", "/api/graphql"].includes(parsedUrl.pathname) && !parsedUrl.searchParams.has("query")) {
+        return reply.redirect("/login");
+      }
+      return reply.status(401).send({ message: "Authentication required." });
+    }
     request.authUser = user;
   });
 
@@ -145,7 +143,6 @@ export function buildApp() {
   void app.register(plexRoutes);
   void app.register(setupRoutes);
   void app.register(graphqlRoutes);
-  void app.register(bazarrCompatRoutes);
 
   return app;
 }

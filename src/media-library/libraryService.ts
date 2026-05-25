@@ -1,5 +1,5 @@
-import { dirname } from "node:path";
-import { unlink } from "node:fs/promises";
+import { dirname, basename, extname } from "node:path";
+import { readdir, unlink } from "node:fs/promises";
 import type { MediaLibraryItem } from "@prisma/client";
 import { prisma } from "../db/prisma.js";
 import { addNzbFromPath, findReusableDownload } from "../downloads/downloadService.js";
@@ -87,11 +87,36 @@ export async function listLibraryItems() {
     },
     orderBy: [{ libraryStatus: "asc" }, { sortTitle: "asc" }, { createdAt: "desc" }]
   });
-  return items.filter((item) => !shouldHideLibraryItem(item));
+  const visible = items.filter((item) => !shouldHideLibraryItem(item));
+  return mapWithConcurrency(visible, 12, async (item) => ({
+    ...item,
+    subtitleLanguages: await subtitleLanguagesForItem(item).catch(() => [])
+  }));
 }
 
 export function getLibraryItem(id: string) {
   return prisma.mediaLibraryItem.findUniqueOrThrow({ where: { id } });
+}
+
+async function subtitleLanguagesForItem(item: Pick<MediaLibraryItem, "symlinkPath" | "strmPath" | "filePath">) {
+  const mediaPath = item.symlinkPath ?? item.strmPath ?? item.filePath;
+  if (!mediaPath) return [];
+  const directory = dirname(mediaPath);
+  const extension = extname(mediaPath);
+  const stem = extension ? basename(mediaPath, extension) : basename(mediaPath);
+  const entries = await readdir(directory, { withFileTypes: true });
+  const languages = entries
+    .filter((entry) => entry.isFile())
+    .map((entry) => entry.name)
+    .flatMap((name) => {
+      const match = name.match(new RegExp(`^${escapeRegExp(stem)}\\.([a-z0-9-]+)\\.(srt|ass|ssa|vtt|sub)$`, "i"));
+      return match?.[1] ? [match[1].toUpperCase()] : [];
+    });
+  return [...new Set(languages)].sort();
+}
+
+function escapeRegExp(value: string) {
+  return value.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
 }
 
 export async function searchLibraryItemReplacements(id: string) {
