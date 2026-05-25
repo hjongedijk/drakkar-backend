@@ -100,14 +100,6 @@ export async function syncRuntimeSettingsFromDatabase(settingsOverride?: AppSett
       language: settings.metadataLanguage,
       cacheTtlHours: settings.metadataCacheTtlHours
     },
-    indexers: current.indexers.map((indexer, index) => index === 0 ? {
-      ...indexer,
-      type: "nzbhydra2",
-      enabled: Boolean(settings.nzbhydraUrl && settings.nzbhydraApiKey),
-      name: indexer.name || "NZBHydra2",
-      url: settings.nzbhydraUrl ?? "",
-      apiKey: settings.nzbhydraApiKey ?? ""
-    } : indexer),
     usenetProviders: usenetProviders.map((server) => ({
       enabled: server.enabled,
       name: server.name,

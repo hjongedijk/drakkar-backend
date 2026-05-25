@@ -1,6 +1,7 @@
 import test from "node:test";
 import assert from "node:assert/strict";
 import { requestDuplicateRank, requestMatchesIdentity } from "../src/requests/sync/requestIdentity.js";
+import { titlesLikelyMatch } from "../src/media-library/identity.js";
 
 test("requestMatchesIdentity matches requests by shared external IDs", () => {
   const existing = {
@@ -108,4 +109,16 @@ test("requestDuplicateRank prefers rows with download links and imports", () => 
   };
 
   assert.ok(requestDuplicateRank(strong) > requestDuplicateRank(weak));
+});
+
+test("titlesLikelyMatch rejects unrelated numeric title collisions", () => {
+  assert.equal(titlesLikelyMatch("Avatar 5", "The King's Avatar - For the Glory"), false);
+});
+
+test("titlesLikelyMatch rejects bait subtitle collisions", () => {
+  assert.equal(titlesLikelyMatch("Arthur the King", "[HnY] Beyblade Burst GT 29 - Assault! Arthur, the King of HELL!! (1080p)"), false);
+});
+
+test("titlesLikelyMatch keeps close sequel-title variants", () => {
+  assert.equal(titlesLikelyMatch("John Wick Chapter 4", "John Wick 4"), true);
 });

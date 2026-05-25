@@ -8,11 +8,12 @@ import { runSearch } from "../../search/searchService.js";
 import { getSettings } from "../../settings/settingsStore.js";
 import { syncRuntimeSettingsFromDatabase } from "../../settings/settingsStore.js";
 import { addNzbFromPath, findReusableDownload, promoteDownloadPriority } from "../../downloads/downloadService.js";
-import { mediaIdentityKey, normalizeTitleForIdentity } from "../../media-library/identity.js";
+import { mediaIdentityKey, normalizeTitleForIdentity, titlesLikelyMatch } from "../../media-library/identity.js";
+import { parseReleaseTitle } from "../../quality/parser.js";
 import { scoreRelease } from "../../quality/scoring.js";
 import { ensureDefaultProfiles } from "../../quality/profileService.js";
 import { createBlocklistItem, isReleaseBlocklisted } from "../../policies/policyService.js";
-import { createSeerrRequest, fetchSeerrRequestById, fetchSeerrRequests, testSeerrConnection, updateSeerrAvailable } from "../seerr/client.js";
+import { fetchSeerrRequestById, fetchSeerrRequests, testSeerrConnection } from "../seerr/client.js";
 import type { ExternalMediaRequest } from "../types.js";
 import { requestDuplicateRank, requestMatchesIdentity } from "./requestIdentity.js";
 
@@ -22,11 +23,17 @@ const REQUEST_RELEASE_CACHE_SECONDS = 6 * 60 * 60;
 const MONITOR_QUEUE_SEED_STATUSES = ["queued", "fetching_nzb", "verifying", "waiting_for_provider", "waiting_for_nzb", "downloading", "paused"];
 const TV_SEASONS_PER_MONITOR_PASS = 8;
 const TV_EPISODE_DOWNLOADS_PER_REQUEST_PASS = 4;
-const MONITORED_REQUESTS_MAX_DURATION_MS = 20_000;
+const MOVIE_NZB_FETCH_ATTEMPTS_PER_PASS = 1;
+const TV_NZB_FETCH_ATTEMPTS_PER_SEASON_PASS = 1;
+const REQUEST_GRAB_COOLDOWN_SECONDS = 30 * 60;
+const REQUEST_WANTED_SEARCH_COOLDOWN_SECONDS = 6 * 60 * 60;
+const MONITORED_REQUESTS_MAX_DURATION_MS = 60_000;
+const REQUEST_RECOVERY_MAX_DURATION_MS = 20_000;
 const REQUEST_SYNC_MAX_DURATION_MS = 35_000;
 const REQUEST_SYNC_PROVIDER_MAX_REQUESTS = 200;
 const FAILED_REQUEST_RECOVERY_MAX_PER_CYCLE = 2;
 const SELECTED_RELEASE_RECOVERY_MAX_PER_CYCLE = 2;
+const ACTIVE_WANTED_SEARCHES_PER_CYCLE = 2;
 const SEERR_WEBHOOK_PRIORITY = 900;
 
 function blockReasonFromFailure(message?: string | null) {
@@ -35,8 +42,32 @@ function blockReasonFromFailure(message?: string | null) {
   if (/430 no such article|no such article|article.*not found|missing article|missing segment|segment download failed|required usenet articles|provider.*missing/.test(normalized)) return "missing_articles";
   if (/password|encrypted/.test(normalized)) return "passworded_archive";
   if (/unsupported archive|rar nzb would require|full disk materialization|archive.*refus|archive extraction|materialization/.test(normalized)) return "unsupported_archive";
-  if (/no streamable video|no eligible files|no importable media|contains no streamable video/.test(normalized)) return "no_video_content";
-  return "import_failed";
+  if (/no direct streamable video|no streamable video|no eligible files|no importable media|contains no streamable video/.test(normalized)) return "no_video_content";
+  return "grab_failed";
+}
+
+function isRetryableGrabFailure(message?: string | null) {
+  const normalized = (message ?? "").toLowerCase();
+  return /nzb download failed with http \d+\b/.test(normalized)
+    || /timed out|timeout|aborted|fetch failed|socket hang up|econnreset|ehostunreach|service unavailable|temporarily disabled/.test(normalized);
+}
+
+async function maybeBlocklistGrabFailure(input: {
+  guid?: string | null;
+  title: string;
+  reason?: string | null;
+  source: string;
+  release?: unknown;
+}) {
+  if (isRetryableGrabFailure(input.reason)) return false;
+  await createBlocklistItem({
+    guid: input.guid === undefined || input.guid === null ? undefined : String(input.guid),
+    title: input.title,
+    reason: blockReasonFromFailure(input.reason),
+    source: input.source,
+    release: input.release
+  }).catch(() => undefined);
+  return true;
 }
 
 function scoreReleaseForRequest(
@@ -47,8 +78,22 @@ function scoreReleaseForRequest(
 ) {
   const decision = scoreRelease(release, profile);
   const reasons = [...decision.reasons];
-  if (request.mediaType === "movie" && (decision.parsed.season || decision.parsed.episode || /\bS\d{1,2}(?:E\d{1,4})?\b/i.test(release.title))) {
+  const parsedTitleMatches = !decision.parsed.title || titlesLikelyMatch(request.title, decision.parsed.title);
+  if (
+    request.mediaType === "movie"
+    && (
+      decision.parsed.mediaHint === "tv"
+      || decision.parsed.season
+      || decision.parsed.episode
+      || decision.parsed.isSeasonPack
+      || decision.parsed.isDaily
+      || /\bTV\b/i.test(release.category ?? "")
+    )
+  ) {
     reasons.push("TV episode or season release rejected for movie request");
+  }
+  if (!parsedTitleMatches) {
+    reasons.push(`parsed release title "${decision.parsed.title}" does not match requested title "${request.title}"`);
   }
   if (request.mediaType === "movie" && request.year && decision.parsed.year && decision.parsed.year !== request.year) {
     reasons.push(`movie year ${decision.parsed.year} does not match requested year ${request.year}`);
@@ -85,10 +130,15 @@ function intersectEpisodes(left: Set<number>, right: Set<number>) {
   return new Set([...left].filter((episode) => right.has(episode)));
 }
 
-async function fetchProviderRequests(provider: RequestProvider, options: { full?: boolean } = {}) {
+async function fetchProviderRequests(
+  provider: RequestProvider,
+  options: { full?: boolean; skip?: number; maxRequests?: number; pageSize?: number } = {}
+) {
   return fetchSeerrRequests(provider, {
-    maxRequests: options.full ? undefined : REQUEST_SYNC_PROVIDER_MAX_REQUESTS,
-    includeDetails: false
+    maxRequests: options.maxRequests ?? (options.full ? undefined : REQUEST_SYNC_PROVIDER_MAX_REQUESTS),
+    includeDetails: false,
+    skip: options.skip,
+    pageSize: options.pageSize
   });
 }
 
@@ -121,10 +171,6 @@ async function reuseExistingReleaseDownload(requestId: string, release: { guid?:
   });
   await refreshMediaLibrary().catch(() => undefined);
   return reusable;
-}
-
-async function updateProviderAvailable(provider: RequestProvider, externalId: string) {
-  return updateSeerrAvailable(provider, externalId);
 }
 
 async function enrichTvRequestWithStructure(request: ExternalMediaRequest) {
@@ -260,7 +306,10 @@ export function deleteProvider(id: string) {
   });
 }
 
-export async function syncRequests(providerId?: string, options: { full?: boolean } = {}) {
+export async function syncRequests(
+  providerId?: string,
+  options: { full?: boolean; skip?: number; maxRequests?: number; pageSize?: number; refreshLibrary?: boolean } = {}
+) {
   const startedAt = Date.now();
   const providers = await prisma.requestProvider.findMany({
     where: { enabled: true, ...(providerId ? { id: providerId } : {}) }
@@ -336,7 +385,7 @@ export async function syncRequests(providerId?: string, options: { full?: boolea
     }
   }
 
-  if (createdCount > 0 || updatedCount > 0) void refreshMediaLibrary().catch(() => undefined);
+  if ((createdCount > 0 || updatedCount > 0) && options.refreshLibrary !== false) void refreshMediaLibrary().catch(() => undefined);
   return {
     imported: createdCount,
     updated: updatedCount,
@@ -461,6 +510,7 @@ export async function syncRequestFromWebhook(payload: unknown, providerId?: stri
 
 export async function recoverFailedRequestDownloads(options: { limit?: number } = {}) {
   const limit = Math.max(1, options.limit ?? FAILED_REQUEST_RECOVERY_MAX_PER_CYCLE);
+  const startedAt = Date.now();
   const requests = await prisma.mediaRequest.findMany({
     where: {
       downloadId: { not: null },
@@ -476,6 +526,7 @@ export async function recoverFailedRequestDownloads(options: { limit?: number } 
   const downloadMap = new Map(downloads.map((download) => [download.id, download]));
   const recovered = [];
   for (const request of requests) {
+    if (Date.now() - startedAt >= REQUEST_RECOVERY_MAX_DURATION_MS) break;
     const download = request.downloadId ? downloadMap.get(request.downloadId) ?? null : null;
     if (!download) {
       await prisma.mediaRequest.update({ where: { id: request.id }, data: { status: "release_failed", downloadId: null } });
@@ -493,6 +544,7 @@ export async function recoverFailedRequestDownloads(options: { limit?: number } 
 
 export async function recoverSelectedReleaseDownloads(options: { limit?: number } = {}) {
   const limit = Math.max(1, options.limit ?? SELECTED_RELEASE_RECOVERY_MAX_PER_CYCLE);
+  const startedAt = Date.now();
   const requests = await prisma.mediaRequest.findMany({
     where: {
       downloadId: null,
@@ -505,6 +557,7 @@ export async function recoverSelectedReleaseDownloads(options: { limit?: number 
 
   const recovered = [];
   for (const request of requests) {
+    if (Date.now() - startedAt >= REQUEST_RECOVERY_MAX_DURATION_MS) break;
     const workingImport = await findWorkingImportForRequest(request).catch(() => null);
     if (workingImport) {
       await prisma.mediaRequest.update({
@@ -521,8 +574,24 @@ export async function recoverSelectedReleaseDownloads(options: { limit?: number 
     try {
       const result = await grabReleaseForRequest(request.id, request.selectedRelease);
       recovered.push({ requestId: request.id, result });
-    } catch {
-      continue;
+    } catch (error) {
+      const message = error instanceof Error ? error.message : "selected release recovery failed";
+      await blocklistSelectedRelease(request, message, "selected-release-recovery");
+      await prisma.mediaRequest.update({
+        where: { id: request.id },
+        data: {
+          status: "release_failed",
+          selectedRelease: Prisma.JsonNull,
+          downloadId: null
+        }
+      }).catch(() => undefined);
+      recovered.push({
+        requestId: request.id,
+        result: await grabForRequestMediaType(request.id, request.mediaType).catch((retryError) => ({
+          grabbed: false,
+          reason: retryError instanceof Error ? retryError.message : "replacement search failed"
+        }))
+      });
     }
   }
 
@@ -595,6 +664,7 @@ export async function ensureMonitoredRequests() {
   const queueSeedTarget = Math.max(1, settings.monitorQueueSeedTarget);
   const startedAt = Date.now();
   let pendingQueueItems = await monitoredQueuePendingCount();
+  let activeWantedSearches = 0;
   if (pendingQueueItems >= queueSeedTarget) {
     return { retried: 0, queueSeedTarget, pendingQueueItems, skippedBecauseQueueFull: 1, results: [] };
   }
@@ -640,8 +710,22 @@ export async function ensureMonitoredRequests() {
         }).catch(() => undefined);
       }
       if (!hasMissingEpisodes) continue;
-      const result = await grabMissingTvForRequest(request.id).catch(() => null);
-      if (result) {
+      let attemptedActiveSearch = false;
+      let result = await grabMissingTvForRequest(request.id, { cachedOnly: true }).catch(() => null);
+      if (!result?.grabbed && activeWantedSearches < ACTIVE_WANTED_SEARCHES_PER_CYCLE && !(await wantedSearchCoolingDown(request.id))) {
+        attemptedActiveSearch = true;
+        activeWantedSearches += 1;
+        result = await grabMissingTvForRequest(request.id).catch(() => null);
+        await markWantedSearchCooldown(request.id).catch(() => undefined);
+      }
+      const hasRemainingSeasonSearches = Boolean(
+        result
+        && typeof result === "object"
+        && "remainingSeasonSearches" in result
+        && typeof (result as Record<string, unknown>).remainingSeasonSearches === "number"
+        && Number((result as Record<string, unknown>).remainingSeasonSearches) > 0
+      );
+      if (result?.grabbed || hasRemainingSeasonSearches || attemptedActiveSearch) {
         retried.push({ requestId: request.id, result });
         await prisma.mediaRequest.update({ where: { id: request.id }, data: { updatedAt: new Date() } }).catch(() => undefined);
       }
@@ -652,8 +736,15 @@ export async function ensureMonitoredRequests() {
     const workingImport = await findWorkingImportForRequest(request).catch(() => null);
     const activeDownload = await existingActiveDownload(request.downloadId).catch(() => null);
     if (workingImport || activeDownload) continue;
-    const result = await grabBestForRequest(request.id).catch(() => null);
-    if (result) {
+    let attemptedActiveSearch = false;
+    let result = await grabBestForRequest(request.id, { cachedOnly: true }).catch(() => null);
+    if (!result?.grabbed && activeWantedSearches < ACTIVE_WANTED_SEARCHES_PER_CYCLE && !(await wantedSearchCoolingDown(request.id))) {
+      attemptedActiveSearch = true;
+      activeWantedSearches += 1;
+      result = await grabBestForRequest(request.id).catch(() => null);
+      await markWantedSearchCooldown(request.id).catch(() => undefined);
+    }
+    if (result?.grabbed || attemptedActiveSearch) {
       retried.push({ requestId: request.id, result });
       await prisma.mediaRequest.update({ where: { id: request.id }, data: { updatedAt: new Date() } }).catch(() => undefined);
     }
@@ -791,19 +882,19 @@ async function consolidateDuplicateRequests(
   const carrySeasons = canonical.seasons ?? duplicates.find((item) => item.seasons)?.seasons ?? undefined;
   const carryEpisodes = canonical.episodes ?? duplicates.find((item) => item.episodes)?.episodes ?? undefined;
 
-  await prisma.$transaction(async (tx) => {
-    await tx.importItem.updateMany({
+  await prisma.$transaction([
+    prisma.importItem.updateMany({
       where: { requestId: { in: duplicateIds } },
       data: { requestId: canonical.id }
-    });
-    await tx.mediaLibraryItem.updateMany({
+    }),
+    prisma.mediaLibraryItem.updateMany({
       where: { requestId: { in: duplicateIds } },
       data: { requestId: canonical.id }
-    });
-    await tx.mediaLibraryItem.deleteMany({
+    }),
+    prisma.mediaLibraryItem.deleteMany({
       where: { sourceKey: { in: duplicateIds.map((id) => `request:${id}`) } }
-    });
-    await tx.mediaRequest.update({
+    }),
+    prisma.mediaRequest.update({
       where: { id: canonical.id },
       data: {
         ...(carryDownloadId ? { downloadId: carryDownloadId } : {}),
@@ -814,11 +905,11 @@ async function consolidateDuplicateRequests(
         ...(carrySeasons ? { seasons: carrySeasons as Prisma.InputJsonValue } : {}),
         ...(carryEpisodes ? { episodes: carryEpisodes as Prisma.InputJsonValue } : {})
       }
-    });
-    await tx.mediaRequest.deleteMany({
+    }),
+    prisma.mediaRequest.deleteMany({
       where: { id: { in: duplicateIds } }
-    });
-  });
+    })
+  ]);
 
   return prisma.mediaRequest.findUniqueOrThrow({
     where: { id: canonical.id },
@@ -918,18 +1009,13 @@ export async function createManualRequest(input: {
   imdbId?: string;
 }) {
   const provider = await prisma.requestProvider.findFirst({ where: { type: "seerr", enabled: true }, orderBy: { createdAt: "asc" } });
-  const externalResult = provider && input.tmdbId
-    ? await createSeerrRequest(provider, { mediaType: input.mediaType, tmdbId: input.tmdbId }).catch((error) => ({ ok: false, status: 0, body: { message: error instanceof Error ? error.message : "Seerr request failed" } }))
-    : null;
-  const externalId = externalResult?.ok && externalResult.body && typeof externalResult.body === "object" && "id" in externalResult.body
-    ? String((externalResult.body as { id: unknown }).id)
-    : `manual:${input.mediaType}:${input.tmdbId ?? input.tvdbId ?? input.imdbId ?? mediaIdentityKey(input)}`;
+  const externalId = `manual:${input.mediaType}:${input.tmdbId ?? input.tvdbId ?? input.imdbId ?? mediaIdentityKey(input)}`;
   const profileId = input.mediaType === "tv" ? provider?.defaultTvProfile : provider?.defaultMovieProfile;
   const manualRequest: ExternalMediaRequest = {
     ...input,
     externalId,
     requestedBy: "Drakkar",
-    externalStatus: externalResult?.ok ? "2" : "manual"
+    externalStatus: "manual"
   };
   const metadataEnriched = await enrichRequestMetadataFallback(manualRequest).catch(() => manualRequest);
   const enriched = input.mediaType === "tv"
@@ -940,7 +1026,7 @@ export async function createManualRequest(input: {
     ? await prisma.mediaRequest.findUnique({ where: { providerId_externalId: { providerId: provider.id, externalId } } })
     : await prisma.mediaRequest.findFirst({ where: { providerId: null, externalId } });
   const data = {
-    providerId: provider?.id,
+    providerId: null,
     externalId,
     mediaType: input.mediaType,
     title: enriched.title,
@@ -974,7 +1060,7 @@ export async function createManualRequest(input: {
       }
     })
     : await prisma.mediaRequest.create({ data });
-  return { request, seerr: externalResult };
+  return { request, seerr: null, localOnly: true };
 }
 
 export async function getRequestMonitor(id: string) {
@@ -1100,7 +1186,7 @@ export function setRequestStatus(id: string, status: string) {
   return prisma.mediaRequest.update({ where: { id }, data: { status } });
 }
 
-export async function searchForRequest(id: string) {
+export async function searchForRequest(id: string, options?: { cachedOnly?: boolean }) {
   const request = await getRequest(id);
   const cached = await cachedRequestReleases(request);
   if (cached) return { request, releases: cached };
@@ -1112,7 +1198,8 @@ export async function searchForRequest(id: string) {
     imdbId: request.imdbId ?? undefined,
     tmdbId: request.tmdbId ?? undefined,
     tvdbId: request.tvdbId ?? undefined,
-    season
+    season,
+    cachedOnly: options?.cachedOnly
   });
   await cacheRequestReleases(request, releases);
   return { request, releases };
@@ -1198,8 +1285,8 @@ export async function rankReleasesForRequest(id: string) {
         : scoreReleaseForRequest(request, release, profile, { rejectAmbiguousAnime })
     }))
   );
-  ranked.sort((a, b) => b.decision.score - a.decision.score);
-  return { request, profile, releases: ranked };
+  const accepted = ranked.filter((item) => item.decision.accepted).sort((a, b) => b.decision.score - a.decision.score);
+  return { request, profile, releases: accepted, rejectedCount: ranked.length - accepted.length };
 }
 
 export async function rankTvEpisodeForRequest(id: string, season: number, episode: number) {
@@ -1226,8 +1313,8 @@ export async function rankTvEpisodeForRequest(id: string, season: number, episod
         : scoreReleaseForRequest(request, release, profile, { rejectAmbiguousAnime })
     }))
   );
-  ranked.sort((a, b) => b.decision.score - a.decision.score);
-  return { request, profile, releases: ranked };
+  const accepted = ranked.filter((item) => item.decision.accepted).sort((a, b) => b.decision.score - a.decision.score);
+  return { request, profile, releases: accepted, rejectedCount: ranked.length - accepted.length };
 }
 
 export async function grabTvEpisodeForRequest(id: string, season: number, episode: number) {
@@ -1242,7 +1329,7 @@ export async function grabTvEpisodeForRequest(id: string, season: number, episod
   return { season, episode, ...result };
 }
 
-export async function grabBestForRequest(id: string, options?: { priorityBoost?: number }) {
+export async function grabBestForRequest(id: string, options?: { priorityBoost?: number; cachedOnly?: boolean }) {
   const request = await getRequest(id);
   const workingImport = await findWorkingImportForRequest(request);
   if (workingImport) {
@@ -1257,13 +1344,16 @@ export async function grabBestForRequest(id: string, options?: { priorityBoost?:
     }
     return { grabbed: true, reason: "request already has an active download", download: existingDownload };
   }
+  if (await requestGrabCoolingDown(id)) {
+    return { grabbed: false, reason: "request search cooling down after recent failed grab attempt" };
+  }
   const settings = await getSettings();
   const configuredProfileId =
     request.selectedProfileId ??
     (request.mediaType === "tv" ? request.provider?.defaultTvProfile ?? settings.defaultTvProfile : request.provider?.defaultMovieProfile ?? settings.defaultMovieProfile);
   const profile = await resolveProfile(configuredProfileId, request.mediaType);
   const rejectAmbiguousAnime = request.mediaType === "tv" && Boolean(request.year);
-  const { releases } = await searchForRequest(id);
+  const { releases } = await searchForRequest(id, { cachedOnly: options?.cachedOnly });
   const scored = await Promise.all(
     releases.map(async (release) => ({
       release,
@@ -1275,15 +1365,25 @@ export async function grabBestForRequest(id: string, options?: { priorityBoost?:
   const ranked = scored.filter((item) => item.decision.accepted).sort((a, b) => b.decision.score - a.decision.score);
 
   if (ranked.length === 0) {
+    if (options?.cachedOnly) {
+      return { grabbed: false, reason: "no acceptable cached release found", releases: ranked };
+    }
+    await markRequestGrabCooldown(id).catch(() => undefined);
     await prisma.mediaRequest.update({ where: { id }, data: { status: "no_release_found" } });
     await refreshMediaLibrary().catch(() => undefined);
     return { grabbed: false, reason: "no acceptable release found", releases: ranked };
   }
 
   const rejected: string[] = [];
+  let attemptedFetches = 0;
   for (const candidate of ranked) {
     const reusable = await reuseExistingReleaseDownload(id, candidate.release);
     if (reusable) return { grabbed: true, release: candidate.release, decision: candidate.decision, download: reusable, reused: true };
+    if (attemptedFetches >= MOVIE_NZB_FETCH_ATTEMPTS_PER_PASS) {
+      rejected.push(`stopped after ${MOVIE_NZB_FETCH_ATTEMPTS_PER_PASS} NZB fetch attempt for this pass; retry rotates next cycle`);
+      break;
+    }
+    attemptedFetches += 1;
     let download: Awaited<ReturnType<typeof addNzbFromPath>>;
     try {
       const nzb = await downloadNzb(settings, candidate.release);
@@ -1295,24 +1395,32 @@ export async function grabBestForRequest(id: string, options?: { priorityBoost?:
     } catch (error) {
       const message = error instanceof Error ? error.message : "failed to fetch or import NZB";
       rejected.push(`${candidate.release.title}: ${message}`);
-      await createBlocklistItem({
+      const blocklisted = await maybeBlocklistGrabFailure({
         guid: candidate.release.guid ? String(candidate.release.guid) : undefined,
         title: candidate.release.title,
-        reason: blockReasonFromFailure(message),
+        reason: message,
         source: "grab-validation",
         release: candidate.release
-      }).catch(() => undefined);
+      });
+      if (!blocklisted) {
+        await markRequestGrabCooldown(id).catch(() => undefined);
+        return { grabbed: false, reason: message, rejected, transient: true };
+      }
       continue;
     }
     if (download.status === "failed") {
       rejected.push(`${candidate.release.title}: ${download.error ?? "failed before queueing"}`);
-      await createBlocklistItem({
+      const blocklisted = await maybeBlocklistGrabFailure({
         guid: candidate.release.guid ? String(candidate.release.guid) : undefined,
         title: candidate.release.title,
-        reason: blockReasonFromFailure(download.error),
+        reason: download.error,
         source: "grab-validation",
         release: candidate.release
-      }).catch(() => undefined);
+      });
+      if (!blocklisted) {
+        await markRequestGrabCooldown(id).catch(() => undefined);
+        return { grabbed: false, reason: download.error ?? "temporary fetch failure", rejected, transient: true };
+      }
       continue;
     }
     await prisma.mediaRequest.update({
@@ -1323,16 +1431,20 @@ export async function grabBestForRequest(id: string, options?: { priorityBoost?:
     return { grabbed: true, release: candidate.release, decision: candidate.decision, download };
   }
 
+  await markRequestGrabCooldown(id).catch(() => undefined);
+  if (options?.cachedOnly) {
+    return { grabbed: false, reason: "all acceptable cached releases failed before queueing", rejected };
+  }
   await prisma.mediaRequest.update({ where: { id }, data: { status: "no_release_found", downloadId: null } });
   await refreshMediaLibrary().catch(() => undefined);
   return { grabbed: false, reason: "all acceptable releases failed before queueing", rejected };
 }
 
-export async function grabMissingTvForRequest(id: string, options?: { priorityBoost?: number }) {
+export async function grabMissingTvForRequest(id: string, options?: { priorityBoost?: number; cachedOnly?: boolean }) {
   const request = await getRequest(id);
-  if (request.mediaType !== "tv") return grabBestForRequest(id);
+  if (request.mediaType !== "tv") return grabBestForRequest(id, options);
   const seasons = await monitoredSeasonNumbersForRequest(request);
-  if (seasons.length === 0) return grabBestForRequest(id);
+  if (seasons.length === 0) return grabBestForRequest(id, options);
   const requestedEpisodes = requestedEpisodesBySeason(request.episodes);
   const seasonEpisodeCounts = new Map(
     Array.isArray(request.seasons)
@@ -1367,7 +1479,8 @@ export async function grabMissingTvForRequest(id: string, options?: { priorityBo
     query: request.title,
     imdbId: request.imdbId ?? undefined,
     tmdbId: request.tmdbId ?? undefined,
-    tvdbId: request.tvdbId ?? undefined
+    tvdbId: request.tvdbId ?? undefined,
+    cachedOnly: options?.cachedOnly
   }).catch(() => []);
   const results = [];
   for (const { season, existingEpisodes, requestedSeasonEpisodes } of seasonsForThisPass) {
@@ -1403,7 +1516,9 @@ export async function grabMissingTvForRequest(id: string, options?: { priorityBo
             ? "grabbed"
             : grabbedResults.length > 0
               ? "grabbed"
-              : "no_release_found",
+              : options?.cachedOnly
+                ? "approved"
+                : "no_release_found",
       downloadId: activeDownloadId
     }
   });
@@ -1499,7 +1614,7 @@ async function grabBestTvSeasonForRequest(
   existingEpisodes = new Set<number>(),
   requestedEpisodes?: Set<number>,
   releasePool?: Parameters<typeof scoreRelease>[0][],
-  options?: { priorityBoost?: number }
+  options?: { priorityBoost?: number; cachedOnly?: boolean }
 ) {
   if (await seasonSearchCoolingDown(request.id, season)) {
     return { grabbed: false, reason: "season search cooling down after recent unsuccessful attempt", queued: [], rejected: [] };
@@ -1538,7 +1653,8 @@ async function grabBestTvSeasonForRequest(
         imdbId: request.imdbId ?? undefined,
         tmdbId: request.tmdbId ?? undefined,
         tvdbId: request.tvdbId ?? undefined,
-        season
+        season,
+        cachedOnly: options?.cachedOnly
       });
   const scored = await Promise.all(
     releases.map(async (release) => ({
@@ -1550,16 +1666,28 @@ async function grabBestTvSeasonForRequest(
   );
   const accepted = scored.filter((item) => item.decision.accepted).sort((a, b) => b.decision.score - a.decision.score);
   const seasonPacks = accepted.filter((item) => isSeasonPackTitle(item.release.title, season));
-  const queued = [];
+  const queued: Array<Awaited<ReturnType<typeof queueReleaseForRequest>>> = [];
   const rejected: string[] = [];
+  let nzbFetchAttempts = 0;
 
   for (const candidate of seasonPacks) {
     const result = await queueReleaseForRequest(request.id, candidate, options);
+    if (result.attemptedFetch) nzbFetchAttempts += 1;
     if (result.grabbed) {
       queued.push(result);
       return { grabbed: true, mode: "season_pack", queued, rejected };
     }
     rejected.push(`${candidate.release.title}: ${result.reason ?? "failed before queueing"}`);
+    if (result.retryableFailure) {
+      rejected.push("season pass cooling down after temporary NZB fetch failure");
+      await markSeasonSearchCooldown(request.id, season);
+      return { grabbed: false, reason: result.reason ?? "temporary NZB fetch failure", queued, rejected, transient: true };
+    }
+    if (nzbFetchAttempts >= TV_NZB_FETCH_ATTEMPTS_PER_SEASON_PASS) {
+      rejected.push(`stopped after ${TV_NZB_FETCH_ATTEMPTS_PER_SEASON_PASS} NZB fetch attempt for this season pass; retry rotates next cycle`);
+      await markSeasonSearchCooldown(request.id, season);
+      return { grabbed: false, reason: "season pass cooling down after failed grab attempt", queued, rejected };
+    }
   }
 
   const episodeCandidates = bestEpisodeCandidates(accepted, season, existingEpisodes, eligibleRequestedEpisodes);
@@ -1572,7 +1700,8 @@ async function grabBestTvSeasonForRequest(
     remainingExistingEpisodes,
     eligibleRequestedEpisodes,
     seasonEpisodeCount,
-    releases
+    releases,
+    options
   );
   const fallbackEpisodeCandidates = [...episodeCandidates, ...separatelySearchedEpisodes];
   for (const candidate of fallbackEpisodeCandidates) {
@@ -1580,12 +1709,36 @@ async function grabBestTvSeasonForRequest(
       rejected.push(`stopped after ${TV_EPISODE_DOWNLOADS_PER_REQUEST_PASS} queued episode candidates; remaining episodes rotate next monitor pass`);
       break;
     }
+    if (nzbFetchAttempts >= TV_NZB_FETCH_ATTEMPTS_PER_SEASON_PASS) {
+      rejected.push(`stopped after ${TV_NZB_FETCH_ATTEMPTS_PER_SEASON_PASS} NZB fetch attempt for this season pass; retry rotates next cycle`);
+      break;
+    }
     const result = await queueReleaseForRequest(request.id, candidate, options);
+    if (result.attemptedFetch) nzbFetchAttempts += 1;
     if (result.grabbed) queued.push(result);
     else rejected.push(`${candidate.release.title}: ${result.reason ?? "failed before queueing"}`);
+    if (!result.grabbed && result.retryableFailure) {
+      rejected.push("season pass cooling down after temporary NZB fetch failure");
+      await markSeasonSearchCooldown(request.id, season);
+      break;
+    }
+    if (!result.grabbed && result.attemptedFetch && nzbFetchAttempts >= TV_NZB_FETCH_ATTEMPTS_PER_SEASON_PASS) {
+      rejected.push(`season pass cooling down after failed grab attempt`);
+      break;
+    }
   }
 
   if (queued.length > 0) return { grabbed: true, mode: seasonPacks.length > 0 ? "episodes_after_season_pack_failure" : "episodes", queued, rejected };
+  if (options?.cachedOnly) {
+    return {
+      grabbed: false,
+      reason: seasonPacks.length > 0
+        ? "all acceptable cached season packs and episode releases failed before queueing"
+        : "no acceptable cached season or episode release found",
+      queued,
+      rejected
+    };
+  }
   await markSeasonSearchCooldown(request.id, season);
   return {
     grabbed: false,
@@ -1633,7 +1786,8 @@ async function searchEpisodesForSeason(
   existingEpisodes = new Set<number>(),
   requestedEpisodes?: Set<number>,
   seasonEpisodeCount?: number,
-  releasePool?: Parameters<typeof scoreRelease>[0][]
+  releasePool?: Parameters<typeof scoreRelease>[0][],
+  options?: { cachedOnly?: boolean }
 ) {
   const targets = requestedEpisodes && requestedEpisodes.size > 0
     ? [...requestedEpisodes].filter((episode) => !existingEpisodes.has(episode))
@@ -1658,6 +1812,8 @@ async function searchEpisodesForSeason(
       else networkSearches += 1;
       const releases = cachedEpisodeReleases.length > 0
         ? cachedEpisodeReleases
+        : options?.cachedOnly
+          ? []
         : await runSearch({
             kind: "episode",
             query: request.title,
@@ -1730,18 +1886,27 @@ function titleSearchClauses(title: string) {
 }
 
 function isSeasonPackTitle(title: string, season: number) {
-  return titleCoversSeason(title, season) && !episodePattern(season).test(title);
+  const parsed = parseReleaseTitle(title);
+  return parsed.season === season && parsed.isSeasonPack;
 }
 
 function releaseBelongsToSeason(title: string, season: number) {
-  return titleCoversSeason(title, season) || episodePattern(season).test(title);
+  const parsed = parseReleaseTitle(title);
+  return parsed.season === season || titleCoversSeason(title, season) || episodePattern(season).test(title);
 }
 
 function releaseBelongsToEpisode(title: string, season: number, episode: number) {
+  const parsed = parseReleaseTitle(title);
+  if (parsed.season === season && parsed.episode === episode) return true;
+  if (parsed.season === season && parsed.isMultiEpisode && parsed.episode && parsed.episodeEnd) {
+    return episode >= parsed.episode && episode <= parsed.episodeEnd;
+  }
   return episodesCoveredByTitle(title, season).has(episode);
 }
 
 function episodeNumberFromTitle(title: string, season: number) {
+  const parsed = parseReleaseTitle(title);
+  if (parsed.season === season && parsed.episode) return parsed.episode;
   return [...episodesCoveredByTitle(title, season)].sort((a, b) => a - b)[0];
 }
 
@@ -1793,12 +1958,36 @@ function seasonCooldownKey(requestId: string, season: number) {
   return `request:season-search-cooldown:${requestId}:${season}`;
 }
 
+function requestGrabCooldownKey(requestId: string) {
+  return `request:grab-cooldown:${requestId}`;
+}
+
+function wantedSearchCooldownKey(requestId: string) {
+  return `request:wanted-search-cooldown:${requestId}`;
+}
+
 async function seasonSearchCoolingDown(requestId: string, season: number) {
   return Boolean(await redis.get(seasonCooldownKey(requestId, season)));
 }
 
 async function markSeasonSearchCooldown(requestId: string, season: number) {
   await redis.set(seasonCooldownKey(requestId, season), "1", "EX", SEARCH_COOLDOWN_SECONDS);
+}
+
+async function requestGrabCoolingDown(requestId: string) {
+  return Boolean(await redis.get(requestGrabCooldownKey(requestId)));
+}
+
+async function markRequestGrabCooldown(requestId: string) {
+  await redis.set(requestGrabCooldownKey(requestId), "1", "EX", REQUEST_GRAB_COOLDOWN_SECONDS);
+}
+
+async function wantedSearchCoolingDown(requestId: string) {
+  return Boolean(await redis.get(wantedSearchCooldownKey(requestId)));
+}
+
+async function markWantedSearchCooldown(requestId: string) {
+  await redis.set(wantedSearchCooldownKey(requestId), "1", "EX", REQUEST_WANTED_SEARCH_COOLDOWN_SECONDS);
 }
 
 async function queueReleaseForRequest(
@@ -1812,10 +2001,12 @@ async function queueReleaseForRequest(
     if (options?.priorityBoost && reusable.status !== "downloading") {
       await promoteDownloadPriority(reusable.id, options.priorityBoost).catch(() => undefined);
     }
-    return { grabbed: true, release: candidate.release, decision: candidate.decision, download: reusable, reused: true };
+    return { grabbed: true, release: candidate.release, decision: candidate.decision, download: reusable, reused: true, attemptedFetch: false };
   }
+  let attemptedFetch = false;
   let download: Awaited<ReturnType<typeof addNzbFromPath>>;
   try {
+    attemptedFetch = true;
     const nzb = await downloadNzb(settings, candidate.release);
     download = await addNzbFromPath(nzb.primaryPath, candidate.release.title, {
       guid: candidate.release.guid ? String(candidate.release.guid) : undefined,
@@ -1824,31 +2015,31 @@ async function queueReleaseForRequest(
     });
   } catch (error) {
     const message = error instanceof Error ? error.message : "failed to fetch or import NZB";
-    await createBlocklistItem({
+    const blocklisted = await maybeBlocklistGrabFailure({
       guid: candidate.release.guid ? String(candidate.release.guid) : undefined,
       title: candidate.release.title,
-      reason: blockReasonFromFailure(message),
+      reason: message,
       source: "grab-validation",
       release: candidate.release
-    }).catch(() => undefined);
-    return { grabbed: false, reason: message };
+    });
+    return { grabbed: false, reason: message, attemptedFetch, retryableFailure: !blocklisted };
   }
   if (download.status === "failed") {
-    await createBlocklistItem({
+    const blocklisted = await maybeBlocklistGrabFailure({
       guid: candidate.release.guid ? String(candidate.release.guid) : undefined,
       title: candidate.release.title,
-      reason: blockReasonFromFailure(download.error),
+      reason: download.error,
       source: "grab-validation",
       release: candidate.release
-    }).catch(() => undefined);
-    return { grabbed: false, reason: download.error ?? "failed before queueing", download };
+    });
+    return { grabbed: false, reason: download.error ?? "failed before queueing", download, attemptedFetch, retryableFailure: !blocklisted };
   }
   await prisma.mediaRequest.update({
     where: { id: requestId },
     data: { status: requestStatusForDownloadStatus(download.status), selectedRelease: jsonValue(candidate.release), downloadId: download.id }
   });
   await refreshMediaLibrary().catch(() => undefined);
-  return { grabbed: true, release: candidate.release, decision: candidate.decision, download };
+  return { grabbed: true, release: candidate.release, decision: candidate.decision, download, attemptedFetch };
 }
 
 export async function grabReleaseForRequest(id: string, release: unknown) {
@@ -1882,19 +2073,51 @@ export async function grabReleaseForRequest(id: string, release: unknown) {
   const reusable = await reuseExistingReleaseDownload(id, typedRelease);
   if (reusable) return { grabbed: true, release: typedRelease, decision, download: reusable, reused: true };
 
-  const nzb = await downloadNzb(settings, typedRelease);
-  const download = await addNzbFromPath(nzb.primaryPath, typedRelease.title, {
-    guid: typedRelease.guid ? String(typedRelease.guid) : undefined,
-    requestId: id
-  });
-  if (download.status === "failed") {
-    await createBlocklistItem({
+  let download: Awaited<ReturnType<typeof addNzbFromPath>>;
+  try {
+    const nzb = await downloadNzb(settings, typedRelease);
+    download = await addNzbFromPath(nzb.primaryPath, typedRelease.title, {
+      guid: typedRelease.guid ? String(typedRelease.guid) : undefined,
+      requestId: id
+    });
+  } catch (error) {
+    const message = error instanceof Error ? error.message : "failed to fetch or import NZB";
+    const blocklisted = await maybeBlocklistGrabFailure({
       guid: typedRelease.guid ? String(typedRelease.guid) : undefined,
       title: typedRelease.title,
-      reason: blockReasonFromFailure(download.error),
+      reason: message,
       source: "manual-grab-validation",
       release: typedRelease
+    });
+    await markRequestGrabCooldown(id).catch(() => undefined);
+    await prisma.mediaRequest.update({
+      where: { id },
+      data: {
+        status: blocklisted ? "release_failed" : "approved",
+        selectedRelease: blocklisted ? jsonValue(typedRelease) : Prisma.JsonNull,
+        downloadId: null
+      }
     }).catch(() => undefined);
+    await refreshMediaLibrary().catch(() => undefined);
+    return { grabbed: false, transient: !blocklisted, reason: message, release: typedRelease };
+  }
+  if (download.status === "failed") {
+    const blocklisted = await maybeBlocklistGrabFailure({
+      guid: typedRelease.guid ? String(typedRelease.guid) : undefined,
+      title: typedRelease.title,
+      reason: download.error,
+      source: "manual-grab-validation",
+      release: typedRelease
+    });
+    if (!blocklisted) {
+      await markRequestGrabCooldown(id).catch(() => undefined);
+      await prisma.mediaRequest.update({
+        where: { id },
+        data: { status: "approved", selectedRelease: Prisma.JsonNull, downloadId: null }
+      }).catch(() => undefined);
+      await refreshMediaLibrary().catch(() => undefined);
+      return { grabbed: false, transient: true, reason: download.error ?? "temporary fetch failure", release: typedRelease };
+    }
     await prisma.mediaRequest.update({
       where: { id },
       data: { status: "release_failed", selectedRelease: jsonValue(typedRelease), downloadId: null }
@@ -1951,8 +2174,15 @@ export async function refreshRequest(id: string) {
 
 export async function markRequestAvailable(id: string) {
   const request = await getRequest(id);
-  if (!request.provider) throw new Error("request has no provider");
-  return updateProviderAvailable(request.provider, request.externalId);
+  const nextStatus = request.mediaType === "tv"
+    ? await tvRequestAvailabilitySummary(request).then((summary) => summary.hasMissingEpisodes ? "grabbed" : "available").catch(() => "available")
+    : "available";
+  const updated = await prisma.mediaRequest.update({
+    where: { id },
+    data: { status: nextStatus }
+  });
+  await refreshMediaLibrary().catch(() => undefined);
+  return { ok: true, localOnly: true, status: updated.status };
 }
 
 async function resolveProfile(profileId: string | null | undefined, mediaType: string) {

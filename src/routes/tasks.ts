@@ -17,7 +17,7 @@ import { migrateImportsToCurrentNaming, repairSuspiciousImports } from "../impor
 import { runBackgroundRepairSweep } from "../repair/repairService.js";
 import { runDeferredRequestRecovery, runImportReconcileCycle, runInterruptedRecoveryCycle, runLogPruneCycle, runNzbhydraRssSyncCycle, runRequestSyncCycle } from "../requests/sync/scheduler.js";
 import { refreshMediaLibrary } from "../media-library/libraryService.js";
-import { cleanupSymlinks, pruneLibraryDirectories } from "../symlinks/symlinkService.js";
+import { cleanupSymlinks, pruneLibraryDirectories, removeStaleLibraryFilesystemEntries } from "../symlinks/symlinkService.js";
 import { normalizeNzbStoragePaths } from "../downloads/downloadService.js";
 import {
   reconcileDownloadQueueState,
@@ -66,11 +66,12 @@ async function executeManualTask(id: string, app: FastifyInstance) {
     case LIBRARY_CLEANUP_TASK_ID:
       return runTrackedTask(id, async () => {
         const symlinkCleanup = await cleanupSymlinks();
+        const staleFilesystem = await removeStaleLibraryFilesystemEntries();
         const pruned = await pruneLibraryDirectories();
         const nzbPaths = await normalizeNzbStoragePaths();
         const suspicious = await repairSuspiciousImports({ limit: 50 });
         await refreshMediaLibrary();
-        return { symlinkCleanup, pruned, nzbPaths, suspicious };
+        return { symlinkCleanup, staleFilesystem, pruned, nzbPaths, suspicious };
       });
     case LOG_PRUNE_TASK_ID:
       return runLogPruneCycle(app.log);

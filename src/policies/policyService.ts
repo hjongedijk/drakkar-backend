@@ -37,6 +37,7 @@ export const blockReasonSchema = z.enum([
   "quality_rejected",
   "ignored_file_only",
   "unsupported_archive",
+  "grab_failed",
   "import_failed"
 ]);
 
@@ -112,7 +113,7 @@ export const DEFAULT_POLICIES: PolicySettings = {
     noEligibleFiles: "remove_blocklist_and_search",
     episodeAlreadyImported: "remove",
     noAudioTracks: "remove_blocklist_and_search",
-    invalidSeasonEpisode: "do_nothing",
+    invalidSeasonEpisode: "remove_blocklist_and_search",
     singleEpisodeContainsSeason: "do_nothing",
     unableToDetermineSample: "do_nothing",
     sample: "remove_blocklist_and_search",
@@ -584,7 +585,7 @@ export function classifyQueueDecisionKey(message: string): QueueDecisionKey | nu
   if (/no audio/.test(normalized)) return "noAudioTracks";
   if (/sample/.test(normalized)) return "sample";
   if (/archive|rar|7z|zip/.test(normalized)) return "archiveNeedsExtraction";
-  if (/invalid season|invalid episode|season\/episode mismatch/.test(normalized)) return "invalidSeasonEpisode";
+  if (/invalid season|invalid episode|season\/episode mismatch|cannot be symlinked without a valid season and episode/.test(normalized)) return "invalidSeasonEpisode";
   if (/not movie upgrade/.test(normalized)) return "notMovieUpgrade";
   if (/not episode upgrade/.test(normalized)) return "notEpisodeUpgrade";
   if (/not custom format upgrade/.test(normalized)) return "notCustomFormatUpgrade";

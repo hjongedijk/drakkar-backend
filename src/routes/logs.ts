@@ -9,6 +9,37 @@ type LogRow = {
   message: string;
 };
 
+function humanizeBlockReason(value: string) {
+  return value
+    .replace(/_/g, " ")
+    .replace(/\b([a-z])/g, (_, letter: string) => letter.toUpperCase());
+}
+
+function searchMessage(search: {
+  type: string;
+  resultCount: number;
+  status: string;
+  message: string | null;
+  query: unknown;
+}) {
+  const query = search.query && typeof search.query === "object" ? search.query as Record<string, unknown> : null;
+  const title = typeof query?.query === "string" ? query.query : typeof query?.title === "string" ? query.title : undefined;
+  const season = typeof query?.season === "number" ? query.season : undefined;
+  const episode = typeof query?.episode === "number" ? query.episode : undefined;
+  const target = [
+    title,
+    season != null ? `S${String(season).padStart(2, "0")}` : null,
+    episode != null ? `E${String(episode).padStart(2, "0")}` : null
+  ].filter(Boolean).join(" ");
+  if (search.message === "merged fallback without strict IDs") {
+    return `${search.type} search${target ? ` for ${target}` : ""} merged fallback search and returned ${search.resultCount} result(s)`;
+  }
+  if (search.message) {
+    return `${search.type} search${target ? ` for ${target}` : ""}: ${search.message}`;
+  }
+  return `${search.type} search${target ? ` for ${target}` : ""} returned ${search.resultCount} result(s)`;
+}
+
 async function buildLogRows() {
   const [downloads, repairs, searches, blocklist] = await Promise.all([
     prisma.download.findMany({ orderBy: { updatedAt: "desc" }, take: 100 }),
@@ -16,6 +47,13 @@ async function buildLogRows() {
     prisma.searchHistory.findMany({ orderBy: { createdAt: "desc" }, take: 100 }),
     prisma.blocklistItem.findMany({ orderBy: { createdAt: "desc" }, take: 100 })
   ]);
+
+  const visibleSearches = searches.filter((search) => {
+    if (search.status === "error") return true;
+    if (search.resultCount > 0) return true;
+    if (search.message) return /fallback|merged|error|failed/i.test(search.message);
+    return false;
+  });
 
   const rows: LogRow[] = [
     ...downloads.map((download) => ({
@@ -32,19 +70,19 @@ async function buildLogRows() {
       service: "repair",
       message: job.message ?? `${job.type} ${job.status}`
     })),
-    ...searches.map((search) => ({
+    ...visibleSearches.map((search) => ({
       id: search.id,
       time: search.createdAt,
       level: search.status === "error" ? "error" as const : "info" as const,
       service: "search",
-      message: search.message ?? `${search.type} returned ${search.resultCount} result(s)`
+      message: searchMessage(search)
     })),
     ...blocklist.map((item) => ({
       id: item.id,
       time: item.createdAt,
       level: "warn" as const,
       service: "blocklist",
-      message: `${item.title}: ${item.reason}`
+      message: `${item.title}: ${humanizeBlockReason(item.reason)}`
     }))
   ];
 

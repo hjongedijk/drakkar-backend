@@ -2,6 +2,7 @@ import { open, mkdir } from "node:fs/promises";
 import { join } from "node:path";
 import type { FastifyBaseLogger } from "fastify";
 import { prisma } from "../db/prisma.js";
+import { redis } from "../db/redis.js";
 import { env } from "../config/env.js";
 import { decodeYencBufferLine } from "./yenc.js";
 import { NntpClient } from "./nntpClient.js";
@@ -17,6 +18,11 @@ export { filenameFromSubject } from "./filename.js";
 const DOWNLOAD_PROGRESS_UPDATE_INTERVAL_MS = 3000;
 const DOWNLOAD_PROGRESS_UPDATE_BYTES = 8 * 1024 * 1024;
 const DOWNLOAD_WRITE_BATCH_BYTES = 4 * 1024 * 1024;
+const MISSING_ARTICLE_CACHE_TTL_SECONDS = 24 * 60 * 60;
+const ARTICLE_VERIFY_CONCURRENCY = 2;
+const MAX_STREAM_VERIFY_SEGMENTS = 256;
+const STREAM_VERIFY_POOL_MAX_CONNECTIONS = 2;
+const DOWNLOAD_PRECHECK_POOL_MAX_CONNECTIONS = 4;
 
 async function loadNzbDocument(id: string) {
   return prisma.nzbDocument.findUnique({
@@ -56,6 +62,94 @@ function isProviderConnectionLimit(message: string) {
 
 function isLikelyMediaSubject(subject: string) {
   return /\.(mkv|mp4|avi|mov|m4v|ts)(?:["_\s).]|$)/i.test(subject);
+}
+
+function isLikelyArchiveSubject(subject: string) {
+  return /\.(rar|r\d{2,3}|zip|7z)(?:["_\s).]|$)/i.test(subject) || /\.part\d+\.rar/i.test(subject);
+}
+
+function normalizeArticleId(articleId: string) {
+  return articleId.startsWith("<") && articleId.endsWith(">") ? articleId.slice(1, -1) : articleId;
+}
+
+function missingArticleCacheKey(articleId: string) {
+  return `usenet:missing-article:${normalizeArticleId(articleId)}`;
+}
+
+function isMissingArticleError(message: string) {
+  return /\b430\b|no such article|article.*not found|missing article|missing segment/i.test(message);
+}
+
+async function markArticleMissing(articleId: string) {
+  await redis.set(missingArticleCacheKey(articleId), "1", "EX", MISSING_ARTICLE_CACHE_TTL_SECONDS).catch(() => undefined);
+}
+
+async function assertNoCachedMissingArticles(articleIds: string[]) {
+  const uniqueIds = [...new Set(articleIds.map(normalizeArticleId).filter(Boolean))];
+  if (uniqueIds.length === 0) return;
+  const cached = await redis.mget(uniqueIds.map(missingArticleCacheKey)).catch(() => []);
+  const missingIndex = cached.findIndex((value) => value);
+  if (missingIndex >= 0) {
+    throw new Error(`Known missing article detected from cache for ${uniqueIds[missingIndex]}`);
+  }
+}
+
+function selectSegmentsForAvailabilityCheck(nzb: NzbWithFiles, maxSegments: number) {
+  const prioritizedFiles = nzb.files
+    .filter((file) => file.segments.length > 0)
+    .map((file, fileIndex) => ({
+      file,
+      fileIndex,
+      filename: filenameFromSubject(file.subject, fileIndex)
+    }))
+    .sort((left, right) => {
+      const leftWeight = Number(isLikelyMediaSubject(left.filename) || isLikelyArchiveSubject(left.filename));
+      const rightWeight = Number(isLikelyMediaSubject(right.filename) || isLikelyArchiveSubject(right.filename));
+      if (leftWeight !== rightWeight) return rightWeight - leftWeight;
+      return right.file.size - left.file.size;
+    });
+
+  const selected: string[] = [];
+  for (const entry of prioritizedFiles) {
+    for (const segment of entry.file.segments) {
+      selected.push(segment.articleId);
+      if (selected.length >= maxSegments) return selected;
+    }
+  }
+  return selected;
+}
+
+async function verifyArticleAvailability(input: {
+  articleIds: string[];
+  pool: NntpPool;
+  logger: FastifyBaseLogger;
+  label: string;
+  maxConcurrency?: number;
+}) {
+  const uniqueIds = [...new Set(input.articleIds.map(normalizeArticleId).filter((value): value is string => Boolean(value)))];
+  if (uniqueIds.length === 0) return 0;
+  let nextIndex = 0;
+
+  async function worker() {
+    while (nextIndex < uniqueIds.length) {
+      const current = uniqueIds[nextIndex];
+      nextIndex += 1;
+      if (!current) continue;
+      try {
+        await input.pool.stat(current);
+      } catch (error) {
+        const message = error instanceof Error ? error.message : "segment availability check failed";
+        if (isMissingArticleError(message)) await markArticleMissing(current);
+        input.logger.warn({ articleId: current, label: input.label, err: error }, "article availability precheck failed");
+        throw error;
+      }
+    }
+  }
+
+  await Promise.all(
+    Array.from({ length: Math.min(input.maxConcurrency ?? ARTICLE_VERIFY_CONCURRENCY, uniqueIds.length) }, () => worker())
+  );
+  return uniqueIds.length;
 }
 
 function sampleSegmentsForDecodeCheck(nzb: NzbWithFiles) {
@@ -205,6 +299,7 @@ class NntpPool {
         return await collectDecodedArticleBody(slot.client, articleId);
       } catch (error) {
         const message = error instanceof Error ? error.message : "unknown NNTP error";
+        if (isMissingArticleError(message)) await markArticleMissing(articleId);
         errors.push(`${slot.provider.name}: ${message}`);
         this.logger.warn({ provider: slot.provider.name, articleId, attempt, err: error }, "segment download failed");
         await slot.client?.quit().catch(() => undefined);
@@ -251,6 +346,7 @@ class NntpPool {
         return;
       } catch (error) {
         const message = error instanceof Error ? error.message : "unknown NNTP error";
+        if (isMissingArticleError(message)) await markArticleMissing(articleId);
         errors.push(`${slot.provider.name}: ${message}`);
         this.logger.warn({ provider: slot.provider.name, articleId, attempt, err: error }, "segment availability check failed");
         await slot.client?.quit().catch(() => undefined);
@@ -301,6 +397,7 @@ class NntpPool {
         return;
       } catch (error) {
         const message = error instanceof Error ? error.message : "unknown NNTP error";
+        if (isMissingArticleError(message)) await markArticleMissing(articleId);
         errors.push(`${slot.provider.name}: ${message}`);
         this.logger.warn({ provider: slot.provider.name, articleId, attempt, err: error }, "segment stream failed");
         await slot.client?.quit().catch(() => undefined);
@@ -567,15 +664,33 @@ export async function prepareNzbDocumentForStreaming(input: {
   });
 
   const allowedConnections = input.maxConnectionsOverride ?? await getAllowedDownloadConnections();
-  const pool = new NntpPool(providers, Math.max(1, allowedConnections), input.logger, input.downloadId, "verifying");
+  const pool = new NntpPool(
+    providers,
+    Math.max(1, Math.min(STREAM_VERIFY_POOL_MAX_CONNECTIONS, allowedConnections)),
+    input.logger,
+    input.downloadId,
+    "verifying"
+  );
   const totalSize = nzb.totalSize;
   let verified = 0;
   let verifiedBytes = 0;
+  let verifiedArticleCount = 0;
   let lastProgressUpdateAt = 0;
   let lastProgressPersistedBytes = 0;
   const startedAt = Date.now();
 
+  await assertNoCachedMissingArticles(nzb.files.flatMap((file) => file.segments.map((segment) => segment.articleId)));
+
   const decodeSamples = sampleSegmentsForDecodeCheck(nzb);
+  const availabilitySegments = selectSegmentsForAvailabilityCheck(nzb, MAX_STREAM_VERIFY_SEGMENTS);
+  verifiedArticleCount = await verifyArticleAvailability({
+    articleIds: availabilitySegments,
+    pool,
+    logger: input.logger,
+    label: "streaming",
+    maxConcurrency: ARTICLE_VERIFY_CONCURRENCY
+  });
+  await updateProgress(true);
   for (const segment of decodeSamples) {
     const decoded = await pool.article(segment.articleId);
     if (decoded.length === 0) throw new Error(`decoded media sample is empty for ${segment.articleId}`);
@@ -618,7 +733,7 @@ export async function prepareNzbDocumentForStreaming(input: {
       where: { id: input.downloadId },
       data: { status: "prepared", progress: 99, downloaded: verifiedBytes, speedBytesSec: 0, etaSeconds: null, error: null }
     });
-    return { status: "prepared", verifiedSegments: verified };
+    return { status: "prepared", verifiedSegments: verified, verifiedArticles: verifiedArticleCount };
   } catch (error) {
     const rawMessage = error instanceof Error ? error.message : "stream preparation failed";
     const message = humanizeDownloadError(rawMessage) ?? rawMessage;
@@ -684,6 +799,29 @@ export async function downloadNzbDocument(input: { downloadId: string; nzbDocume
   let downloaded = 0;
   const startedAt = Date.now();
   try {
+    await assertNoCachedMissingArticles(nzb.files.flatMap((file) => file.segments.map((segment) => segment.articleId)));
+    const availabilitySegments = nzb.files.flatMap((file) => file.segments.map((segment) => segment.articleId));
+    const precheckPool = new NntpPool(
+      providers,
+      Math.max(1, Math.min(DOWNLOAD_PRECHECK_POOL_MAX_CONNECTIONS, allowedConnections)),
+      input.logger,
+      `${input.downloadId}:precheck`,
+      "verifying"
+    );
+    const checkedArticles = await (async () => {
+      try {
+        return await verifyArticleAvailability({
+          articleIds: availabilitySegments,
+          pool: precheckPool,
+          logger: input.logger,
+          label: "download",
+          maxConcurrency: ARTICLE_VERIFY_CONCURRENCY
+        });
+      } finally {
+        await precheckPool.close();
+      }
+    })();
+    input.logger.info({ downloadId: input.downloadId, checkedArticles }, "article availability precheck completed");
     for (const [fileIndex, file] of nzb.files.entries()) {
       const result = await reconstructFile({ ...input, nzb, file, fileIndex, pool, downloadedBefore: downloaded, startedAt });
       downloaded += result.bytes;

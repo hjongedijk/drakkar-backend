@@ -3,7 +3,7 @@ import { dirname, extname, join, relative } from "node:path";
 import { Prisma, type ImportItem } from "@prisma/client";
 import { env } from "../config/env.js";
 import { prisma } from "../db/prisma.js";
-import { canonicalizeDisplayTitle, inferMediaIdentity, normalizeTitleForIdentity } from "../media-library/identity.js";
+import { canonicalizeDisplayTitle, inferMediaIdentity, normalizeTitleForIdentity, titlesLikelyMatch } from "../media-library/identity.js";
 import { fetchMediaMetadata, fetchSeriesStructure } from "../metadata/metadataService.js";
 import { completedPathToVfsPath, getNamingSettings, libraryPathFor } from "../naming/namingService.js";
 import { getPolicySettings } from "../policies/policyService.js";
@@ -61,6 +61,7 @@ export async function resolveImportMedia(item: ImportItem) {
   const request = item.requestId ? await prisma.mediaRequest.findUnique({ where: { id: item.requestId } }) : null;
   const download = item.downloadId ? await prisma.download.findUnique({ where: { id: item.downloadId } }) : null;
   const settings = await getSettings();
+  const requestForcesMovie = request?.mediaType === "movie";
   const compactTitle = item.title.trim();
   const releaseStyleTitle = /\bS\d{1,2}E\d{1,4}(?:E\d{1,4}|[- .]E?\d{1,4})?\b/i.test(item.title)
     && /\b(2160p|1080p|720p|web-?dl|webrip|bluray|h\.?264|x264|x265|hevc|ddp|dts)\b/i.test(item.title);
@@ -71,21 +72,27 @@ export async function resolveImportMedia(item: ImportItem) {
     || releaseStyleTitle
     || /\($/.test(item.title.trim());
   const downloadIdentity = download?.title ? inferMediaIdentity(download.title) : null;
-  const shouldTrustDownloadIdentity = suspiciousTitle
+  const shouldTrustDownloadIdentity = !requestForcesMovie && (
+    suspiciousTitle
     || (item.mediaType === "movie" && (item.season !== null || item.episode !== null))
-    || downloadIdentity?.mediaType === "tv";
-  const inferredIdentity = item.mediaType === "tv" || shouldTrustDownloadIdentity || downloadIdentity?.mediaType === "tv"
+    || downloadIdentity?.mediaType === "tv"
+  );
+  const inferredIdentity = !requestForcesMovie && (item.mediaType === "tv" || shouldTrustDownloadIdentity || downloadIdentity?.mediaType === "tv")
     ? inferMediaIdentity(`${item.completedPath} ${download?.title ?? ""}`)
     : downloadIdentity;
   const titleFallback = suspiciousTitle
     ? downloadIdentity?.title ?? fallbackMediaTitle(download?.title) ?? item.title
     : item.title;
   const media = {
-    mediaType: shouldTrustDownloadIdentity && downloadIdentity?.mediaType !== "unknown" ? downloadIdentity?.mediaType ?? item.mediaType : item.mediaType,
+    mediaType: requestForcesMovie
+      ? "movie"
+      : shouldTrustDownloadIdentity && downloadIdentity?.mediaType !== "unknown"
+        ? downloadIdentity?.mediaType ?? item.mediaType
+        : item.mediaType,
     title: canonicalizeDisplayTitle(titleFallback, item.year),
     year: item.year ?? (inferredIdentity?.mediaType === "movie" ? inferredIdentity.year : undefined),
-    season: item.season ?? (inferredIdentity?.mediaType === "tv" ? inferredIdentity.season : undefined),
-    episode: item.episode ?? (inferredIdentity?.mediaType === "tv" ? inferredIdentity.episode : undefined),
+    season: requestForcesMovie ? undefined : item.season ?? (inferredIdentity?.mediaType === "tv" ? inferredIdentity.season : undefined),
+    episode: requestForcesMovie ? undefined : item.episode ?? (inferredIdentity?.mediaType === "tv" ? inferredIdentity.episode : undefined),
     tmdbId: undefined as string | undefined,
     tvdbId: undefined as string | undefined
   };
@@ -104,14 +111,7 @@ export async function resolveImportMedia(item: ImportItem) {
     media.year = media.year ?? requestCandidate.year;
     media.tmdbId = requestCandidate.tmdbId ?? media.tmdbId;
     media.tvdbId = requestCandidate.tvdbId ?? media.tvdbId;
-  } else if (
-    request &&
-    request.downloadId &&
-    request.downloadId === item.downloadId &&
-    media.mediaType === "tv" &&
-    media.season != null &&
-    media.episode != null
-  ) {
+  } else if (request && request.downloadId && request.downloadId === item.downloadId) {
     await prisma.$transaction([
       prisma.importItem.update({ where: { id: item.id }, data: { requestId: null } }),
       prisma.mediaRequest.update({
@@ -253,6 +253,12 @@ async function metadataCandidateMatchesMedia(
     tvdbId?: string | null;
   }
 ) {
+  const mediaTitle = normalizeTitleForIdentity(media.title);
+  const candidateTitle = normalizeTitleForIdentity(candidate.title ?? "");
+  if (!mediaTitle || !candidateTitle) return false;
+  const titleMatches = titlesLikelyMatch(media.title, candidate.title ?? "");
+
+  if (!titleMatches) return false;
   if (media.mediaType === "movie") return !(media.year != null && candidate.year != null && media.year !== candidate.year);
   if (media.mediaType !== "tv" || media.season == null || media.episode == null) return true;
   if (!candidate.tmdbId && !candidate.tvdbId) return true;
@@ -535,8 +541,38 @@ async function pruneEmptyTree(root: string) {
   await rmdir(root).catch(() => undefined);
 }
 
+async function removeUntrackedLibraryEntries(root: string, trackedPaths: Set<string>) {
+  const entries = await readdir(root, { withFileTypes: true }).catch(() => []);
+  let removed = 0;
+  for (const entry of entries) {
+    const path = join(root, entry.name);
+    if (entry.isDirectory()) {
+      removed += await removeUntrackedLibraryEntries(path, trackedPaths);
+      const remaining = await readdir(path).catch(() => null);
+      if (remaining && remaining.length === 0) {
+        await rmdir(path).catch(() => undefined);
+      }
+      continue;
+    }
+    if (trackedPaths.has(path)) continue;
+    await rm(path, { force: true }).catch(() => undefined);
+    removed += 1;
+  }
+  return removed;
+}
+
 export async function pruneLibraryDirectories() {
   await pruneEmptyTree(env.MEDIA_MOVIES_DIR);
   await pruneEmptyTree(env.MEDIA_TV_DIR);
   return { ok: true };
+}
+
+export async function removeStaleLibraryFilesystemEntries() {
+  const links = await prisma.symlink.findMany({ select: { linkPath: true } });
+  const trackedPaths = new Set(links.map((link) => link.linkPath));
+  const removedMovies = await removeUntrackedLibraryEntries(env.MEDIA_MOVIES_DIR, trackedPaths);
+  const removedTv = await removeUntrackedLibraryEntries(env.MEDIA_TV_DIR, trackedPaths);
+  await pruneEmptyTree(env.MEDIA_MOVIES_DIR);
+  await pruneEmptyTree(env.MEDIA_TV_DIR);
+  return { removed: removedMovies + removedTv, removedMovies, removedTv };
 }

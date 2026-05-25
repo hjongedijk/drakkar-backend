@@ -38,6 +38,9 @@ export async function pruneLogData(options?: { retentionDays?: number; maxSearch
     prisma.searchHistory.deleteMany({
       where: {
         OR: [
+          { type: "movie", resultCount: 0, status: "ok" },
+          { type: "tv", resultCount: 0, status: "ok" },
+          { type: "season", resultCount: 0, status: "ok" },
           { type: "episode", resultCount: 0 },
           { type: "episode-grab", resultCount: 0 },
           { message: "fallback without strict IDs", resultCount: 0 }

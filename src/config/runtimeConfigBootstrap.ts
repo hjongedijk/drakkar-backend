@@ -9,48 +9,51 @@ function hasValue(value?: string | null) {
   return Boolean(value && value.trim());
 }
 
+function hasConfiguredValue(value?: string | null) {
+  if (!hasValue(value)) return false;
+  return value!.trim().toLowerCase() !== "fill-me";
+}
+
 function runtimeHasCompleteSetup(runtime: ReturnType<typeof ensureRuntimeSettings>) {
-  const hasUsenet = runtime.usenetProviders.some((item) => item.enabled && hasValue(item.name) && hasValue(item.host));
-  const hasRequestProvider = runtime.requestProviders.some((item) => item.enabled && hasValue(item.name) && hasValue(item.baseUrl) && hasValue(item.apiKey));
-  const hasNzbhydra = runtime.nzbhydra.enabled && hasValue(runtime.nzbhydra.url) && hasValue(runtime.nzbhydra.apiKey);
-  const hasMetadata = hasValue(runtime.metadata.tmdbApiKey) || hasValue(runtime.metadata.tvdbApiKey);
-  const hasPlex = runtime.plex.enabled && hasValue(runtime.plex.serverUrl) && hasValue(runtime.plex.token);
+  const hasUsenet = runtime.usenetProviders.some((item) => item.enabled && hasConfiguredValue(item.name) && hasConfiguredValue(item.host));
+  const hasRequestProvider = runtime.requestProviders.some((item) => item.enabled && hasConfiguredValue(item.name) && hasConfiguredValue(item.baseUrl) && hasConfiguredValue(item.apiKey));
+  const hasNzbhydra = runtime.nzbhydra.enabled && hasConfiguredValue(runtime.nzbhydra.url) && hasConfiguredValue(runtime.nzbhydra.apiKey);
+  const hasMetadata = hasConfiguredValue(runtime.metadata.tmdbApiKey) || hasConfiguredValue(runtime.metadata.tvdbApiKey);
+  const hasPlex = runtime.plex.enabled && hasConfiguredValue(runtime.plex.serverUrl) && hasConfiguredValue(runtime.plex.token);
   return hasUsenet && hasRequestProvider && hasNzbhydra && hasMetadata && hasPlex;
 }
 
 export async function bootstrapRuntimeConfiguredServices(log: Logger) {
   const runtime = ensureRuntimeSettings();
   const current = await getSettings();
-  const nzbhydra = runtime.nzbhydra.enabled && hasValue(runtime.nzbhydra.url) && hasValue(runtime.nzbhydra.apiKey)
+  const nzbhydra = runtime.nzbhydra.enabled && hasConfiguredValue(runtime.nzbhydra.url) && hasConfiguredValue(runtime.nzbhydra.apiKey)
     ? runtime.nzbhydra
-    : runtime.indexers.find((item) => item.enabled && item.type.toLowerCase() === "nzbhydra2" && hasValue(item.url) && hasValue(item.apiKey));
+    : undefined;
 
   const nextSettings = {
     ...current,
-    ...(nzbhydra ? {
-      nzbhydraUrl: "url" in nzbhydra ? nzbhydra.url : "",
-      nzbhydraApiKey: "apiKey" in nzbhydra ? nzbhydra.apiKey : "",
-      nzbhydraCategories: "categories" in nzbhydra ? nzbhydra.categories : current.nzbhydraCategories,
-      nzbhydraTimeoutMs: "timeoutMs" in nzbhydra ? nzbhydra.timeoutMs : current.nzbhydraTimeoutMs,
-      nzbhydraCacheTtlSeconds: "searchCacheTtlSeconds" in nzbhydra ? nzbhydra.searchCacheTtlSeconds : current.nzbhydraCacheTtlSeconds,
-      nzbhydraFeedCacheTtlSeconds: "feedCacheTtlSeconds" in nzbhydra ? nzbhydra.feedCacheTtlSeconds : current.nzbhydraFeedCacheTtlSeconds,
-      nzbhydraFeedMaxResults: "feedMaxResults" in nzbhydra ? nzbhydra.feedMaxResults : current.nzbhydraFeedMaxResults
-    } : {}),
-    ...(runtime.plex.enabled && hasValue(runtime.plex.serverUrl) ? {
-      plexServerUrl: runtime.plex.serverUrl,
-      plexToken: runtime.plex.token,
-      plexLibraryPath: runtime.plex.libraryPath,
-      plexSectionId: runtime.plex.sectionId
-    } : {}),
-    ...(hasValue(runtime.metadata.tmdbApiKey) ? { tmdbApiKey: runtime.metadata.tmdbApiKey } : {}),
-    ...(hasValue(runtime.metadata.tvdbApiKey) ? { tvdbApiKey: runtime.metadata.tvdbApiKey } : {}),
+    nzbhydraUrl: nzbhydra ? ("url" in nzbhydra ? nzbhydra.url : "") : "",
+    nzbhydraApiKey: nzbhydra ? ("apiKey" in nzbhydra ? nzbhydra.apiKey : "") : "",
+    nzbhydraCategories: nzbhydra && "categories" in nzbhydra ? nzbhydra.categories : current.nzbhydraCategories,
+    nzbhydraTimeoutMs: nzbhydra && "timeoutMs" in nzbhydra ? nzbhydra.timeoutMs : current.nzbhydraTimeoutMs,
+    nzbhydraCacheTtlSeconds: nzbhydra && "searchCacheTtlSeconds" in nzbhydra ? nzbhydra.searchCacheTtlSeconds : current.nzbhydraCacheTtlSeconds,
+    nzbhydraFeedCacheTtlSeconds: nzbhydra && "feedCacheTtlSeconds" in nzbhydra ? nzbhydra.feedCacheTtlSeconds : current.nzbhydraFeedCacheTtlSeconds,
+    nzbhydraFeedMaxResults: nzbhydra && "feedMaxResults" in nzbhydra ? nzbhydra.feedMaxResults : current.nzbhydraFeedMaxResults,
+    plexServerUrl: runtime.plex.enabled && hasConfiguredValue(runtime.plex.serverUrl) ? runtime.plex.serverUrl : "",
+    plexToken: runtime.plex.enabled && hasConfiguredValue(runtime.plex.token) ? runtime.plex.token : "",
+    plexLibraryPath: runtime.plex.libraryPath || current.plexLibraryPath,
+    plexSectionId: runtime.plex.enabled ? runtime.plex.sectionId : "",
+    ...(hasConfiguredValue(runtime.metadata.tmdbApiKey) ? { tmdbApiKey: runtime.metadata.tmdbApiKey } : {}),
+    ...(hasConfiguredValue(runtime.metadata.tvdbApiKey) ? { tvdbApiKey: runtime.metadata.tvdbApiKey } : {}),
     metadataLanguage: runtime.metadata.language || current.metadataLanguage,
     metadataCacheTtlHours: runtime.metadata.cacheTtlHours || current.metadataCacheTtlHours
   };
   await updateSettings(nextSettings);
 
   let usenetSynced = 0;
-  for (const server of runtime.usenetProviders.filter((item) => item.enabled && hasValue(item.name) && hasValue(item.host))) {
+  const configuredUsenetNames = new Set<string>();
+  for (const server of runtime.usenetProviders.filter((item) => hasConfiguredValue(item.name) && hasConfiguredValue(item.host))) {
+    configuredUsenetNames.add(server.name.trim().toLowerCase());
     const existing = await prisma.usenetServer.findFirst({ where: { OR: [{ name: server.name }, { host: server.host, port: server.port }] } });
     const data = {
       name: server.name,
@@ -69,9 +72,22 @@ export async function bootstrapRuntimeConfiguredServices(log: Logger) {
     else await prisma.usenetServer.create({ data });
     usenetSynced += 1;
   }
+  if (configuredUsenetNames.size > 0) {
+    const existingServers = await prisma.usenetServer.findMany();
+    for (const server of existingServers) {
+      if (configuredUsenetNames.has(server.name.trim().toLowerCase())) continue;
+      if (!server.enabled) continue;
+      await prisma.usenetServer.update({
+        where: { id: server.id },
+        data: { enabled: false }
+      });
+    }
+  }
 
   let requestProvidersSynced = 0;
-  for (const provider of runtime.requestProviders.filter((item) => item.enabled && hasValue(item.baseUrl) && hasValue(item.apiKey))) {
+  const configuredRequestProviderNames = new Set<string>();
+  for (const provider of runtime.requestProviders.filter((item) => hasConfiguredValue(item.name) && hasConfiguredValue(item.baseUrl) && hasConfiguredValue(item.apiKey))) {
+    configuredRequestProviderNames.add(provider.name.trim().toLowerCase());
     const existing = await prisma.requestProvider.findFirst({ where: { OR: [{ name: provider.name }, { baseUrl: provider.baseUrl }] } });
     const data = {
       type: provider.type,
@@ -86,6 +102,15 @@ export async function bootstrapRuntimeConfiguredServices(log: Logger) {
     if (existing) await prisma.requestProvider.update({ where: { id: existing.id }, data });
     else await prisma.requestProvider.create({ data });
     requestProvidersSynced += 1;
+  }
+  const existingProviders = await prisma.requestProvider.findMany();
+  for (const provider of existingProviders) {
+    if (configuredRequestProviderNames.has(provider.name.trim().toLowerCase())) continue;
+    if (!provider.enabled) continue;
+    await prisma.requestProvider.update({
+      where: { id: provider.id },
+      data: { enabled: false }
+    });
   }
 
   const setupCompletedRow = await prisma.setting.findUnique({ where: { key: "setup.completed" } });

@@ -52,6 +52,8 @@ type SeerrRequestDetails = SeerrRequest & {
 type FetchSeerrRequestsOptions = {
   maxRequests?: number;
   includeDetails?: boolean;
+  skip?: number;
+  pageSize?: number;
 };
 
 function serviceName(provider: RequestProvider) {
@@ -221,7 +223,7 @@ async function fetchRequestPage(provider: RequestProvider, take: number, skip: n
 
 async function fetchAllRequestPages(provider: RequestProvider, pageSize = 100, options: FetchSeerrRequestsOptions = {}) {
   const requests: SeerrRequest[] = [];
-  let skip = 0;
+  let skip = Math.max(0, options.skip ?? 0);
   let page = 0;
   let totalPages: number | undefined;
   const maxRequests = options.maxRequests && options.maxRequests > 0 ? options.maxRequests : undefined;
@@ -246,7 +248,8 @@ async function fetchAllRequestPages(provider: RequestProvider, pageSize = 100, o
 
 export async function fetchSeerrRequests(provider: RequestProvider, options: FetchSeerrRequestsOptions = {}): Promise<ExternalMediaRequest[]> {
   await assertServiceAllowed(serviceName(provider), providerConfigured(provider), `${provider.name} is not configured; request sync skipped`);
-  const requests = await fetchAllRequestPages(provider, 100, options);
+  const effectivePageSize = Math.max(1, Math.min(100, options.pageSize ?? options.maxRequests ?? 100));
+  const requests = await fetchAllRequestPages(provider, effectivePageSize, options);
   return mapWithConcurrency(requests, 8, async (request) => mapSeerrRequest(provider, request, options));
 }
 

@@ -134,6 +134,8 @@ describe("parseReleaseTitle", () => {
     const oneBy = parseReleaseTitle("The.Last.of.Us.1x03.Long.Long.Time.1080p.WEB-DL-GROUP");
     const multi = parseReleaseTitle("Avatar.The.Last.Airbender.S02E12E13.1080p.BluRay.x264-CiNEFiLE");
     const longAnime = parseReleaseTitle("One.Piece.S01E1162.1080p.NF.WEB-DL.AAC2.0.H.264-VARYG");
+    const highSeason = parseReleaseTitle("House.Hunters.S194E08.Fast.and.Furious.in.Kansas.City.WEB.h264-CAFFEiNE");
+    const animeEp = parseReleaseTitle("One.Piece.EP1163.I.Want.You.to.Praise.Me.The.Reunion.of.Robin.and.Saul.1080p.BILI.WEB-DL.JPN.AAC2.0.H.265.MSubs-ToonsHub");
 
     assert.equal(sxxexx.season, 1);
     assert.equal(sxxexx.episode, 3);
@@ -141,15 +143,51 @@ describe("parseReleaseTitle", () => {
     assert.equal(oneBy.episode, 3);
     assert.equal(multi.season, 2);
     assert.equal(multi.episode, 12);
+    assert.equal(multi.episodeEnd, 13);
+    assert.equal(multi.isMultiEpisode, true);
     assert.equal(longAnime.season, 1);
     assert.equal(longAnime.episode, 1162);
+    assert.equal(highSeason.season, 194);
+    assert.equal(highSeason.episode, 8);
+    assert.equal(highSeason.mediaHint, "tv");
+    assert.equal(animeEp.title, "One Piece");
+    assert.equal(animeEp.episode, 1163);
+    assert.equal(animeEp.mediaHint, "tv");
   });
 
   it("parses daily TV date as year metadata", () => {
     const parsed = parseReleaseTitle("The.Daily.Show.2026.05.23.1080p.WEB-DL-GROUP");
 
     assert.equal(parsed.year, 2026);
+    assert.equal(parsed.title, "The Daily Show");
     assert.equal(parsed.resolution, "1080p");
     assert.equal(parsed.source, "webdl");
+    assert.equal(parsed.isDaily, true);
+    assert.equal(parsed.mediaHint, "tv");
+  });
+
+  it("parses season packs and extracts the real title stem", () => {
+    const parsed = parseReleaseTitle("The.Last.of.Us.S01.1080p.BluRay.x265-GROUP");
+
+    assert.equal(parsed.title, "The Last of Us");
+    assert.equal(parsed.season, 1);
+    assert.equal(parsed.isSeasonPack, true);
+    assert.equal(parsed.mediaHint, "tv");
+  });
+
+  it("does not parse daily TV bait as the requested movie title", () => {
+    const parsed = parseReleaseTitle("Conan.2015.07.09.The.Hunger.Games.Mockingjay.Part.2.720p.HDTV.x264-BATV");
+
+    assert.equal(parsed.title, "Conan");
+    assert.equal(parsed.year, 2015);
+    assert.equal(parsed.isDaily, true);
+    assert.equal(parsed.mediaHint, "tv");
+  });
+
+  it("strips bracketed quality junk from title stems", () => {
+    const parsed = parseReleaseTitle("[BDRIP] The King's Avatar - For the Glory [1080P-HEVC,CHN-DTSHD-MA-5.1,ENG-SRT]");
+
+    assert.equal(parsed.title, "The King's Avatar - For the Glory");
+    assert.equal(parsed.mediaHint, "unknown");
   });
 });

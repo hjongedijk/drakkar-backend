@@ -55,13 +55,6 @@ const runtimeSettingsSchema = z.object({
     language: z.string().default("en-US"),
     cacheTtlHours: z.number().int().positive().default(168)
   }).default({}),
-  indexers: z.array(z.object({
-    type: z.string().default("nzbhydra2"),
-    enabled: z.boolean().default(false),
-    name: z.string().default("NZBHydra2"),
-    url: z.string().default(""),
-    apiKey: z.string().default("")
-  })).default([]),
   usenetProviders: z.array(z.object({
     enabled: z.boolean().default(false),
     name: z.string().default(""),
@@ -142,15 +135,6 @@ function defaultRuntimeSettings(): RuntimeSettings {
       language: "en-US",
       cacheTtlHours: 168
     },
-    indexers: [
-      {
-        type: "nzbhydra2",
-        enabled: false,
-        name: "NZBHydra2",
-        url: "http://nzbhydra2:5076",
-        apiKey: "fill-me"
-      }
-    ],
     usenetProviders: [
       {
         enabled: false,
@@ -184,7 +168,6 @@ function mergeExampleProviderArrays(input: Partial<RuntimeSettings>) {
   const defaults = defaultRuntimeSettings();
   return {
     ...input,
-    indexers: Array.isArray(input.indexers) && input.indexers.length > 0 ? input.indexers : defaults.indexers,
     usenetProviders: Array.isArray(input.usenetProviders) && input.usenetProviders.length > 0 ? input.usenetProviders : defaults.usenetProviders,
     requestProviders: Array.isArray(input.requestProviders) && input.requestProviders.length > 0 ? input.requestProviders : defaults.requestProviders
   };
@@ -225,6 +208,27 @@ export function ensureRuntimeSettings(configDir = process.env.CONFIG_DIR || "/da
 
   const parsed = JSON.parse(readFileSync(path, "utf8")) as Partial<RuntimeSettings> & { frontendApiToken?: string; drakkarApiToken?: string };
   if (!parsed.drakkarApiToken && parsed.frontendApiToken) parsed.drakkarApiToken = parsed.frontendApiToken;
+  const legacyIndexer = Array.isArray((parsed as { indexers?: Array<Record<string, unknown>> }).indexers)
+    ? (parsed as { indexers?: Array<Record<string, unknown>> }).indexers?.find((item) => {
+      if (!item || typeof item !== "object") return false;
+      const type = typeof item.type === "string" ? item.type.toLowerCase() : "";
+      const name = typeof item.name === "string" ? item.name.toLowerCase() : "";
+      return type === "nzbhydra2" || name.includes("nzbhydra");
+    })
+    : undefined;
+  if (
+    legacyIndexer
+    && (!parsed.nzbhydra || !parsed.nzbhydra.url || !parsed.nzbhydra.apiKey)
+  ) {
+    const defaultNzbhydra = defaultRuntimeSettings().nzbhydra;
+    parsed.nzbhydra = {
+      ...defaultNzbhydra,
+      ...parsed.nzbhydra,
+      enabled: typeof legacyIndexer.enabled === "boolean" ? legacyIndexer.enabled : (parsed.nzbhydra?.enabled ?? defaultNzbhydra.enabled),
+      url: typeof legacyIndexer.url === "string" ? legacyIndexer.url : (parsed.nzbhydra?.url ?? defaultNzbhydra.url),
+      apiKey: typeof legacyIndexer.apiKey === "string" ? legacyIndexer.apiKey : (parsed.nzbhydra?.apiKey ?? defaultNzbhydra.apiKey)
+    };
+  }
   const input = mergeExampleProviderArrays(parsed as Partial<RuntimeSettings>) as RuntimeSettings & {
     nzbhydra?: { categories?: string[]; timeoutMs?: number };
   };

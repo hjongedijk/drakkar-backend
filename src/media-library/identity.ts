@@ -58,6 +58,52 @@ export function normalizeTitleForIdentity(value: string) {
     .trim();
 }
 
+function compactNormalizedTitle(value: string) {
+  return normalizeTitleForIdentity(value).replace(/\s+/g, "");
+}
+
+function normalizedTitleTokens(value: string) {
+  return normalizeTitleForIdentity(value)
+    .split(" ")
+    .map((token) => token.trim())
+    .filter(Boolean);
+}
+
+export function titlesLikelyMatch(left: string, right: string) {
+  const normalizedLeft = normalizeTitleForIdentity(left);
+  const normalizedRight = normalizeTitleForIdentity(right);
+  if (!normalizedLeft || !normalizedRight) return false;
+  if (normalizedLeft === normalizedRight) return true;
+
+  const compactLeft = compactNormalizedTitle(left);
+  const compactRight = compactNormalizedTitle(right);
+  if (!compactLeft || !compactRight) return false;
+
+  const shortCompactLength = Math.min(compactLeft.length, compactRight.length);
+  if (shortCompactLength <= 4) return compactLeft === compactRight;
+
+  if (normalizedLeft.includes(normalizedRight) || normalizedRight.includes(normalizedLeft)) {
+    const shorter = Math.min(compactLeft.length, compactRight.length);
+    const longer = Math.max(compactLeft.length, compactRight.length);
+    if (shorter / longer >= 0.8) return true;
+  }
+
+  const leftTokens = new Set(normalizedTitleTokens(left));
+  const rightTokens = new Set(normalizedTitleTokens(right));
+  if (leftTokens.size === 0 || rightTokens.size === 0) return false;
+
+  const numericLeft = [...leftTokens].filter((token) => /^\d+$/.test(token));
+  if (numericLeft.some((token) => !rightTokens.has(token))) return false;
+
+  let overlap = 0;
+  for (const token of leftTokens) {
+    if (rightTokens.has(token)) overlap += 1;
+  }
+  const leftOverlapRatio = overlap / leftTokens.size;
+  const rightOverlapRatio = overlap / rightTokens.size;
+  return leftOverlapRatio >= 0.75 && rightOverlapRatio >= 0.75;
+}
+
 export function mediaIdentityKey(input: {
   mediaType: string;
   title: string;
@@ -93,6 +139,25 @@ export function inferMediaIdentity(rawTitle: string) {
   }
 
   const episode = normalized.match(/\bS(\d{1,2})E(\d{1,4})\b/i);
+  const wideSeasonEpisode = normalized.match(/\bS(\d{1,3})E(\d{1,4})\b/i);
+  if (wideSeasonEpisode) {
+    return {
+      mediaType: "tv",
+      title: canonicalizeDisplayTitle(trimAtQuality(normalized.slice(0, wideSeasonEpisode.index)).trim() || normalized),
+      season: Number(wideSeasonEpisode[1]),
+      episode: Number(wideSeasonEpisode[2])
+    };
+  }
+
+  const animeEpisode = normalized.match(/\bEP?(\d{2,4})\b/i);
+  if (animeEpisode) {
+    return {
+      mediaType: "tv",
+      title: canonicalizeDisplayTitle(trimAtQuality(normalized.slice(0, animeEpisode.index)).trim() || normalized),
+      episode: Number(animeEpisode[1])
+    };
+  }
+
   if (episode) {
     return {
       mediaType: "tv",
@@ -112,7 +177,7 @@ export function inferMediaIdentity(rawTitle: string) {
     };
   }
 
-  const seasonPack = normalized.match(/\bS(\d{1,2})(?!\s*E\d{1,4})\b/i);
+  const seasonPack = normalized.match(/\bS(\d{1,3})(?!\s*E\d{1,4})\b/i);
   if (seasonPack) {
     return {
       mediaType: "tv",

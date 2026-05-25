@@ -10,6 +10,7 @@ type BlockReason =
   | "missing_articles"
   | "passworded_archive"
   | "unsupported_archive"
+  | "grab_failed"
   | "import_failed";
 
 function releaseFromJson(value: unknown): { guid?: string; title: string } | null {
@@ -28,7 +29,7 @@ function classifyFailure(message: string): BlockReason {
   if (/no streamable video|no video|sample|ignored/i.test(message)) return "no_video_content";
   if (/missing|all providers failed|stat|article|segment/i.test(message)) return "missing_articles";
   if (/archive|rar|7z|password/i.test(message)) return /password/i.test(message) ? "passworded_archive" : "unsupported_archive";
-  return "import_failed";
+  return "grab_failed";
 }
 
 function titleNeedle(title: string) {

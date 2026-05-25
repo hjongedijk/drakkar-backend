@@ -13,7 +13,8 @@ export const LIBRARY_CLEANUP_TASK_ID = "library-cleanup";
 export const LOG_PRUNE_TASK_ID = "log-prune";
 
 export const REQUEST_SYNC_INTERVAL_MS = 15 * 60_000;
-export const NZBHYDRA_RSS_SYNC_INTERVAL_MS = 15 * 60_000;
+export const REQUEST_RECOVERY_INTERVAL_MS = 1 * 60_000;
+export const NZBHYDRA_RSS_SYNC_INTERVAL_MS = 30 * 60_000;
 export const BACKGROUND_REPAIR_INTERVAL_MS = 30 * 60_000;
 export const LOG_PRUNE_INTERVAL_MS = 6 * 60 * 60_000;
 
@@ -30,7 +31,7 @@ export function registerCoreTasks() {
     id: REQUEST_RECOVERY_TASK_ID,
     name: "Request Download Recovery",
     description: "Seed monitored missing requests into the queue and retry selected or failed request downloads in bounded batches.",
-    intervalMs: null,
+    intervalMs: REQUEST_RECOVERY_INTERVAL_MS,
     enabled: env.REQUEST_SYNC_ENABLED,
     manualRunnable: true
   });

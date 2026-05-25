@@ -61,13 +61,14 @@ export function parseNewznabResponse(xml: string, indexer = "NZBHydra2"): Newzna
       const attributes = attrMap(item.attr);
       const title = item.title ?? "Untitled release";
       const downloadUrl = item.enclosure?.url ?? item.link;
+      const hydraIndexerName = stringAttr(attributes, "hydraIndexerName");
 
       return enrichRelease({
         title,
         guid: normalizeGuid(item.guid, downloadUrl ?? title),
         detailsUrl: item.comments ?? item.link,
         downloadUrl,
-        indexer,
+        indexer: hydraIndexerName ?? indexer,
         category: item.category ?? stringAttr(attributes, "category"),
         size: Number(item.enclosure?.length ?? attributes.size) || undefined,
         age: numberAttr(attributes, "age"),

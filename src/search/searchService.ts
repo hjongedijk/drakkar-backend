@@ -1,8 +1,10 @@
 import { prisma } from "../db/prisma.js";
 import { getSettings } from "../settings/settingsStore.js";
-import { searchNzbhydra, type SearchParams } from "../indexers/nzbhydra/client.js";
+import { searchNzbhydra, searchNzbhydraCachedOnly, type SearchParams } from "../indexers/nzbhydra/client.js";
 import type { Release } from "../releases/types.js";
 import { looksLikeArchiveRelease } from "../releases/archiveHeuristics.js";
+import { titlesLikelyMatch } from "../media-library/identity.js";
+import { parseReleaseTitle } from "../quality/parser.js";
 
 const MIN_STRICT_TV_RESULTS_BEFORE_FALLBACK = 20;
 
@@ -62,12 +64,23 @@ function uniqAndFilterReleases(releases: Release[], badKeys: Awaited<ReturnType<
   return filtered;
 }
 
-export async function runSearch(params: SearchParams & { recordHistory?: boolean }) {
+function filterFallbackByRequestedTitle(releases: Release[], query?: string) {
+  if (!query) return releases;
+  return releases.filter((release) => {
+    const parsed = parseReleaseTitle(release.title);
+    const candidateTitle = parsed.title || release.title;
+    return titlesLikelyMatch(query, candidateTitle);
+  });
+}
+
+export async function runSearch(params: SearchParams & { recordHistory?: boolean; cachedOnly?: boolean }) {
   const settings = await getSettings();
-  const { recordHistory = true, ...searchParams } = params;
+  const { recordHistory = true, cachedOnly = false, ...searchParams } = params;
   try {
     const badKeys = await knownBadReleaseKeys();
-    const releases = await searchNzbhydra(settings, searchParams);
+    const releases = cachedOnly
+      ? await searchNzbhydraCachedOnly(settings, searchParams)
+      : await searchNzbhydra(settings, searchParams);
     let filtered = uniqAndFilterReleases(releases, badKeys);
     const usedStrictIds = Boolean(searchParams.imdbId || searchParams.tmdbId || searchParams.tvdbId);
     let message: string | undefined;
@@ -78,9 +91,15 @@ export async function runSearch(params: SearchParams & { recordHistory?: boolean
         (["tv", "season", "episode"].includes(searchParams.kind) && filtered.length < MIN_STRICT_TV_RESULTS_BEFORE_FALLBACK));
     if (shouldFallback) {
       const fallbackParams = { ...searchParams, imdbId: undefined, tmdbId: undefined, tvdbId: undefined };
-      const fallback = await searchNzbhydra(settings, fallbackParams);
-      filtered = uniqAndFilterReleases([...filtered, ...fallback], badKeys);
-      message = "merged fallback without strict IDs";
+      const fallback = cachedOnly
+        ? await searchNzbhydraCachedOnly(settings, fallbackParams)
+        : await searchNzbhydra(settings, fallbackParams);
+      const fallbackFiltered = filterFallbackByRequestedTitle(fallback, searchParams.query);
+      const merged = uniqAndFilterReleases([...filtered, ...fallbackFiltered], badKeys);
+      if (merged.length > filtered.length) {
+        filtered = merged;
+        message = "merged fallback without strict IDs";
+      }
     }
     if (recordHistory) {
       await prisma.searchHistory.create({

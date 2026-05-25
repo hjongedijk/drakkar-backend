@@ -4,7 +4,7 @@ import { getImport, importCompletedPath, listImports, migrateImportsToCurrentNam
 import { getNamingSettings, previewNaming, updateNamingSettings } from "../naming/namingService.js";
 import { refreshMediaLibrary } from "../media-library/libraryService.js";
 import { extractDownloadPath, listRepairJobs, runBackgroundRepairSweep, runRepair } from "../repair/repairService.js";
-import { cleanupSymlinks, listSymlinks, pruneLibraryDirectories, repairSymlinks } from "../symlinks/symlinkService.js";
+import { cleanupSymlinks, listSymlinks, pruneLibraryDirectories, removeStaleLibraryFilesystemEntries, repairSymlinks } from "../symlinks/symlinkService.js";
 
 const reprocessSchema = z.object({
   sourcePath: z.string().optional()
@@ -57,7 +57,12 @@ export async function processingRoutes(app: FastifyInstance): Promise<void> {
 
   app.get("/api/symlinks", async () => listSymlinks());
   app.post("/api/symlinks/repair", async () => repairSymlinks());
-  app.post("/api/symlinks/cleanup", async () => cleanupSymlinks());
+  app.post("/api/symlinks/cleanup", async () => {
+    const symlinkCleanup = await cleanupSymlinks();
+    const staleFilesystem = await removeStaleLibraryFilesystemEntries();
+    const pruned = await pruneLibraryDirectories();
+    return { symlinkCleanup, staleFilesystem, pruned };
+  });
 
   app.get("/api/naming", async (request, reply) => {
     if (!request.authUser?.isAdmin) return reply.status(403).send({ message: "Admin access required." });

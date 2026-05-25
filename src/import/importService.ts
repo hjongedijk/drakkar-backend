@@ -137,6 +137,16 @@ async function requestMetadata(requestId?: string): Promise<Partial<ImportMedia>
 }
 
 function enrichMountedTvMedia(media: ImportMedia, downloadTitle: string, requestInfo: Partial<ImportMedia>): ImportMedia {
+  if (requestInfo.mediaType === "movie") {
+    return {
+      ...media,
+      mediaType: "movie",
+      title: requestInfo.title ?? media.title,
+      year: requestInfo.year ?? media.year,
+      season: undefined,
+      episode: undefined
+    };
+  }
   if (requestInfo.mediaType !== "tv" && media.mediaType !== "tv") return media;
   if (media.season && media.episode) return media;
   const fromDownload = inferMedia(downloadTitle);
@@ -148,6 +158,15 @@ function enrichMountedTvMedia(media: ImportMedia, downloadTitle: string, request
     season: media.season ?? fromDownload.season,
     episode: media.episode ?? fromDownload.episode
   };
+}
+
+function movieRequestResolvedToTv(requestInfo: Partial<ImportMedia>, media: Partial<ImportMedia>, downloadTitle?: string) {
+  if (requestInfo.mediaType !== "movie") return false;
+  if (media.mediaType === "tv") return true;
+  if (media.season != null || media.episode != null) return true;
+  if (!downloadTitle) return false;
+  const downloadIdentity = inferMediaIdentity(downloadTitle);
+  return downloadIdentity.mediaType === "tv";
 }
 
 export async function reconcileRequestStatusAfterImport(requestId?: string, downloadId?: string | null) {
@@ -252,6 +271,9 @@ export async function importCompletedPath(input: { sourcePath: string; downloadI
 
   for (const sourcePath of mediaFiles) {
     const inferred = { ...inferMedia(sourcePath), ...requestInfo };
+    if (movieRequestResolvedToTv(requestInfo, inferred, basename(sourcePath))) {
+      throw new Error(`Selected NZB resolves to TV-shaped media for movie request: ${basename(sourcePath)}`);
+    }
     const completedPath = completedPathFor({ media: inferred, sourcePath, naming });
     await mkdir(dirname(completedPath), { recursive: true });
     await rename(sourcePath, completedPath);
@@ -341,6 +363,9 @@ export async function makeMountedDownloadAvailable(input: { downloadId: string; 
       ? inferMedia(download.title)
       : {};
     const inferred = enrichMountedTvMedia({ ...inferMedia(filename), ...downloadFallback, ...requestInfo }, download.title, requestInfo);
+    if (movieRequestResolvedToTv(requestInfo, inferred, download.title)) {
+      throw new Error(`Selected NZB resolves to TV-shaped media for movie request: ${download.title}`);
+    }
     const matchingImport = await findWorkingImportByIdentity(inferred);
 
     const existing = await prisma.importItem.findFirst({

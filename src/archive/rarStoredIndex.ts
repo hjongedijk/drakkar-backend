@@ -64,6 +64,7 @@ function oneLineLog(value: string) {
 }
 const archiveIndexCache = new Map<string, { value: ArchiveVirtualEntry[]; expiresAt: number }>();
 const execFileAsync = promisify(execFile);
+const ARCHIVE_SEGMENT_BATCH_SIZE = 1000;
 
 function isRarName(name: string) {
   return /\.(?:part\d+\.rar|rar|r\d{2,3})$/i.test(name);
@@ -215,34 +216,47 @@ async function readPersistedArchiveEntries(documentId: string): Promise<ArchiveV
 }
 
 async function persistArchiveEntries(documentId: string, entries: ArchiveVirtualEntry[]) {
-  await prisma.$transaction(async (tx) => {
-    await tx.archiveEntry.deleteMany({ where: { nzbDocumentId: documentId } });
-    for (const entry of entries) {
-      await tx.archiveEntry.create({
-        data: {
-          nzbDocumentId: documentId,
-          name: entry.name,
-          path: entry.path,
-          format: "rar",
-          compression: "store",
-          size: entry.size,
-          modifiedAt: entry.modifiedAt,
-          status: "streamable",
-          segments: {
-            create: entry.segments.map((segment) => ({
-              nzbFileId: segment.fileId,
-              articleId: segment.articleId,
-              segmentNumber: segment.segmentNumber,
-              bytes: segment.bytes,
-              start: segment.start,
-              end: segment.end,
-              sourceOffset: segment.sourceOffset
-            }))
-          }
-        }
-      });
-    }
+  await prisma.archiveEntry.deleteMany({ where: { nzbDocumentId: documentId } });
+  if (entries.length === 0) return;
+
+  await prisma.archiveEntry.createMany({
+    data: entries.map((entry) => ({
+      nzbDocumentId: documentId,
+      name: entry.name,
+      path: entry.path,
+      format: "rar",
+      compression: "store",
+      size: entry.size,
+      modifiedAt: entry.modifiedAt,
+      status: "streamable"
+    }))
   });
+
+  const persistedEntries = await prisma.archiveEntry.findMany({
+    where: { nzbDocumentId: documentId },
+    select: { id: true, path: true }
+  });
+  const byPath = new Map(persistedEntries.map((entry) => [entry.path, entry.id]));
+  const allSegments = entries.flatMap((entry) => {
+    const archiveEntryId = byPath.get(entry.path);
+    if (!archiveEntryId) return [];
+    return entry.segments.map((segment) => ({
+      archiveEntryId,
+      nzbFileId: segment.fileId,
+      articleId: segment.articleId,
+      segmentNumber: segment.segmentNumber,
+      bytes: segment.bytes,
+      start: segment.start,
+      end: segment.end,
+      sourceOffset: segment.sourceOffset
+    }));
+  });
+
+  for (let index = 0; index < allSegments.length; index += ARCHIVE_SEGMENT_BATCH_SIZE) {
+    await prisma.archiveSegment.createMany({
+      data: allSegments.slice(index, index + ARCHIVE_SEGMENT_BATCH_SIZE)
+    });
+  }
 }
 
 async function fetchArticleSlice(articleId: string, startOffset: number, length: number, servers: UsenetServer[], signal?: AbortSignal) {

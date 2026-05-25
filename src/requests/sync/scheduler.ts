@@ -1,11 +1,12 @@
 import type { FastifyBaseLogger } from "fastify";
+import { prisma } from "../../db/prisma.js";
 import { cleanupDownloadHistory } from "../../downloads/downloadService.js";
 import { refreshNzbhydraUpdateFeeds } from "../../indexers/nzbhydra/client.js";
 import { refreshMediaLibrary } from "../../media-library/libraryService.js";
 import { reconcileAvailableDownloadsWithoutImports, recoverInterruptedDownloads } from "../../usenet/workers.js";
 import { pruneLogData } from "../../logs/logPruneService.js";
 import { getSettings } from "../../settings/settingsStore.js";
-import { IMPORT_RECONCILE_TASK_ID, INTERRUPTED_RECOVERY_TASK_ID, LIBRARY_CLEANUP_TASK_ID, LOG_PRUNE_INTERVAL_MS, LOG_PRUNE_TASK_ID, NAMING_MIGRATION_TASK_ID, NZBHYDRA_RSS_SYNC_INTERVAL_MS, NZBHYDRA_RSS_SYNC_TASK_ID, REQUEST_RECOVERY_TASK_ID, REQUEST_SYNC_INTERVAL_MS, REQUEST_SYNC_TASK_ID, registerCoreTasks } from "../../tasks/coreTasks.js";
+import { IMPORT_RECONCILE_TASK_ID, INTERRUPTED_RECOVERY_TASK_ID, LIBRARY_CLEANUP_TASK_ID, LOG_PRUNE_INTERVAL_MS, LOG_PRUNE_TASK_ID, NAMING_MIGRATION_TASK_ID, NZBHYDRA_RSS_SYNC_INTERVAL_MS, NZBHYDRA_RSS_SYNC_TASK_ID, REQUEST_RECOVERY_INTERVAL_MS, REQUEST_RECOVERY_TASK_ID, REQUEST_SYNC_INTERVAL_MS, REQUEST_SYNC_TASK_ID, registerCoreTasks } from "../../tasks/coreTasks.js";
 import { getTask, runTrackedTask, setTaskNextRun } from "../../tasks/taskRegistry.js";
 import {
   backfillPlaceholderRequestMetadata,
@@ -17,6 +18,8 @@ import {
 
 let timer: NodeJS.Timeout | undefined;
 let initialTimer: NodeJS.Timeout | undefined;
+let recoveryTimer: NodeJS.Timeout | undefined;
+let recoveryInitialTimer: NodeJS.Timeout | undefined;
 let rssTimer: NodeJS.Timeout | undefined;
 let rssInitialTimer: NodeJS.Timeout | undefined;
 let logPruneTimer: NodeJS.Timeout | undefined;
@@ -24,6 +27,8 @@ let logPruneInitialTimer: NodeJS.Timeout | undefined;
 let running = false;
 let rssRunning = false;
 let logPruneRunning = false;
+const FULL_REQUEST_SYNC_BATCH_SIZE = 100;
+const REQUEST_RECOVERY_BATCH_LIMIT = 10;
 
 function isLibraryMaintenanceRunning(id: string) {
   const task = getTask(id);
@@ -76,11 +81,11 @@ export async function runDeferredRequestRecovery(logger: FastifyBaseLogger) {
           skippedBecauseQueueFull: monitored.skippedBecauseQueueFull
         }, "monitored request queue seeding completed");
       }
-      const selectedReleaseRecovery = await recoverSelectedReleaseDownloads({ limit: 2 });
+      const selectedReleaseRecovery = await recoverSelectedReleaseDownloads({ limit: REQUEST_RECOVERY_BATCH_LIMIT });
       if (selectedReleaseRecovery.recovered > 0) {
         logger.info({ recovered: selectedReleaseRecovery.recovered }, "selected releases without downloads were re-queued");
       }
-      const failedRecovery = await recoverFailedRequestDownloads({ limit: 2 });
+      const failedRecovery = await recoverFailedRequestDownloads({ limit: REQUEST_RECOVERY_BATCH_LIMIT });
       if (failedRecovery.recovered > 0) {
         logger.info({ recovered: failedRecovery.recovered }, "failed request downloads were recovered");
       }
@@ -90,6 +95,8 @@ export async function runDeferredRequestRecovery(logger: FastifyBaseLogger) {
   } catch (error) {
     logger.warn({ err: error }, "deferred request download recovery failed");
     return { started: true, error };
+  } finally {
+    setTaskNextRun(REQUEST_RECOVERY_TASK_ID, new Date(Date.now() + REQUEST_RECOVERY_INTERVAL_MS));
   }
 }
 
@@ -132,18 +139,67 @@ export async function runFullRequestSyncRefresh(logger: FastifyBaseLogger, provi
   running = true;
   try {
     await runTrackedTask(REQUEST_SYNC_TASK_ID, async () => {
-      const sync = await syncRequests(providerId, { full: true });
+      const providers = providerId
+        ? [{ id: providerId }]
+        : await prisma.requestProvider.findMany({
+            where: { enabled: true, type: "seerr" },
+            select: { id: true }
+          });
+      const aggregate = {
+        imported: 0,
+        updated: 0,
+        skipped: 0,
+        fetched: 0,
+        failedProviders: 0,
+        autoGrabbed: 0,
+        budgetExceeded: false,
+        requests: [],
+        providerResults: []
+      } as Awaited<ReturnType<typeof syncRequests>>;
+
+      for (const provider of providers) {
+        let skip = 0;
+        while (true) {
+          const batch = await syncRequests(provider.id, {
+            full: true,
+            skip,
+            maxRequests: FULL_REQUEST_SYNC_BATCH_SIZE,
+            pageSize: FULL_REQUEST_SYNC_BATCH_SIZE,
+            refreshLibrary: false
+          });
+          aggregate.imported += batch.imported;
+          aggregate.updated += batch.updated;
+          aggregate.skipped += batch.skipped;
+          aggregate.fetched += batch.fetched;
+          aggregate.failedProviders += batch.failedProviders;
+          aggregate.providerResults.push(...batch.providerResults);
+          aggregate.requests.push(...batch.requests);
+
+          logger.info({
+            providerId: provider.id,
+            skip,
+            batchFetched: batch.fetched,
+            batchImported: batch.imported,
+            batchUpdated: batch.updated,
+            batchSkipped: batch.skipped
+          }, "full request resync batch completed");
+
+          if (batch.fetched < FULL_REQUEST_SYNC_BATCH_SIZE) break;
+          skip += FULL_REQUEST_SYNC_BATCH_SIZE;
+        }
+      }
       const metadataBackfill = await backfillPlaceholderRequestMetadata();
       const library = await refreshMediaLibrary();
       logger.info({
-        imported: sync.imported,
-        updated: sync.updated,
-        skipped: sync.skipped,
-        budgetExceeded: sync.budgetExceeded,
+        imported: aggregate.imported,
+        updated: aggregate.updated,
+        skipped: aggregate.skipped,
+        fetched: aggregate.fetched,
+        failedProviders: aggregate.failedProviders,
         metadataUpdated: metadataBackfill.updated,
         libraryRefreshed: library.refreshed
       }, "full request resync and library refresh completed");
-      return sync;
+      return aggregate;
     });
     void runDeferredRequestRecovery(logger);
     return { started: true };
@@ -210,6 +266,16 @@ export function startRequestSyncSchedule(logger: FastifyBaseLogger) {
       void runRequestSyncCycle(logger);
     }, REQUEST_SYNC_INTERVAL_MS);
   }
+  if (!recoveryTimer && !recoveryInitialTimer) {
+    setTaskNextRun(REQUEST_RECOVERY_TASK_ID, new Date(Date.now() + 45_000));
+    recoveryInitialTimer = setTimeout(() => {
+      recoveryInitialTimer = undefined;
+      void runDeferredRequestRecovery(logger);
+    }, 45_000);
+    recoveryTimer = setInterval(() => {
+      void runDeferredRequestRecovery(logger);
+    }, REQUEST_RECOVERY_INTERVAL_MS);
+  }
   if (!rssTimer && !rssInitialTimer) {
     setTaskNextRun(NZBHYDRA_RSS_SYNC_TASK_ID, new Date(Date.now() + 15_000));
     rssInitialTimer = setTimeout(() => {
@@ -235,12 +301,16 @@ export function startRequestSyncSchedule(logger: FastifyBaseLogger) {
 export function stopRequestSyncSchedule() {
   if (initialTimer) clearTimeout(initialTimer);
   if (timer) clearInterval(timer);
+  if (recoveryInitialTimer) clearTimeout(recoveryInitialTimer);
+  if (recoveryTimer) clearInterval(recoveryTimer);
   if (rssInitialTimer) clearTimeout(rssInitialTimer);
   if (rssTimer) clearInterval(rssTimer);
   if (logPruneInitialTimer) clearTimeout(logPruneInitialTimer);
   if (logPruneTimer) clearInterval(logPruneTimer);
   initialTimer = undefined;
   timer = undefined;
+  recoveryInitialTimer = undefined;
+  recoveryTimer = undefined;
   rssInitialTimer = undefined;
   rssTimer = undefined;
   logPruneInitialTimer = undefined;

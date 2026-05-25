@@ -39,6 +39,12 @@ const FEED_PAGE_LIMIT = 500;
 const NZBHYDRA_SERVICE = "nzbhydra2";
 const NZBHYDRA_GUARD_OPTIONS = { failureLimit: 10, cooldownSeconds: 60 };
 const DRAKKAR_USER_AGENT = `Drakkar/${DRAKKAR_VERSION} (NZBHydra2 client; +https://wiki.drakkar.botcontrol.nl/)`;
+const DRAKKAR_DOWNLOAD_USER_AGENT = `Drakkar/${DRAKKAR_VERSION}`;
+
+function isReleaseSpecificDownloadError(error: unknown) {
+  const message = error instanceof Error ? error.message : String(error);
+  return /NZB download failed with HTTP (400|401|403|404|410|429)\b/i.test(message);
+}
 
 function nzbhydraFetch(input: URL | string, timeoutMs: number) {
   return fetch(input, {
@@ -47,6 +53,47 @@ function nzbhydraFetch(input: URL | string, timeoutMs: number) {
       "user-agent": DRAKKAR_USER_AGENT
     }
   });
+}
+
+async function fetchWithRedirectAwareUserAgent(input: URL, timeoutMs: number, hydraBaseUrl: string) {
+  const hydraOrigin = new URL(hydraBaseUrl).origin;
+  let currentUrl = input;
+  for (let redirects = 0; redirects < 5; redirects += 1) {
+    const userAgent = currentUrl.origin === hydraOrigin ? DRAKKAR_USER_AGENT : DRAKKAR_DOWNLOAD_USER_AGENT;
+    const response = await fetch(currentUrl, {
+      signal: AbortSignal.timeout(timeoutMs),
+      redirect: "manual",
+      headers: {
+        "user-agent": userAgent
+      }
+    });
+    if (response.status >= 300 && response.status < 400) {
+      const location = response.headers.get("location");
+      if (!location) throw new Error(`NZB download redirect missing location (HTTP ${response.status})`);
+      currentUrl = new URL(location, response.url);
+      continue;
+    }
+    return response;
+  }
+  throw new Error("NZB download failed: too many redirects");
+}
+
+async function buildNzbDownloadError(response: Response) {
+  const contentType = response.headers.get("content-type") ?? "";
+  let detail = "";
+  if (/xml|json|text/i.test(contentType)) {
+    try {
+      const text = (await response.text()).trim();
+      const xmlDescription = text.match(/description="([^"]+)"/i)?.[1];
+      const jsonMessage = text.match(/"message"\s*:\s*"([^"]+)"/i)?.[1];
+      detail = xmlDescription ?? jsonMessage ?? text.slice(0, 160);
+    } catch {
+      detail = "";
+    }
+  }
+  return detail
+    ? new Error(`NZB download failed with HTTP ${response.status}: ${detail}`)
+    : new Error(`NZB download failed with HTTP ${response.status}`);
 }
 
 export function isNzbhydraConfigured(settings: AppSettings) {
@@ -196,6 +243,22 @@ async function searchFromFeeds(settings: AppSettings, params: SearchParams) {
   if (matched.length === 0) return null;
   await incrementSearchMetric("semanticCacheHits");
   return matched;
+}
+
+export async function searchNzbhydraCachedOnly(settings: AppSettings, params: SearchParams): Promise<Release[]> {
+  await requireHydra(settings);
+  const cacheKey = searchCacheKey(settings, params);
+  const cached = await redis.get(cacheKey).catch(() => null);
+  if (cached) {
+    await incrementSearchMetric("cacheHits");
+    return JSON.parse(cached) as Release[];
+  }
+  const feedMatched = await searchFromFeeds(settings, params);
+  if (feedMatched) {
+    await redis.set(cacheKey, JSON.stringify(feedMatched), "EX", settings.nzbhydraCacheTtlSeconds).catch(() => undefined);
+    return feedMatched;
+  }
+  return [];
 }
 
 async function refreshFeed(settings: AppSettings, mediaType: "movie" | "tv") {
@@ -411,8 +474,8 @@ async function fetchNzbForReleaseUncached(settings: AppSettings, release: Releas
   const url = await releaseDownloadUrl(settings, release);
   await incrementSearchMetric("nzbNetworkFetches");
   try {
-    const response = await nzbhydraFetch(url, settings.nzbhydraTimeoutMs);
-    if (!response.ok) throw new Error(`NZB download failed with HTTP ${response.status}`);
+    const response = await fetchWithRedirectAwareUserAgent(url, settings.nzbhydraTimeoutMs, settings.nzbhydraUrl ?? "");
+    if (!response.ok) throw await buildNzbDownloadError(response);
 
     const bytes = Buffer.from(await response.arrayBuffer());
     const disposition = response.headers.get("content-disposition");
@@ -430,7 +493,11 @@ async function fetchNzbForReleaseUncached(settings: AppSettings, release: Releas
       contentType
     };
   } catch (error) {
-    await recordServiceFailure(NZBHYDRA_SERVICE, error, NZBHYDRA_GUARD_OPTIONS);
+    if (isReleaseSpecificDownloadError(error)) {
+      await recordServiceSuccess(NZBHYDRA_SERVICE);
+    } else {
+      await recordServiceFailure(NZBHYDRA_SERVICE, error, NZBHYDRA_GUARD_OPTIONS);
+    }
     throw error;
   }
 }

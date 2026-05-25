@@ -47,6 +47,23 @@ describe("inferMediaIdentity", () => {
     });
   });
 
+  it("detects high-season-number TV episodes", () => {
+    assert.deepEqual(inferMediaIdentity("House.Hunters.S194E08.Fast.and.Furious.in.Kansas.City.WEB.h264-CAFFEiNE"), {
+      mediaType: "tv",
+      title: "House Hunters",
+      season: 194,
+      episode: 8
+    });
+  });
+
+  it("detects anime EP-style numbering without seasons", () => {
+    assert.deepEqual(inferMediaIdentity("One.Piece.EP1163.I.Want.You.to.Praise.Me.The.Reunion.of.Robin.and.Saul.1080p.BILI.WEB-DL.JPN.AAC2.0.H.265.MSubs-ToonsHub"), {
+      mediaType: "tv",
+      title: "One Piece",
+      episode: 1163
+    });
+  });
+
   it("detects movies and release years", () => {
     assert.deepEqual(inferMediaIdentity("Example.Movie.2026.2160p.BluRay.x265-GROUP"), {
       mediaType: "movie",
