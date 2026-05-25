@@ -1,4 +1,4 @@
-import { createHash } from "node:crypto";
+import { createHash, randomUUID } from "node:crypto";
 import { basename, dirname, resolve } from "node:path";
 import { readdir, stat } from "node:fs/promises";
 import type { FastifyInstance, FastifyRequest } from "fastify";
@@ -17,7 +17,15 @@ function queryToken(request: FastifyRequest) {
   const bearer = auth?.startsWith("Bearer ") ? auth.slice("Bearer ".length).trim() : undefined;
   const xApiKey = Array.isArray(request.headers["x-api-key"]) ? request.headers["x-api-key"][0] : request.headers["x-api-key"];
   const xApiToken = Array.isArray(request.headers["x-api-token"]) ? request.headers["x-api-token"][0] : request.headers["x-api-token"];
-  return String(xApiKey ?? xApiToken ?? url.searchParams.get("apikey") ?? url.searchParams.get("apiToken") ?? bearer ?? "");
+  return String(
+    xApiKey
+    ?? xApiToken
+    ?? url.searchParams.get("apikey")
+    ?? url.searchParams.get("apiToken")
+    ?? url.searchParams.get("access_token")
+    ?? bearer
+    ?? ""
+  );
 }
 
 async function ensureCompatAuth(request: FastifyRequest) {
@@ -342,8 +350,25 @@ export async function bazarrCompatRoutes(app: FastifyInstance): Promise<void> {
     }
   });
 
-  const sonarrStatus = { version: "4.0.9.2421" };
+  const sonarrStatus = { version: "4.0.17.2952" };
   const radarrStatus = { version: "5.14.0.9383" };
+  const signalrNegotiation = () => ({
+    connectionId: randomUUID(),
+    negotiateVersion: 0,
+    availableTransports: [
+      {
+        transport: "WebSockets",
+        transferFormats: ["Text", "Binary"]
+      }
+    ]
+  });
+
+  app.post("/api/compat/sonarr/signalr/messages/negotiate", async () => signalrNegotiation());
+  app.post("/api/compat/radarr/signalr/messages/negotiate", async () => signalrNegotiation());
+  app.get("/api/compat/sonarr/signalr/messages", async (_request, reply) => reply.status(204).send());
+  app.post("/api/compat/sonarr/signalr/messages", async (_request, reply) => reply.status(204).send());
+  app.get("/api/compat/radarr/signalr/messages", async (_request, reply) => reply.status(204).send());
+  app.post("/api/compat/radarr/signalr/messages", async (_request, reply) => reply.status(204).send());
 
   app.get("/api/compat/sonarr/api/system/status", async () => sonarrStatus);
   app.get("/api/compat/sonarr/api/v3/system/status", async () => sonarrStatus);
@@ -352,6 +377,26 @@ export async function bazarrCompatRoutes(app: FastifyInstance): Promise<void> {
 
   app.get("/api/compat/sonarr/api/v3/tag", async () => []);
   app.get("/api/compat/radarr/api/v3/tag", async () => []);
+  app.get("/api/compat/sonarr/api/v3/command", async () => []);
+  app.get("/api/compat/radarr/api/v3/command", async () => []);
+  app.post("/api/compat/sonarr/api/v3/command", async (request, reply) => {
+    const body = (request.body as { name?: string; seriesId?: number } | null) ?? {};
+    return reply.status(201).send({
+      id: stableInt(`sonarr-command:${body.name ?? "unknown"}:${body.seriesId ?? 0}:${Date.now()}`),
+      name: body.name ?? "Unknown",
+      seriesId: body.seriesId ?? null,
+      state: "completed"
+    });
+  });
+  app.post("/api/compat/radarr/api/v3/command", async (request, reply) => {
+    const body = (request.body as { name?: string; movieId?: number } | null) ?? {};
+    return reply.status(201).send({
+      id: stableInt(`radarr-command:${body.name ?? "unknown"}:${body.movieId ?? 0}:${Date.now()}`),
+      name: body.name ?? "Unknown",
+      movieId: body.movieId ?? null,
+      state: "completed"
+    });
+  });
 
   app.get("/api/compat/sonarr/api/v3/rootfolder", async () => [{ id: stableInt(env.MEDIA_TV_DIR), path: env.MEDIA_TV_DIR }]);
   app.get("/api/compat/radarr/api/v3/rootfolder", async () => [{ id: stableInt(env.MEDIA_MOVIES_DIR), path: env.MEDIA_MOVIES_DIR }]);
