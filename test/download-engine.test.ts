@@ -4,9 +4,9 @@ import assert from "node:assert/strict";
 process.env.DATABASE_URL ??= "postgresql://test:test@localhost:5432/test";
 process.env.REDIS_URL ??= "redis://localhost:6379";
 
-const { filenameFromSubject } = await import("../src/usenet/filename.js");
-const { classifyNzbImportMode } = await import("../src/usenet/importMode.js");
-const { parseStoredRarHeaders } = await import("../src/archive/rarStoredIndex.js");
+const { filenameFromSubject } = await import("../src/services/usenet/filename.js");
+const { classifyNzbImportMode } = await import("../src/services/usenet/importMode.js");
+const { parseStoredRarHeaders } = await import("../src/services/archive/rarStoredIndex.js");
 
 describe("filenameFromSubject", () => {
   it("uses quoted media filenames from NZB subjects", () => {

@@ -1,7 +1,7 @@
 import test from "node:test";
 import assert from "node:assert/strict";
-import { requestDuplicateRank, requestMatchesIdentity } from "../src/requests/sync/requestIdentity.js";
-import { titlesLikelyMatch } from "../src/media-library/identity.js";
+import { requestDuplicateRank, requestMatchesIdentity } from "../src/services/requests/sync/requestIdentity.js";
+import { titlesLikelyMatch } from "../src/services/media-library/identity.js";
 
 test("requestMatchesIdentity matches requests by shared external IDs", () => {
   const existing = {

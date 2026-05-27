@@ -1,7 +1,7 @@
 import { describe, it } from "node:test";
 import assert from "node:assert/strict";
-import { isMountedPath } from "../src/vfs/mountedNzbService.js";
-import { isPar2File } from "../src/extract/detect.js";
+import { isMountedPath } from "../src/services/mountedNzbService.js";
+import { isPar2File } from "../src/services/extract/detect.js";
 
 describe("mounted NZB VFS helpers", () => {
   it("detects mounted paths", () => {

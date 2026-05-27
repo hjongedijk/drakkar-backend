@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import { describe, it } from "node:test";
-import { getTask, registerTask, runTrackedTask } from "../src/tasks/taskRegistry.js";
+import { getTask, registerTask, runTrackedTask } from "../src/workers/tasks/taskRegistry.js";
 
 describe("task registry", () => {
   it("does not start an overlapping execution for a running task", async () => {

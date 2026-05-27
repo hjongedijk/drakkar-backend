@@ -1,6 +1,6 @@
 import { describe, it } from "node:test";
 import assert from "node:assert/strict";
-import { inferMediaIdentity } from "../src/media-library/identity.js";
+import { inferMediaIdentity } from "../src/services/media-library/identity.js";
 
 describe("inferMediaIdentity", () => {
   it("detects TV episodes from release-style titles", () => {

@@ -1,6 +1,6 @@
 import { z } from "zod";
 import type { FastifyInstance } from "fastify";
-import type { Release } from "../releases/types.js";
+import type { Release } from "../services/releases/types.js";
 import {
   createProfile,
   deleteProfile,
@@ -8,8 +8,8 @@ import {
   listProfiles,
   scoreAndStoreRelease,
   updateProfile
-} from "../quality/profileService.js";
-import { scoreRelease } from "../quality/scoring.js";
+} from "../services/quality/profileService.js";
+import { scoreRelease } from "../services/quality/scoring.js";
 
 const profileSchema = z.object({
   name: z.string().min(1),

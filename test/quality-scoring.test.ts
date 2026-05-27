@@ -1,9 +1,9 @@
 import { describe, it } from "node:test";
 import assert from "node:assert/strict";
-import type { QualityProfile } from "@prisma/client";
-import { parseReleaseTitle } from "../src/quality/parser.js";
-import { scoreRelease } from "../src/quality/scoring.js";
-import type { Release } from "../src/releases/types.js";
+import type { QualityProfile } from "../src/repositories/db/prisma.js";
+import { parseReleaseTitle } from "../src/services/quality/parser.js";
+import { scoreRelease } from "../src/services/quality/scoring.js";
+import type { Release } from "../src/services/releases/types.js";
 
 const baseProfile: QualityProfile = {
   id: "profile-1",

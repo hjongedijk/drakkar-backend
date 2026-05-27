@@ -1,10 +1,10 @@
 import type { FastifyInstance } from "fastify";
 import { graphql, buildSchema } from "graphql";
 import { z } from "zod";
-import { prisma } from "../db/prisma.js";
-import { redis } from "../db/redis.js";
-import { getSettings } from "../settings/settingsStore.js";
-import { DRAKKAR_VERSION } from "../version.js";
+import { prisma } from "../repositories/db/prisma.js";
+import { redis } from "../repositories/db/redis.js";
+import { getSettings } from "../services/settings/settingsStore.js";
+import { DRAKKAR_VERSION } from "../models/version.js";
 
 const schema = buildSchema(`
   """Basic runtime health for Drakkar and core infrastructure."""

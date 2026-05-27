@@ -1,6 +1,6 @@
 import type { FastifyInstance } from "fastify";
 import { z } from "zod";
-import { toPublicRelease } from "../releases/public.js";
+import { toPublicRelease } from "../services/releases/public.js";
 import {
   autoReplaceLibraryItem,
   deleteLibraryItem,
@@ -10,8 +10,8 @@ import {
   refreshMediaLibrary,
   replaceLibraryItemWithRelease,
   searchLibraryItemReplacements
-} from "../media-library/libraryService.js";
-import { reprocessImport } from "../import/importService.js";
+} from "../services/libraryService.js";
+import { reprocessImport } from "../services/importService.js";
 
 function idParam(request: { params: unknown }) {
   return (request.params as { id: string }).id;
@@ -24,7 +24,7 @@ const replaceReleaseSchema = z.object({
 export async function libraryRoutes(app: FastifyInstance): Promise<void> {
   app.get("/api/library", async () => listLibraryItems());
   app.get("/api/library/stats", async () => libraryStats());
-  app.post("/api/library/refresh", async () => refreshMediaLibrary());
+  app.post("/api/library/refresh", async () => refreshMediaLibrary({ includeItems: true }));
   app.get("/api/library/:id", async (request) => getLibraryItem(idParam(request)));
   app.get("/api/library/:id/replacements", async (request) => searchLibraryItemReplacements(idParam(request)));
   app.delete("/api/library/:id", async (request) => deleteLibraryItem(idParam(request), { blocklist: false }));

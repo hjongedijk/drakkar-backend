@@ -1,7 +1,7 @@
 import { describe, it } from "node:test";
 import assert from "node:assert/strict";
-import { toPublicRelease, toPublicReleases } from "../src/releases/public.js";
-import type { Release } from "../src/releases/types.js";
+import { toPublicRelease, toPublicReleases } from "../src/services/releases/public.js";
+import type { Release } from "../src/services/releases/types.js";
 
 function release(downloadUrl?: string): Release {
   return {

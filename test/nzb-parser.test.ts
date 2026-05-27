@@ -1,6 +1,6 @@
 import { describe, it } from "node:test";
 import assert from "node:assert/strict";
-import { parseNzbXml } from "../src/nzb/parser.js";
+import { parseNzbXml } from "../src/services/nzb/parser.js";
 
 const fixture = `<?xml version="1.0" encoding="UTF-8"?>
 <nzb xmlns="http://www.newzbin.com/DTD/2003/nzb">

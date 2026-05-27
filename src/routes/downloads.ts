@@ -13,8 +13,8 @@ import {
   invalidateDownloadViewCache,
   makeDownloadAvailable,
   setDownloadStatus
-} from "../downloads/downloadService.js";
-import { testNzbUrl } from "../usenet/urlNzb.js";
+} from "../services/downloadService.js";
+import { testNzbUrl } from "../services/usenet/urlNzb.js";
 
 const addNzbSchema = z.object({
   filename: z.string().optional(),

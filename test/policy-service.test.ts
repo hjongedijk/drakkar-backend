@@ -1,6 +1,6 @@
 import { describe, it } from "node:test";
 import assert from "node:assert/strict";
-import { matchesIgnoredPattern, normalizePolicyConnectionBudgets } from "../src/policies/policyService.js";
+import { matchesIgnoredPattern, normalizePolicyConnectionBudgets } from "../src/services/policyService.js";
 
 describe("matchesIgnoredPattern", () => {
   it("matches extension and substring ignore patterns", () => {

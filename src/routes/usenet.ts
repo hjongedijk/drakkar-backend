@@ -1,5 +1,5 @@
 import type { FastifyInstance } from "fastify";
-import { createUsenetServer, deleteUsenetServer, listUsenetServers, updateUsenetServer } from "../usenet/settings.js";
+import { createUsenetServer, deleteUsenetServer, listUsenetServers, updateUsenetServer } from "../services/usenet/settings.js";
 
 function idParam(request: { params: unknown }) {
   return (request.params as { id: string }).id;

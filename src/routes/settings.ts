@@ -1,7 +1,7 @@
 import type { FastifyInstance } from "fastify";
-import { getDrakkarApiToken, rotateDrakkarApiToken } from "../config/runtimeSettings.js";
-import { getSettings, updateSettings } from "../settings/settingsStore.js";
-import { resetEnvironment } from "../system/resetService.js";
+import { getDrakkarApiToken, rotateDrakkarApiToken } from "../services/config/runtimeSettings.js";
+import { getSettings, updateSettings } from "../services/settings/settingsStore.js";
+import { resetEnvironment } from "../services/resetService.js";
 
 export async function settingsRoutes(app: FastifyInstance): Promise<void> {
   app.get("/api/settings", async (request, reply) => {

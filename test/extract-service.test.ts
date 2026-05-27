@@ -4,7 +4,7 @@ import { mkdtemp, readFile, writeFile } from "node:fs/promises";
 import { spawn } from "node:child_process";
 import { join } from "node:path";
 import { tmpdir } from "node:os";
-import { extractArchivesInPath } from "../src/extract/extractService.js";
+import { extractArchivesInPath } from "../src/services/extractService.js";
 
 function run(command: string, args: string[], cwd: string) {
   return new Promise<void>((resolve, reject) => {

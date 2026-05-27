@@ -1,4 +1,4 @@
-import { redis } from "../db/redis.js";
+import { redis } from "../repositories/db/redis.js";
 
 const DEFAULT_FAILURE_LIMIT = 3;
 const DEFAULT_COOLDOWN_SECONDS = 10 * 60;

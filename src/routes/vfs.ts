@@ -12,12 +12,12 @@ import {
   streamVfsFile,
   treeVfs,
   updateVfsFile
-} from "../vfs/vfsService.js";
-import { listMounts } from "../vfs/mountedNzbService.js";
-import { getStreamMetrics, listActiveStreamSessions, stopStreamSession } from "../streaming/mountedStream.service.js";
-import { planMountedFileRange } from "../streaming/rangePlanner.service.js";
-import { getBandwidthStatus } from "../bandwidth/bandwidthScheduler.js";
-import { getFuseMountStatus } from "../vfs/fuseMountService.js";
+} from "../services/vfsService.js";
+import { listMounts } from "../services/mountedNzbService.js";
+import { getStreamMetrics, listActiveStreamSessions, stopStreamSession } from "../services/mountedStream.service.js";
+import { planMountedFileRange } from "../services/rangePlanner.service.js";
+import { getBandwidthStatus } from "../services/bandwidth/bandwidthScheduler.js";
+import { getFuseMountStatus } from "../services/fuseMountService.js";
 
 export async function vfsRoutes(app: FastifyInstance): Promise<void> {
   app.get("/api/vfs/list", async (request) => {

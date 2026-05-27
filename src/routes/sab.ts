@@ -1,6 +1,6 @@
 import type { FastifyInstance } from "fastify";
-import { DRAKKAR_VERSION } from "../version.js";
-import { addNzbUpload, addUrl, getHistory, getQueue, setDownloadStatus } from "../downloads/downloadService.js";
+import { DRAKKAR_VERSION } from "../models/version.js";
+import { addNzbUpload, addUrl, getHistory, getQueue, setDownloadStatus } from "../services/downloadService.js";
 
 export async function sabRoutes(app: FastifyInstance): Promise<void> {
   app.get("/sabnzbd/api", async (request) => {

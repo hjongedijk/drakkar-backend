@@ -25,9 +25,13 @@ one_line_file() {
 
 db_state() {
   node --input-type=module <<'EOF'
-import { PrismaClient } from "@prisma/client";
+import { PrismaClient } from "./dist/models/generated/prisma/client.js";
+import pg from "pg";
+import { PrismaPg } from "@prisma/adapter-pg";
 
-const prisma = new PrismaClient();
+const prisma = new PrismaClient({
+  adapter: new PrismaPg(new pg.Pool({ connectionString: process.env.DATABASE_URL }))
+});
 try {
   const rows = await prisma.$queryRawUnsafe(`
     SELECT table_name
@@ -79,11 +83,11 @@ eval "$(db_state || true)"
 
 if [ "${APP_TABLES:-0}" = "0" ] && [ "${HAS_MIGRATIONS:-0}" = "0" ]; then
   push_log="$(mktemp)"
-  if npx prisma db push --skip-generate >"$push_log" 2>&1; then
+  if npx prisma db push >"$push_log" 2>&1; then
     echo "Prisma fresh database initialized: $(one_line_file "$push_log")"
     rm -f "$push_log"
     mark_all_migrations_applied
-    exec node dist/index.js
+    exec node dist/workers/server.js
   fi
   echo "Prisma fresh database initialization failed: $(one_line_file "$push_log")"
   rm -f "$push_log"
@@ -91,7 +95,7 @@ if [ "${APP_TABLES:-0}" = "0" ] && [ "${HAS_MIGRATIONS:-0}" = "0" ]; then
 fi
 
 if run_migrate_deploy; then
-  exec node dist/index.js
+  exec node dist/workers/server.js
 fi
 
 if [ "${DRAKKAR_AUTO_BASELINE_MIGRATIONS:-true}" != "true" ]; then
@@ -103,7 +107,7 @@ if [ "${HAS_MIGRATIONS:-0}" = "0" ] && [ "${HAS_SETTING:-0}" = "1" ]; then
   echo "Migration deploy failed. Attempting one-time baseline for existing pre-migration database."
   mark_all_migrations_applied
   run_migrate_deploy
-  exec node dist/index.js
+  exec node dist/workers/server.js
 fi
 
 echo "Prisma migrate deploy failed and database is not a safe fresh-db or safe baseline case."

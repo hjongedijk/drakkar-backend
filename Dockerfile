@@ -24,6 +24,7 @@ ENV DOTNET_SYSTEM_GLOBALIZATION_INVARIANT=1
 RUN apk add --no-cache openssl zip unzip 7zip par2cmdline fuse ffmpeg \
   && { grep -q '^user_allow_other' /etc/fuse.conf 2>/dev/null || echo 'user_allow_other' >> /etc/fuse.conf; }
 COPY package*.json ./
+COPY prisma.config.ts ./prisma.config.ts
 COPY docker-entrypoint.sh ./docker-entrypoint.sh
 COPY --from=build /app/node_modules ./node_modules
 COPY --from=build /app/dist ./dist

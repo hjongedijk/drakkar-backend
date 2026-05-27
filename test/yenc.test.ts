@@ -1,6 +1,6 @@
 import { describe, it } from "node:test";
 import assert from "node:assert/strict";
-import { decodeArticleBody } from "../src/usenet/yenc.js";
+import { decodeArticleBody } from "../src/services/usenet/yenc.js";
 
 function encodeYenc(input: Buffer) {
   let output = "";

@@ -1,9 +1,17 @@
 import { afterEach, describe, it } from "node:test";
 import assert from "node:assert/strict";
-import type { RequestProvider } from "@prisma/client";
-import { fetchSeerrRequests, updateSeerrAvailable } from "../src/requests/seerr/client.js";
+import type { RequestProvider } from "../src/repositories/db/prisma.js";
+import { redis } from "../src/repositories/db/redis.js";
+import { fetchSeerrRequests, updateSeerrAvailable } from "../src/services/requests/seerr/client.js";
 
 const originalFetch = globalThis.fetch;
+const originalRedisGet = redis.get.bind(redis);
+const originalRedisSet = redis.set.bind(redis);
+const originalRedisDel = redis.del.bind(redis);
+const originalRedisIncr = redis.incr.bind(redis);
+const originalRedisExpire = redis.expire.bind(redis);
+const redisStrings = new Map<string, string>();
+const redisCounters = new Map<string, number>();
 
 function provider(): RequestProvider {
   return {
@@ -25,10 +33,33 @@ function provider(): RequestProvider {
 
 afterEach(() => {
   globalThis.fetch = originalFetch;
+  redisStrings.clear();
+  redisCounters.clear();
+  redis.get = originalRedisGet as typeof redis.get;
+  redis.set = originalRedisSet as typeof redis.set;
+  redis.del = originalRedisDel as typeof redis.del;
+  redis.incr = originalRedisIncr as typeof redis.incr;
+  redis.expire = originalRedisExpire as typeof redis.expire;
 });
 
 describe("fetchSeerrRequests", () => {
   it("paginates beyond the first 100 requests", async () => {
+    redis.get = (async (key: string) => redisStrings.get(key) ?? null) as typeof redis.get;
+    redis.set = (async (key: string, value: string) => {
+      redisStrings.set(key, value);
+      return "OK";
+    }) as typeof redis.set;
+    redis.del = (async (...keys: string[]) => {
+      let count = 0;
+      for (const key of keys) count += Number(redisStrings.delete(key));
+      return count;
+    }) as typeof redis.del;
+    redis.incr = (async (key: string) => {
+      const value = (redisCounters.get(key) ?? 0) + 1;
+      redisCounters.set(key, value);
+      return value;
+    }) as typeof redis.incr;
+    redis.expire = (async () => 1) as typeof redis.expire;
     const calls: string[] = [];
     globalThis.fetch = (async (input: string | URL | Request) => {
       const url = String(input);
@@ -78,6 +109,22 @@ describe("fetchSeerrRequests", () => {
   });
 
   it("normalizes requested seasons and episodes for tv requests", async () => {
+    redis.get = (async (key: string) => redisStrings.get(key) ?? null) as typeof redis.get;
+    redis.set = (async (key: string, value: string) => {
+      redisStrings.set(key, value);
+      return "OK";
+    }) as typeof redis.set;
+    redis.del = (async (...keys: string[]) => {
+      let count = 0;
+      for (const key of keys) count += Number(redisStrings.delete(key));
+      return count;
+    }) as typeof redis.del;
+    redis.incr = (async (key: string) => {
+      const value = (redisCounters.get(key) ?? 0) + 1;
+      redisCounters.set(key, value);
+      return value;
+    }) as typeof redis.incr;
+    redis.expire = (async () => 1) as typeof redis.expire;
     globalThis.fetch = (async () => new Response(JSON.stringify({
       pageInfo: { pages: 1, pageSize: 100, results: 1, page: 0 },
       results: [{
@@ -110,6 +157,22 @@ describe("fetchSeerrRequests", () => {
 
 describe("updateSeerrAvailable", () => {
   it("updates the Seerr media status endpoint documented for availability", async () => {
+    redis.get = (async (key: string) => redisStrings.get(key) ?? null) as typeof redis.get;
+    redis.set = (async (key: string, value: string) => {
+      redisStrings.set(key, value);
+      return "OK";
+    }) as typeof redis.set;
+    redis.del = (async (...keys: string[]) => {
+      let count = 0;
+      for (const key of keys) count += Number(redisStrings.delete(key));
+      return count;
+    }) as typeof redis.del;
+    redis.incr = (async (key: string) => {
+      const value = (redisCounters.get(key) ?? 0) + 1;
+      redisCounters.set(key, value);
+      return value;
+    }) as typeof redis.incr;
+    redis.expire = (async () => 1) as typeof redis.expire;
     const calls: Array<{ url: string; method?: string; body?: BodyInit | null }> = [];
     globalThis.fetch = (async (input: string | URL | Request, init?: RequestInit) => {
       calls.push({ url: String(input), method: init?.method, body: init?.body });

@@ -5,7 +5,7 @@ process.env.DATABASE_URL ??= "postgresql://test:test@localhost:5432/test";
 process.env.REDIS_URL ??= "redis://localhost:6379";
 process.env.MEDIA_SYMLINKS_DIR ??= "/mnt/media";
 
-const { applyNamingTemplate, cleanPathPart, completedPathFor, DEFAULT_NAMING_SETTINGS, libraryPathFor } = await import("../src/naming/namingService.js");
+const { applyNamingTemplate, cleanPathPart, completedPathFor, DEFAULT_NAMING_SETTINGS, libraryPathFor } = await import("../src/services/namingService.js");
 
 describe("naming service", () => {
   it("applies tokens and zero padding", () => {

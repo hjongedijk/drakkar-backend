@@ -1,6 +1,6 @@
 import { describe, it } from "node:test";
 import assert from "node:assert/strict";
-import { classifyRepairOutcome, deriveImportHealth, estimateHealthProgress } from "../src/health/checks.js";
+import { classifyRepairOutcome, deriveImportHealth, estimateHealthProgress } from "../src/services/health/checks.js";
 
 describe("health check helpers", () => {
   it("classifies repaired jobs before healthy fallback", () => {

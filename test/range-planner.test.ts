@@ -1,6 +1,6 @@
 import { describe, it } from "node:test";
 import assert from "node:assert/strict";
-import { normalizeRange } from "../src/streaming/rangePlanner.service.js";
+import { normalizeRange } from "../src/services/rangePlanner.service.js";
 
 describe("normalizeRange", () => {
   it("returns the full file range when no range is provided", () => {

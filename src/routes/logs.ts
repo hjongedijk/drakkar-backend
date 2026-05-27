@@ -1,5 +1,5 @@
 import type { FastifyInstance } from "fastify";
-import { prisma } from "../db/prisma.js";
+import { prisma } from "../repositories/db/prisma.js";
 
 type LogRow = {
   id: string;
@@ -42,10 +42,26 @@ function searchMessage(search: {
 
 async function buildLogRows() {
   const [downloads, repairs, searches, blocklist] = await Promise.all([
-    prisma.download.findMany({ orderBy: { updatedAt: "desc" }, take: 100 }),
-    prisma.repairJob.findMany({ orderBy: { updatedAt: "desc" }, take: 100 }),
-    prisma.searchHistory.findMany({ orderBy: { createdAt: "desc" }, take: 100 }),
-    prisma.blocklistItem.findMany({ orderBy: { createdAt: "desc" }, take: 100 })
+    prisma.download.findMany({
+      orderBy: { updatedAt: "desc" },
+      take: 100,
+      select: { id: true, updatedAt: true, error: true, status: true, title: true }
+    }),
+    prisma.repairJob.findMany({
+      orderBy: { updatedAt: "desc" },
+      take: 100,
+      select: { id: true, updatedAt: true, status: true, message: true, type: true }
+    }),
+    prisma.searchHistory.findMany({
+      orderBy: { createdAt: "desc" },
+      take: 100,
+      select: { id: true, createdAt: true, status: true, resultCount: true, message: true, type: true, query: true }
+    }),
+    prisma.blocklistItem.findMany({
+      orderBy: { createdAt: "desc" },
+      take: 100,
+      select: { id: true, createdAt: true, title: true, reason: true }
+    })
   ]);
 
   const visibleSearches = searches.filter((search) => {

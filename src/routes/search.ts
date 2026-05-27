@@ -1,11 +1,11 @@
 import { z } from "zod";
 import type { FastifyInstance } from "fastify";
-import { addNzbFromPath, findReusableDownload } from "../downloads/downloadService.js";
-import { getSettings } from "../settings/settingsStore.js";
-import { downloadNzb, fetchNzbForRelease, testDownloadNzb, testNzbhydraConnection } from "../indexers/nzbhydra/client.js";
-import { fetchDiscoverHome, fetchDiscoverList, fetchMediaDetails, searchDiscoverMedia } from "../metadata/metadataService.js";
-import { getSearchHistory, runSearch } from "../search/searchService.js";
-import { toPublicReleases } from "../releases/public.js";
+import { addNzbFromPath, findReusableDownload } from "../services/downloadService.js";
+import { getSettings } from "../services/settings/settingsStore.js";
+import { downloadNzb, fetchNzbForRelease, testDownloadNzb, testNzbhydraConnection } from "../services/indexers/nzbhydra/client.js";
+import { fetchDiscoverHome, fetchDiscoverList, fetchMediaDetails, searchDiscoverMedia } from "../services/metadataService.js";
+import { getSearchHistory, runSearch } from "../services/searchService.js";
+import { toPublicReleases } from "../services/releases/public.js";
 
 const baseSearchSchema = z.object({
   query: z.string().optional(),

@@ -1,8 +1,12 @@
 import { afterEach, describe, it } from "node:test";
 import assert from "node:assert/strict";
-import { fetchMediaMetadata, fetchSeasonEpisodes, fetchSeriesStructure } from "../src/metadata/metadataService.js";
+import { fetchMediaMetadata, fetchSeasonEpisodes, fetchSeriesStructure } from "../src/services/metadataService.js";
+import { redis } from "../src/repositories/db/redis.js";
 
 const originalFetch = globalThis.fetch;
+const originalRedisGet = redis.get.bind(redis);
+const originalRedisSet = redis.set.bind(redis);
+const redisCache = new Map<string, string>();
 
 const settings = {
   tmdbApiKey: "tmdb-key",
@@ -13,10 +17,18 @@ const settings = {
 
 afterEach(() => {
   globalThis.fetch = originalFetch;
+  redisCache.clear();
+  redis.get = originalRedisGet as typeof redis.get;
+  redis.set = originalRedisSet as typeof redis.set;
 });
 
 describe("metadataService cache", () => {
   it("reuses cached series structure and season episode lookups", async () => {
+    redis.get = (async (key: string) => redisCache.get(key) ?? null) as typeof redis.get;
+    redis.set = (async (key: string, value: string) => {
+      redisCache.set(key, value);
+      return "OK";
+    }) as typeof redis.set;
     const uniqueTitle = `Cached Show ${Date.now()}`;
     const calls: string[] = [];
     globalThis.fetch = (async (input: string | URL | Request) => {
@@ -56,6 +68,11 @@ describe("metadataService cache", () => {
   });
 
   it("reuses cached media metadata lookups", async () => {
+    redis.get = (async (key: string) => redisCache.get(key) ?? null) as typeof redis.get;
+    redis.set = (async (key: string, value: string) => {
+      redisCache.set(key, value);
+      return "OK";
+    }) as typeof redis.set;
     const uniqueTitle = `Cache Movie ${Date.now()}`;
     const calls: string[] = [];
     globalThis.fetch = (async (input: string | URL | Request) => {

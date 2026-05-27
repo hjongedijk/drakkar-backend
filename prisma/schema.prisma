@@ -1,10 +1,10 @@
 generator client {
-  provider = "prisma-client-js"
+  provider = "prisma-client"
+  output   = "../src/models/generated/prisma"
 }
 
 datasource db {
   provider = "postgresql"
-  url      = env("DATABASE_URL")
 }
 
 model User {
@@ -109,6 +109,8 @@ model ReleaseDecision {
   reasons      String[]
   parsed       Json
   createdAt    DateTime        @default(now())
+
+  @@index([createdAt])
 }
 
 model SearchHistory {
@@ -159,6 +161,7 @@ model NzbDocument {
   mounts      VfsMount[]
   archiveEntries ArchiveEntry[]
   download    Download?
+  mediaFiles  MediaFile[]
   createdAt   DateTime  @default(now())
 }
 
@@ -195,6 +198,7 @@ model VfsMount {
   path          String      @unique
   status        String      @default("mounted")
   streamable    Boolean     @default(false)
+  mediaFiles    MediaFile[]
   createdAt     DateTime    @default(now())
   updatedAt     DateTime    @updatedAt
 
@@ -255,9 +259,133 @@ model Download {
   completedAt   DateTime?
   repairJobs     RepairJob[]
   imports        ImportItem[]
+  mediaFiles     MediaFile[]
 
   @@index([status, updatedAt])
   @@index([createdAt])
+}
+
+model Movie {
+  id             String             @id @default(cuid())
+  tmdbId         String             @unique @map("tmdb_id")
+  imdbId         String?            @map("imdb_id")
+  tvdbId         String?            @map("tvdb_id")
+  title          String
+  originalTitle  String?            @map("original_title")
+  overview       String?
+  releaseDate    DateTime?          @map("release_date")
+  year           Int?
+  runtimeMinutes Int?               @map("runtime_minutes")
+  posterPath     String?            @map("poster_path")
+  backdropPath   String?            @map("backdrop_path")
+  rawSeerr       Json?              @map("raw_seerr")
+  rawTmdb        Json?              @map("raw_tmdb")
+  createdAt      DateTime           @default(now()) @map("created_at")
+  updatedAt      DateTime           @updatedAt @map("updated_at")
+  requests       MediaRequest[]     @relation("MovieRequests")
+  libraryItems   MediaLibraryItem[] @relation("MovieLibraryItems")
+  mediaFiles     MediaFile[]        @relation("MovieFiles")
+
+  @@index([title])
+  @@index([year])
+  @@index([imdbId])
+  @@index([tvdbId])
+  @@map("movies")
+}
+
+model TvShow {
+  id               String             @id @default(cuid())
+  tmdbId           String             @unique @map("tmdb_id")
+  imdbId           String?            @map("imdb_id")
+  tvdbId           String?            @map("tvdb_id")
+  title            String
+  originalTitle    String?            @map("original_title")
+  overview         String?
+  firstAirDate     DateTime?          @map("first_air_date")
+  lastAirDate      DateTime?          @map("last_air_date")
+  year             Int?
+  posterPath       String?            @map("poster_path")
+  backdropPath     String?            @map("backdrop_path")
+  numberOfSeasons  Int?               @map("number_of_seasons")
+  numberOfEpisodes Int?               @map("number_of_episodes")
+  rawSeerr         Json?              @map("raw_seerr")
+  rawTmdb          Json?              @map("raw_tmdb")
+  createdAt        DateTime           @default(now()) @map("created_at")
+  updatedAt        DateTime           @updatedAt @map("updated_at")
+  seasons          TvSeason[]
+  episodes         TvEpisode[]
+  requests         MediaRequest[]     @relation("TvShowRequests")
+  libraryItems     MediaLibraryItem[] @relation("TvShowLibraryItems")
+
+  @@index([title])
+  @@index([year])
+  @@index([imdbId])
+  @@index([tvdbId])
+  @@map("tv_shows")
+}
+
+model TvSeason {
+  id           String             @id @default(cuid())
+  tvShowId     String             @map("tv_show_id")
+  tvShow       TvShow             @relation(fields: [tvShowId], references: [id], onDelete: Cascade)
+  tmdbId       String?            @map("tmdb_id")
+  tvdbId       String?            @map("tvdb_id")
+  seasonNumber Int                @map("season_number")
+  title        String?
+  overview     String?
+  airDate      DateTime?          @map("air_date")
+  posterPath   String?            @map("poster_path")
+  episodeCount Int?               @map("episode_count")
+  rawSeerr     Json?              @map("raw_seerr")
+  rawTmdb      Json?              @map("raw_tmdb")
+  createdAt    DateTime           @default(now()) @map("created_at")
+  updatedAt    DateTime           @updatedAt @map("updated_at")
+  episodes     TvEpisode[]
+  requests     MediaRequest[]     @relation("TvSeasonRequests")
+  libraryItems MediaLibraryItem[] @relation("TvSeasonLibraryItems")
+
+  @@unique([tvShowId, seasonNumber])
+  @@index([tvShowId])
+  @@index([tvShowId, seasonNumber])
+  @@index([tmdbId])
+  @@index([tvdbId])
+  @@map("tv_seasons")
+}
+
+model TvEpisode {
+  id                    String             @id @default(cuid())
+  tvShowId              String             @map("tv_show_id")
+  tvShow                TvShow             @relation(fields: [tvShowId], references: [id], onDelete: Cascade)
+  seasonId              String             @map("season_id")
+  season                TvSeason           @relation(fields: [seasonId], references: [id], onDelete: Cascade)
+  tmdbId                String?            @map("tmdb_id")
+  imdbId                String?            @map("imdb_id")
+  tvdbId                String?            @map("tvdb_id")
+  seasonNumber          Int                @map("season_number")
+  episodeNumber         Int                @map("episode_number")
+  absoluteEpisodeNumber Int?               @map("absolute_episode_number")
+  title                 String
+  overview              String?
+  airDate               DateTime?          @map("air_date")
+  runtimeMinutes        Int?               @map("runtime_minutes")
+  stillPath             String?            @map("still_path")
+  rawSeerr              Json?              @map("raw_seerr")
+  rawTmdb               Json?              @map("raw_tmdb")
+  createdAt             DateTime           @default(now()) @map("created_at")
+  updatedAt             DateTime           @updatedAt @map("updated_at")
+  requests              MediaRequest[]     @relation("TvEpisodeRequests")
+  libraryItems          MediaLibraryItem[] @relation("TvEpisodeLibraryItems")
+  mediaFiles            MediaFile[]        @relation("TvEpisodeFiles")
+
+  @@unique([tvShowId, seasonNumber, episodeNumber])
+  @@unique([seasonId, episodeNumber])
+  @@index([tvShowId])
+  @@index([seasonId])
+  @@index([tvShowId, seasonNumber, episodeNumber])
+  @@index([tmdbId])
+  @@index([imdbId])
+  @@index([tvdbId])
+  @@map("tv_episodes")
 }
 
 model RequestProvider {
@@ -298,6 +426,16 @@ model MediaRequest {
   status            String           @default("pending")
   selectedProfileId String?
   selectedRelease   Json?
+  movieId           String?
+  movie             Movie?           @relation("MovieRequests", fields: [movieId], references: [id], onDelete: SetNull)
+  tvShowId          String?
+  tvShow            TvShow?          @relation("TvShowRequests", fields: [tvShowId], references: [id], onDelete: SetNull)
+  seasonId          String?
+  seasonTarget      TvSeason?        @relation("TvSeasonRequests", fields: [seasonId], references: [id], onDelete: SetNull)
+  episodeId         String?
+  episodeTarget     TvEpisode?       @relation("TvEpisodeRequests", fields: [episodeId], references: [id], onDelete: SetNull)
+  rawRequest        Json?
+  rawMedia          Json?
   downloadId        String?
   imports           ImportItem[]
   createdAt         DateTime         @default(now())
@@ -306,6 +444,11 @@ model MediaRequest {
   @@unique([providerId, externalId])
   @@index([downloadId])
   @@index([status, createdAt])
+  @@index([movieId])
+  @@index([tvShowId])
+  @@index([seasonId])
+  @@index([episodeId])
+  @@map("media_requests")
 }
 
 model RepairJob {
@@ -325,12 +468,14 @@ model RepairJob {
 }
 
 model FailedRelease {
-  id        String   @id @default(cuid())
-  guid      String?
-  title     String
+  id         String   @id @default(cuid())
+  guid       String?
+  title      String
   reason    String
   downloadId String?
   createdAt DateTime @default(now())
+
+  @@index([createdAt])
 }
 
 model BlocklistItem {
@@ -350,6 +495,7 @@ model BlocklistItem {
 
 model ImportItem {
   id            String       @id @default(cuid())
+  identityKey   String       @unique
   downloadId    String?
   download      Download?    @relation(fields: [downloadId], references: [id], onDelete: SetNull)
   requestId     String?
@@ -364,6 +510,7 @@ model ImportItem {
   status        String       @default("imported")
   metadataPath  String?
   stableIdPath  String?
+  mediaFiles    MediaFile[]
   symlinks      Symlink[]
   createdAt     DateTime     @default(now())
   updatedAt     DateTime     @updatedAt
@@ -372,6 +519,7 @@ model ImportItem {
   @@index([requestId])
   @@index([mediaType, title, year, season, episode])
   @@index([createdAt])
+  @@map("media_import_items")
 }
 
 model Symlink {
@@ -386,28 +534,30 @@ model Symlink {
 
   @@index([importId])
   @@index([status, updatedAt])
+  @@map("media_symlinks")
 }
 
 model MediaLibraryItem {
   id                String   @id @default(cuid())
   sourceKey         String   @unique
+  identityKey       String   @unique
   mediaType         String
+  movieId           String?
+  movie             Movie?   @relation("MovieLibraryItems", fields: [movieId], references: [id], onDelete: SetNull)
+  tvShowId          String?
+  tvShow            TvShow?  @relation("TvShowLibraryItems", fields: [tvShowId], references: [id], onDelete: SetNull)
+  seasonId          String?
+  seasonTarget      TvSeason? @relation("TvSeasonLibraryItems", fields: [seasonId], references: [id], onDelete: SetNull)
+  episodeId         String?
+  episodeTarget     TvEpisode? @relation("TvEpisodeLibraryItems", fields: [episodeId], references: [id], onDelete: SetNull)
   title             String
   sortTitle         String
   year              Int?
   tmdbId            String?
   tvdbId            String?
   imdbId            String?
-  posterUrl         String?
-  backdropUrl       String?
-  overview          String?
-  metadataProvider  String?
-  metadataUpdatedAt DateTime?
   season            Int?
   episode           Int?
-  episodeTitle      String?
-  episodeOverview   String?
-  episodeAirDate    DateTime?
   requestedBy       String?
   requestProvider   String?
   requestId         String?
@@ -443,4 +593,53 @@ model MediaLibraryItem {
   @@index([downloadId])
   @@index([filePath])
   @@index([lastStreamedAt])
+  @@index([movieId])
+  @@index([tvShowId])
+  @@index([seasonId])
+  @@index([episodeId])
+  @@map("media_library_items")
+}
+
+model MediaFile {
+  id           String      @id @default(cuid())
+  mediaType    String      @map("media_type")
+  movieId      String?     @map("movie_id")
+  movie        Movie?      @relation("MovieFiles", fields: [movieId], references: [id], onDelete: Cascade)
+  episodeId    String?     @map("episode_id")
+  episode      TvEpisode?  @relation("TvEpisodeFiles", fields: [episodeId], references: [id], onDelete: Cascade)
+  importId     String?     @map("import_id")
+  importItem   ImportItem? @relation(fields: [importId], references: [id], onDelete: SetNull)
+  downloadId   String?     @map("download_id")
+  download     Download?   @relation(fields: [downloadId], references: [id], onDelete: SetNull)
+  nzbId        String?     @map("nzb_id")
+  nzbDocument  NzbDocument? @relation(fields: [nzbId], references: [id], onDelete: SetNull)
+  vfsMountId   String?     @map("vfs_mount_id")
+  vfsMount     VfsMount?   @relation(fields: [vfsMountId], references: [id], onDelete: SetNull)
+  path         String?     @unique
+  folderPath   String?     @map("folder_path")
+  filePath     String?     @unique @map("file_path")
+  symlinkPath  String?     @unique @map("symlink_path")
+  strmPath     String?     @unique @map("strm_path")
+  filename     String?
+  size         Float?
+  duration     Float?
+  quality      String?
+  source       String?
+  codec        String?
+  audio        String?
+  hdr          Boolean     @default(false)
+  dv           Boolean     @default(false)
+  releaseGroup String?     @map("release_group")
+  isAvailable  Boolean     @default(true) @map("is_available")
+  createdAt    DateTime    @default(now()) @map("created_at")
+  updatedAt    DateTime    @updatedAt @map("updated_at")
+
+  @@index([movieId])
+  @@index([episodeId])
+  @@index([importId])
+  @@index([downloadId])
+  @@index([nzbId])
+  @@index([vfsMountId])
+  @@index([isAvailable])
+  @@map("media_files")
 }

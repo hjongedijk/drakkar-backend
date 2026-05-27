@@ -1,10 +1,10 @@
 import { z } from "zod";
 import type { FastifyInstance } from "fastify";
-import { getImport, importCompletedPath, listImports, migrateImportsToCurrentNaming, reprocessImport } from "../import/importService.js";
-import { getNamingSettings, previewNaming, updateNamingSettings } from "../naming/namingService.js";
-import { refreshMediaLibrary } from "../media-library/libraryService.js";
-import { extractDownloadPath, listRepairJobs, runBackgroundRepairSweep, runRepair } from "../repair/repairService.js";
-import { cleanupSymlinks, listSymlinks, pruneLibraryDirectories, removeStaleLibraryFilesystemEntries, repairSymlinks } from "../symlinks/symlinkService.js";
+import { getImport, importCompletedPath, listImports, migrateImportsToCurrentNaming, reprocessImport } from "../services/importService.js";
+import { getNamingSettings, previewNaming, updateNamingSettings } from "../services/namingService.js";
+import { refreshMediaLibrary } from "../services/libraryService.js";
+import { extractDownloadPath, listRepairJobs, runBackgroundRepairSweep, runRepair } from "../services/repairService.js";
+import { cleanupSymlinks, listSymlinks, pruneLibraryDirectories, removeStaleLibraryFilesystemEntries, repairSymlinks } from "../services/symlinkService.js";
 
 const reprocessSchema = z.object({
   sourcePath: z.string().optional()

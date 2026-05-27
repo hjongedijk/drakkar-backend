@@ -4,10 +4,17 @@ import assert from "node:assert/strict";
 process.env.DATABASE_URL ??= "postgresql://test:test@localhost:5432/test";
 process.env.REDIS_URL ??= "redis://localhost:6379";
 
-const originalFetch = globalThis.fetch;
+const { redis } = await import("../src/repositories/db/redis.js");
+const { searchNzbhydra, searchCacheKey } = await import("../src/services/indexers/nzbhydra/client.js");
 
-const { redis } = await import("../src/db/redis.js");
-const { searchNzbhydra, searchCacheKey } = await import("../src/indexers/nzbhydra/client.js");
+const originalFetch = globalThis.fetch;
+const originalRedisGet = redis.get.bind(redis);
+const originalRedisSet = redis.set.bind(redis);
+const originalRedisDel = redis.del.bind(redis);
+const originalRedisHincrby = redis.hincrby.bind(redis);
+const originalRedisHgetall = redis.hgetall.bind(redis);
+const redisStrings = new Map<string, string>();
+const redisHashes = new Map<string, Record<string, string>>();
 
 const settings = {
   nzbhydraUrl: "http://hydra.local",
@@ -21,14 +28,37 @@ const keysToDelete = new Set<string>();
 
 afterEach(async () => {
   globalThis.fetch = originalFetch;
+  redisStrings.clear();
+  redisHashes.clear();
+  redis.get = originalRedisGet as typeof redis.get;
+  redis.set = originalRedisSet as typeof redis.set;
+  redis.del = originalRedisDel as typeof redis.del;
+  redis.hincrby = originalRedisHincrby as typeof redis.hincrby;
+  redis.hgetall = originalRedisHgetall as typeof redis.hgetall;
   if (keysToDelete.size > 0) {
-    await redis.del(...keysToDelete);
     keysToDelete.clear();
   }
 });
 
 describe("searchNzbhydra", () => {
   it("reuses cached identical searches", async () => {
+    redis.get = (async (key: string) => redisStrings.get(key) ?? null) as typeof redis.get;
+    redis.set = (async (key: string, value: string) => {
+      redisStrings.set(key, value);
+      return "OK";
+    }) as typeof redis.set;
+    redis.del = (async (...keys: string[]) => {
+      let count = 0;
+      for (const key of keys) count += Number(redisStrings.delete(key));
+      return count;
+    }) as typeof redis.del;
+    redis.hincrby = (async (key: string, field: string, increment: number) => {
+      const hash = redisHashes.get(key) ?? {};
+      hash[field] = String((Number(hash[field] ?? 0) + increment));
+      redisHashes.set(key, hash);
+      return Number(hash[field]);
+    }) as typeof redis.hincrby;
+    redis.hgetall = (async (key: string) => redisHashes.get(key) ?? {}) as typeof redis.hgetall;
     let fetchCount = 0;
     const params = {
       kind: "movie" as const,
@@ -53,6 +83,23 @@ describe("searchNzbhydra", () => {
   });
 
   it("dedupes concurrent identical searches in flight", async () => {
+    redis.get = (async (key: string) => redisStrings.get(key) ?? null) as typeof redis.get;
+    redis.set = (async (key: string, value: string) => {
+      redisStrings.set(key, value);
+      return "OK";
+    }) as typeof redis.set;
+    redis.del = (async (...keys: string[]) => {
+      let count = 0;
+      for (const key of keys) count += Number(redisStrings.delete(key));
+      return count;
+    }) as typeof redis.del;
+    redis.hincrby = (async (key: string, field: string, increment: number) => {
+      const hash = redisHashes.get(key) ?? {};
+      hash[field] = String((Number(hash[field] ?? 0) + increment));
+      redisHashes.set(key, hash);
+      return Number(hash[field]);
+    }) as typeof redis.hincrby;
+    redis.hgetall = (async (key: string) => redisHashes.get(key) ?? {}) as typeof redis.hgetall;
     let fetchCount = 0;
     const params = {
       kind: "episode" as const,
