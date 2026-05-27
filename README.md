@@ -16,7 +16,7 @@ Drakkar coordinates request sync, NZB search, download queueing, FUSE-mounted me
 
 ## Version
 
-Current backend version: `0.3.3`
+Current backend version: `0.3.4`
 
 ## Runtime layout
 

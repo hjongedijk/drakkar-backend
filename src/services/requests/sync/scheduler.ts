@@ -23,7 +23,24 @@ let running = false;
 let rssRunning = false;
 let logPruneRunning = false;
 const FULL_REQUEST_SYNC_BATCH_SIZE = 100;
+const INCREMENTAL_REQUEST_SYNC_BATCH_SIZE = 200;
 const REQUEST_RECOVERY_BATCH_LIMIT = 25;
+const REQUEST_SYNC_CURSOR_KEY_PREFIX = "request-sync.cursor:";
+
+async function getRequestSyncCursor(providerId: string) {
+  const row = await prisma.setting.findUnique({ where: { key: `${REQUEST_SYNC_CURSOR_KEY_PREFIX}${providerId}` } });
+  const value = row?.value as { skip?: unknown } | undefined;
+  const skip = typeof value?.skip === "number" && Number.isFinite(value.skip) && value.skip >= 0 ? Math.floor(value.skip) : 0;
+  return skip;
+}
+
+async function setRequestSyncCursor(providerId: string, skip: number) {
+  await prisma.setting.upsert({
+    where: { key: `${REQUEST_SYNC_CURSOR_KEY_PREFIX}${providerId}` },
+    update: { value: { skip } },
+    create: { key: `${REQUEST_SYNC_CURSOR_KEY_PREFIX}${providerId}`, value: { skip } }
+  });
+}
 
 async function configuredTaskInterval(taskId: string, fallback: number | null) {
   const settings = await getSettings().catch(() => null);
@@ -291,7 +308,55 @@ export async function runRequestSyncCycle(logger: FastifyBaseLogger) {
   running = true;
   try {
     await runTrackedTask(REQUEST_SYNC_TASK_ID, async () => {
-      const sync = await syncRequests();
+      const providers = await prisma.requestProvider.findMany({
+        where: { enabled: true, type: "seerr" },
+        select: { id: true, name: true }
+      });
+      const sync = {
+        imported: 0,
+        updated: 0,
+        skipped: 0,
+        fetched: 0,
+        failedProviders: 0,
+        autoGrabbed: 0,
+        budgetExceeded: false,
+        requests: [],
+        providerResults: []
+      } as Awaited<ReturnType<typeof syncRequests>>;
+
+      for (const provider of providers) {
+        const skip = await getRequestSyncCursor(provider.id);
+        const batch = await syncRequests(provider.id, {
+          full: true,
+          skip,
+          maxRequests: INCREMENTAL_REQUEST_SYNC_BATCH_SIZE,
+          pageSize: INCREMENTAL_REQUEST_SYNC_BATCH_SIZE,
+          refreshLibrary: false
+        });
+        sync.imported += batch.imported;
+        sync.updated += batch.updated;
+        sync.skipped += batch.skipped;
+        sync.fetched += batch.fetched;
+        sync.failedProviders += batch.failedProviders;
+        sync.autoGrabbed += batch.autoGrabbed;
+        sync.budgetExceeded = sync.budgetExceeded || batch.budgetExceeded;
+        sync.requests.push(...batch.requests);
+        sync.providerResults.push(...batch.providerResults);
+
+        const nextSkip = batch.fetched < INCREMENTAL_REQUEST_SYNC_BATCH_SIZE ? 0 : skip + INCREMENTAL_REQUEST_SYNC_BATCH_SIZE;
+        await setRequestSyncCursor(provider.id, nextSkip);
+        logger.info({
+          providerId: provider.id,
+          providerName: provider.name,
+          skip,
+          nextSkip,
+          batchFetched: batch.fetched,
+          batchImported: batch.imported,
+          batchUpdated: batch.updated,
+          batchSkipped: batch.skipped
+        }, "request sync batch completed");
+      }
+
       logger.info({
         fetched: sync.fetched,
         imported: sync.imported,

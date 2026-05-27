@@ -1,6 +1,7 @@
 import type { FastifyBaseLogger } from "fastify";
 import { prisma, Prisma, type MediaRequest, type RequestProvider } from "../../../repositories/db/prisma.js";
 import { refreshMediaLibrary } from "../../libraryService.js";
+import { refreshLibraryRequestRows } from "../../media-library/libraryRefresh.js";
 import { fetchMediaDetails as fetchMetadataDetails, fetchSeriesStructure } from "../../metadataService.js";
 import { getSettings } from "../../settings/settingsStore.js";
 import { syncRuntimeSettingsFromDatabase } from "../../settings/settingsStore.js";
@@ -26,6 +27,7 @@ import {
 import { hydrateLegacyRequestFields } from "../../media-library/normalizedMedia.js";
 
 const MONITOR_QUEUE_SEED_STATUSES = ["queued", "fetching_nzb", "verifying", "waiting_for_provider", "waiting_for_nzb", "downloading", "paused"];
+const MONITORED_REQUEST_STATUSES = ["approved", "grabbed", "available", "release_failed", "no_release_found", "auto_grab_failed"];
 const MONITORED_REQUESTS_MAX_DURATION_MS = 60_000;
 const MONITORED_REQUEST_OPERATION_TIMEOUT_MS = 20_000;
 const REQUEST_RECOVERY_MAX_DURATION_MS = 45_000;
@@ -35,8 +37,11 @@ const FAILED_REQUEST_RECOVERY_MAX_PER_CYCLE = 8;
 const SELECTED_RELEASE_RECOVERY_MAX_PER_CYCLE = 8;
 const ACTIVE_WANTED_SEARCHES_PER_CYCLE = 1;
 const MONITORED_REQUEST_TIMEOUT_BUDGET = 4;
+const MONITORED_REQUEST_BATCH_SIZE = 120;
+const MONITORED_TV_BATCH_SIZE = 12;
 const MONITORED_MOVIE_SEARCH_LIMIT = 30;
 const MONITORED_TV_SEARCH_LIMIT = 30;
+const MONITORED_TV_CURSOR_KEY = "request-recovery.tv.cursor";
 const MONITORED_SEARCH_OPTIONS = {
   searchLimit: MONITORED_MOVIE_SEARCH_LIMIT,
   skipFallback: true,
@@ -135,6 +140,58 @@ function desiredMovieRequestStatus(input: {
   }
   if (input.request.status === "grabbed") return { status: "approved", clearDownloadId: true };
   return { status: input.request.status, clearDownloadId: false };
+}
+
+async function getMonitoredTvCursor() {
+  const row = await prisma.setting.findUnique({ where: { key: MONITORED_TV_CURSOR_KEY } });
+  const value = row?.value as { skip?: unknown } | undefined;
+  const skip = typeof value?.skip === "number" && Number.isFinite(value.skip) && value.skip >= 0 ? Math.floor(value.skip) : 0;
+  return skip;
+}
+
+async function setMonitoredTvCursor(skip: number) {
+  await prisma.setting.upsert({
+    where: { key: MONITORED_TV_CURSOR_KEY },
+    update: { value: { skip } },
+    create: { key: MONITORED_TV_CURSOR_KEY, value: { skip } }
+  });
+}
+
+async function fetchMonitoredTvRequestsBatch() {
+  const where = {
+    mediaType: "tv",
+    status: { in: MONITORED_REQUEST_STATUSES }
+  };
+  const total = await prisma.mediaRequest.count({ where });
+  if (total === 0) {
+    await setMonitoredTvCursor(0).catch(() => undefined);
+    return [] as Array<MediaRequest & { provider?: RequestProvider | null }>;
+  }
+
+  let skip = await getMonitoredTvCursor();
+  if (skip >= total) skip = 0;
+
+  let rows = await prisma.mediaRequest.findMany({
+    where,
+    orderBy: [{ updatedAt: "asc" }, { id: "asc" }],
+    skip,
+    take: MONITORED_TV_BATCH_SIZE,
+    include: REQUEST_SYNC_RELATION_SELECT
+  });
+
+  if (rows.length === 0) {
+    skip = 0;
+    rows = await prisma.mediaRequest.findMany({
+      where,
+      orderBy: [{ updatedAt: "asc" }, { id: "asc" }],
+      take: MONITORED_TV_BATCH_SIZE,
+      include: REQUEST_SYNC_RELATION_SELECT
+    });
+  }
+
+  const nextSkip = skip + rows.length >= total ? 0 : skip + rows.length;
+  await setMonitoredTvCursor(nextSkip).catch(() => undefined);
+  return rows.map((request) => hydrateLegacyRequestFields(request));
 }
 
 async function fetchProviderRequests(
@@ -370,7 +427,9 @@ export async function syncRequests(
     }
   }
 
-  if ((createdCount > 0 || updatedCount > 0) && options.refreshLibrary !== false) void refreshMediaLibrary().catch(() => undefined);
+  if ((createdCount > 0 || updatedCount > 0) && options.refreshLibrary !== false) {
+    void refreshLibraryRequestRows(imported.map((request) => request.id)).catch(() => undefined);
+  }
   return {
     imported: createdCount,
     updated: updatedCount,
@@ -470,7 +529,7 @@ export async function syncRequestFromWebhook(payload: unknown, providerId?: stri
       const grabbed = await maybeAutoGrabWebhookRequest(provider, result.request).catch((error) => ({
         error: error instanceof Error ? error.message : "automatic request grab failed"
       }));
-      await refreshMediaLibrary().catch(() => undefined);
+      await refreshLibraryRequestRows([result.request.id]).catch(() => undefined);
       return {
         ok: true,
         mode: "targeted" as const,
@@ -555,7 +614,7 @@ export async function recoverFailedRequestDownloads(options: { limit?: number } 
     await prisma.mediaRequest.update({ where: { id: request.id }, data: { status: "release_failed", downloadId: null } });
     recovered.push(await grabForRequestMediaType(request.id, request.mediaType));
   }
-  if (recovered.length > 0) await refreshMediaLibrary().catch(() => undefined);
+  if (recovered.length > 0) await refreshLibraryRequestRows(requests.map((request) => request.id)).catch(() => undefined);
   return { scanned: requests.length, recovered: recovered.length, results: recovered };
 }
 
@@ -613,7 +672,7 @@ export async function recoverSelectedReleaseDownloads(options: { limit?: number 
     }
   }
 
-  if (recovered.length > 0) await refreshMediaLibrary().catch(() => undefined);
+  if (recovered.length > 0) await refreshLibraryRequestRows(recovered.map((item) => item.requestId).filter((value): value is string => Boolean(value))).catch(() => undefined);
   return { recovered: recovered.length, results: recovered };
 }
 
@@ -668,7 +727,7 @@ export async function backfillPlaceholderRequestMetadata() {
     updated += 1;
   }
 
-  if (updated > 0) await refreshMediaLibrary().catch(() => undefined);
+  if (updated > 0) await refreshLibraryRequestRows(requests.map((request) => request.id)).catch(() => undefined);
   return { scanned: requests.length, updated };
 }
 
@@ -696,13 +755,17 @@ export async function ensureMonitoredRequests(logger?: FastifyBaseLogger) {
   if (pendingQueueItems >= queueSeedTarget) {
     return { retried: 0, queueSeedTarget, pendingQueueItems, skippedBecauseQueueFull: 1, results: [] };
   }
-  const requests = (await prisma.mediaRequest.findMany({
+  const movieRequests = (await prisma.mediaRequest.findMany({
     where: {
-      status: { in: ["approved", "grabbed", "available", "release_failed", "no_release_found", "auto_grab_failed"] }
+      mediaType: "movie",
+      status: { in: MONITORED_REQUEST_STATUSES }
     },
-    orderBy: [{ status: "asc" }, { mediaType: "asc" }, { updatedAt: "asc" }],
+    orderBy: [{ status: "asc" }, { updatedAt: "asc" }, { id: "asc" }],
+    take: Math.max(queueSeedTarget, Math.ceil(MONITORED_REQUEST_BATCH_SIZE / 2)),
     include: REQUEST_SYNC_RELATION_SELECT
   })).map((request) => hydrateLegacyRequestFields(request));
+  const tvRequests = await fetchMonitoredTvRequestsBatch();
+  const requests = [...tvRequests, ...movieRequests];
 
   const retried = [];
   let skippedBecauseQueueFull = 0;
@@ -870,7 +933,7 @@ export async function ensureMonitoredRequests(logger?: FastifyBaseLogger) {
     pendingQueueItems = await monitoredQueuePendingCount();
   }
 
-  if (retried.length > 0) await refreshMediaLibrary().catch(() => undefined);
+  if (retried.length > 0) await refreshLibraryRequestRows(retried.map((item) => item.requestId)).catch(() => undefined);
   return { retried: retried.length, queueSeedTarget, pendingQueueItems, skippedBecauseQueueFull, results: retried };
 }
 

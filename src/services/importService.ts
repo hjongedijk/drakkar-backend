@@ -6,7 +6,7 @@ import { detectArchive, isJunkFile, isMediaFile } from "../services/extract/dete
 import { extractArchiveFiles, extractArchivesInPath } from "../services/extractService.js";
 import { writeImportMetadata } from "../services/metadataService.js";
 import { importIdentityKey, inferMediaIdentity, mediaIdentityKey } from "../services/media-library/identity.js";
-import { refreshMediaLibrary } from "../services/libraryService.js";
+import { refreshLibraryImportRows, refreshLibraryTargets } from "../services/media-library/libraryRefresh.js";
 import { safeUpdateDownload } from "../services/downloads/downloadState.js";
 import { completedPathFor, getNamingSettings } from "../services/namingService.js";
 import { getIgnoredPatterns, matchesIgnoredPattern } from "../services/policyService.js";
@@ -556,7 +556,10 @@ export async function makeMountedDownloadAvailable(input: { downloadId: string; 
     error: null
   });
   await reconcileRequestStatusAfterImport(input.requestId, download.id);
-  await refreshMediaLibrary();
+  await refreshLibraryTargets({
+    requestIds: input.requestId ? [input.requestId] : [],
+    importIds: imported.map((entry) => entry.item.id)
+  });
   return { downloadId: download.id, import: imported[0]?.item, symlink: imported[0]?.link, imports: imported.map((item) => item.item), streamPath: imported[0]?.streamPath };
 }
 
@@ -622,7 +625,10 @@ export async function importMountedDownloadByExtraction(input: { downloadId: str
     } else {
       await prisma.mediaRequest.updateMany({ where: { downloadId: download.id }, data: { status: "available" } });
     }
-    await refreshMediaLibrary();
+    await refreshLibraryTargets({
+      requestIds: input.requestId ? [input.requestId] : [],
+      importIds: imported.map((entry) => entry.id)
+    });
     return { downloadId: download.id, imports: imported };
   } finally {
     await rm(tempExtractPath, { recursive: true, force: true }).catch(() => undefined);
@@ -640,6 +646,7 @@ export async function repairSuspiciousImports(options: { limit?: number } = {}) 
 
   let repaired = 0;
   let hidden = 0;
+  const repairedIds: string[] = [];
   for (const item of imports.slice(0, limit)) {
     const requestInfo = item.requestId ? await requestMetadata(item.requestId) : {};
     const filename = normalizeMountedFilename(decodePathBasename(item.completedPath));
@@ -691,10 +698,13 @@ export async function repairSuspiciousImports(options: { limit?: number } = {}) 
       episode: updated.episode
     }).catch(() => undefined);
     await createLibraryEntryForImport(updated).catch(() => undefined);
+    repairedIds.push(updated.id);
     repaired += 1;
   }
 
-  await refreshMediaLibrary();
+  if (repairedIds.length > 0) {
+    await refreshLibraryImportRows(repairedIds).catch(() => undefined);
+  }
   return { scanned: Math.min(imports.length, limit), remainingEstimate: Math.max(0, imports.length - limit), repaired, hidden };
 }
 
@@ -813,7 +823,7 @@ export async function reprocessImport(id: string) {
     episode: updated.episode
   }).catch(() => undefined);
   await createLibraryEntryForImport(updated);
-  await refreshMediaLibrary();
+  await refreshLibraryImportRows([updated.id]);
   return getImport(id);
 }
 
@@ -824,6 +834,7 @@ export async function migrateImportsToCurrentNaming(options?: { refreshPlex?: bo
   });
   let moved = 0;
   let relinked = 0;
+  const refreshedImportIds = new Set<string>();
   const failures: Array<{ importId: string; reason: string }> = [];
 
   for (const item of imports) {
@@ -865,6 +876,7 @@ export async function migrateImportsToCurrentNaming(options?: { refreshPlex?: bo
         refreshPlex: options?.refreshPlex ?? false,
         changedPaths: options?.changedPaths
       });
+      refreshedImportIds.add(updated.id);
       relinked += 1;
     } catch (error) {
       failures.push({
@@ -874,6 +886,8 @@ export async function migrateImportsToCurrentNaming(options?: { refreshPlex?: bo
     }
   }
 
-  await refreshMediaLibrary();
+  if (refreshedImportIds.size > 0) {
+    await refreshLibraryImportRows([...refreshedImportIds]);
+  }
   return { moved, relinked, skipped: failures.length, failures: failures.slice(0, 50) };
 }

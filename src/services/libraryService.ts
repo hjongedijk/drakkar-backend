@@ -8,7 +8,7 @@ import type { Release } from "../services/releases/types.js";
 import { runSearch } from "../services/searchService.js";
 import { getSettings } from "../services/settings/settingsStore.js";
 import { getLibraryItem, libraryStats, listLibraryItems } from "./media-library/libraryQueries.js";
-import { refreshMediaLibrary } from "./media-library/libraryRefresh.js";
+import { refreshMediaLibrary, refreshLibraryRequestRows, requestMediaLibraryRefresh } from "./media-library/libraryRefresh.js";
 
 function searchParamsForLibraryItem(item: Pick<MediaLibraryItem, "mediaType" | "title" | "imdbId" | "tmdbId" | "tvdbId" | "season" | "episode">) {
   const base = {
@@ -71,7 +71,7 @@ export async function deleteLibraryItem(id: string, options: { blocklist?: boole
     }).catch(() => undefined);
   }
 
-  void refreshMediaLibrary().catch(() => undefined);
+  void requestMediaLibraryRefresh().catch(() => undefined);
   return { deleted: true, item };
 }
 
@@ -110,7 +110,11 @@ export async function replaceLibraryItemWithRelease(id: string, release: unknown
       }
     }).catch(() => undefined);
   }
-  await refreshMediaLibrary();
+  if (item.requestId) {
+    await refreshLibraryRequestRows([item.requestId]);
+  } else {
+    await requestMediaLibraryRefresh();
+  }
   return { replaced: true, item, release: typedRelease, download };
 }
 

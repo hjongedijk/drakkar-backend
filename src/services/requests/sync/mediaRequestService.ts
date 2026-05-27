@@ -3,6 +3,7 @@ import { redis } from "../../../repositories/db/redis.js";
 import { LocalTtlCache } from "../../cache/localTtlCache.js";
 import { downloadNzb } from "../../indexers/nzbhydra/client.js";
 import { refreshMediaLibrary } from "../../libraryService.js";
+import { refreshLibraryRequestRows } from "../../media-library/libraryRefresh.js";
 import { fetchMediaDetails as fetchMetadataDetails, fetchSeasonEpisodes, fetchSeriesStructure } from "../../metadataService.js";
 import { runSearch } from "../../searchService.js";
 import { getSettings } from "../../settings/settingsStore.js";
@@ -204,7 +205,7 @@ async function reuseExistingReleaseDownload(requestId: string, release: { guid?:
       downloadId: reusable.id
     }
   });
-  await refreshMediaLibrary().catch(() => undefined);
+  await refreshLibraryRequestRows([requestId]).catch(() => undefined);
   return reusable;
 }
 
@@ -1298,7 +1299,7 @@ export async function grabTvEpisodeForRequest(id: string, season: number, episod
     return { grabbed: false, reason: "episode already available or downloading", season, episode };
   }
   const result = await grabBestTvSeasonForRequest(request, season, existingEpisodes, new Set([episode]));
-  await refreshMediaLibrary().catch(() => undefined);
+  await refreshLibraryRequestRows([id]).catch(() => undefined);
   return { season, episode, ...result };
 }
 
@@ -1316,7 +1317,7 @@ export async function grabBestForRequest(id: string, options?: { priorityBoost?:
         const workingImport = await findWorkingImportForRequest(request);
         if (workingImport) {
           await prisma.mediaRequest.update({ where: { id }, data: { status: "available", downloadId: workingImport.downloadId } });
-          await refreshMediaLibrary().catch(() => undefined);
+          await refreshLibraryRequestRows([id]).catch(() => undefined);
           return { grabbed: false, reason: "a working library item already exists", import: workingImport };
         }
         const existingDownload = await existingActiveDownload(request.downloadId);
@@ -1361,7 +1362,7 @@ export async function grabBestForRequest(id: string, options?: { priorityBoost?:
         }
         await markRequestGrabCooldown(id).catch(() => undefined);
         await prisma.mediaRequest.update({ where: { id }, data: { status: "no_release_found" } });
-        await refreshMediaLibrary().catch(() => undefined);
+        await refreshLibraryRequestRows([id]).catch(() => undefined);
         return { terminal: { grabbed: false, reason: "no acceptable release found", releases: ranked } };
       },
       tryCandidate: async (candidate) => {
@@ -1416,7 +1417,7 @@ export async function grabBestForRequest(id: string, options?: { priorityBoost?:
           where: { id },
           data: { status: requestStatusForDownloadStatus(download.status), selectedRelease: jsonValue(candidate.release), downloadId: download.id }
         });
-        await refreshMediaLibrary().catch(() => undefined);
+        await refreshLibraryRequestRows([id]).catch(() => undefined);
         return { grabbed: true, reason: "release queued", release: candidate.release, decision: candidate.decision, download, attemptedFetch: true };
       },
       onExhausted: async ({ rejected }) => {
@@ -1425,7 +1426,7 @@ export async function grabBestForRequest(id: string, options?: { priorityBoost?:
           return { grabbed: false, reason: "all acceptable cached releases failed before queueing", rejected };
         }
         await prisma.mediaRequest.update({ where: { id }, data: { status: "no_release_found", downloadId: null } });
-        await refreshMediaLibrary().catch(() => undefined);
+        await refreshLibraryRequestRows([id]).catch(() => undefined);
         return { grabbed: false, reason: "all acceptable releases failed before queueing", rejected };
       }
     }
@@ -1464,7 +1465,7 @@ export async function grabMissingTvForRequest(id: string, options?: { priorityBo
         }
         if (seasonsNeedingSearch.length === 0) {
           await prisma.mediaRequest.update({ where: { id: request.id }, data: { status: "available" } }).catch(() => undefined);
-          await refreshMediaLibrary().catch(() => undefined);
+          await refreshLibraryRequestRows([request.id]).catch(() => undefined);
           return {
             terminal: { grabbed: false, reason: "all requested episodes already available", seasons: [] },
             seasonsNeedingSearch: []
@@ -1524,7 +1525,7 @@ export async function grabMissingTvForRequest(id: string, options?: { priorityBo
             downloadId: activeDownloadId
           }
         });
-        await refreshMediaLibrary().catch(() => undefined);
+        await refreshLibraryRequestRows([request.id]).catch(() => undefined);
         return {
           grabbed: grabbedResults.length > 0,
           seasons: results,
@@ -2180,7 +2181,7 @@ async function queueReleaseForRequest(
     where: { id: requestId },
     data: { status: requestStatusForDownloadStatus(download.status), selectedRelease: jsonValue(candidate.release), downloadId: download.id }
   });
-  await refreshMediaLibrary().catch(() => undefined);
+  await refreshLibraryRequestRows([requestId]).catch(() => undefined);
   return { grabbed: true, reason: "release queued", release: candidate.release, decision: candidate.decision, download, attemptedFetch };
 }
 
@@ -2258,7 +2259,7 @@ export async function grabReleaseForRequest(id: string, release: unknown) {
               downloadId: null
             }
           }).catch(() => undefined);
-          await refreshMediaLibrary().catch(() => undefined);
+          await refreshLibraryRequestRows([id]).catch(() => undefined);
           return { grabbed: false, transient: !blocklisted, retryableFailure: !blocklisted, reason: message, release: typedRelease, attemptedFetch: true };
         }
         if (download.status === "failed") {
@@ -2275,7 +2276,7 @@ export async function grabReleaseForRequest(id: string, release: unknown) {
               where: { id },
               data: { status: "approved", selectedRelease: Prisma.JsonNull, downloadId: null }
             }).catch(() => undefined);
-            await refreshMediaLibrary().catch(() => undefined);
+            await refreshLibraryRequestRows([id]).catch(() => undefined);
             return { grabbed: false, transient: true, retryableFailure: true, reason: download.error ?? "temporary fetch failure", release: typedRelease, attemptedFetch: true };
           }
           await prisma.mediaRequest.update({
@@ -2296,7 +2297,7 @@ export async function grabReleaseForRequest(id: string, release: unknown) {
           where: { id },
           data: { status: requestStatusForDownloadStatus(download.status), selectedRelease: jsonValue(typedRelease), downloadId: download.id }
         });
-        await refreshMediaLibrary().catch(() => undefined);
+        await refreshLibraryRequestRows([id]).catch(() => undefined);
         return { grabbed: true, reason: "release queued", release: typedRelease, decision: candidate.decision, download, attemptedFetch: true };
       },
       onExhausted: async () => ({
@@ -2337,7 +2338,7 @@ export async function refreshRequest(id: string) {
   const matched = requests.find((item) => item.externalId === request.externalId);
   if (!matched) return request;
   const refreshed = await upsertRequest(request.provider, matched);
-  await refreshMediaLibrary().catch(() => undefined);
+  await refreshLibraryRequestRows([id]).catch(() => undefined);
   return refreshed;
 }
 
@@ -2430,7 +2431,7 @@ export async function reconcileRequestLinkStates() {
     });
     updated += 1;
   }
-  if (updated > 0) await refreshMediaLibrary().catch(() => undefined);
+  if (updated > 0) await refreshLibraryRequestRows(requests.map((request) => request.id)).catch(() => undefined);
   return { updated };
 }
 
@@ -2443,7 +2444,7 @@ export async function markRequestAvailable(id: string) {
     where: { id },
     data: { status: nextStatus }
   });
-  await refreshMediaLibrary().catch(() => undefined);
+  await refreshLibraryRequestRows([id]).catch(() => undefined);
   return { ok: true, localOnly: true, status: updated.status };
 }
 

@@ -21,6 +21,14 @@ import { listLibraryItems } from "./libraryQueries.js";
 
 let refreshPromise: Promise<{ refreshed: number; items: Awaited<ReturnType<typeof listLibraryItems>> }> | null = null;
 let refreshQueued = false;
+let lastRefreshCompletedAt = 0;
+let lastRefreshResult: { refreshed: number; items: Awaited<ReturnType<typeof listLibraryItems>> } | null = null;
+const REFRESH_THROTTLE_MS = 10_000;
+const BACKGROUND_REFRESH_DEBOUNCE_MS = 1_500;
+let scheduledRefreshTimer: NodeJS.Timeout | null = null;
+let scheduledRefreshPromise: Promise<{ refreshed: number; items: Awaited<ReturnType<typeof listLibraryItems>> }> | null = null;
+let scheduledRefreshResolve: ((value: { refreshed: number; items: Awaited<ReturnType<typeof listLibraryItems>> }) => void) | null = null;
+let scheduledRefreshReject: ((reason?: unknown) => void) | null = null;
 
 async function dedupeLibraryItems() {
   const items = await prisma.mediaLibraryItem.findMany({
@@ -157,6 +165,292 @@ async function enrichLibraryItem(item: MediaLibraryItem, settings: Awaited<Retur
     where: { id: item.id },
     select: LIBRARY_LIST_SELECT
   }).then((value) => value ? hydrateLegacyMediaFields(value) : null)) ?? base;
+}
+
+async function runTargetedLibraryRefresh(input: { requestIds?: string[]; importIds?: string[]; includeItems?: boolean }) {
+  const requestIds = [...new Set((input.requestIds ?? []).filter(Boolean))];
+  const directImportIds = [...new Set((input.importIds ?? []).filter(Boolean))];
+  if (requestIds.length === 0 && directImportIds.length === 0) {
+    return { refreshed: 0, items: input.includeItems ? await listLibraryItems() : [] };
+  }
+
+  const directImports = directImportIds.length > 0
+    ? await prisma.importItem.findMany({
+        where: { id: { in: directImportIds } },
+        include: {
+          symlinks: { orderBy: { updatedAt: "desc" } },
+          mediaFiles: {
+            select: {
+              movieId: true,
+              episodeId: true,
+              episode: {
+                select: {
+                  seasonId: true,
+                  tvShowId: true
+                }
+              }
+            }
+          }
+        }
+      })
+    : [];
+  const requestIdsToLoad = [...new Set([...requestIds, ...directImports.map((item) => item.requestId).filter((value): value is string => Boolean(value))])];
+  const requests = requestIdsToLoad.length > 0
+    ? (await prisma.mediaRequest.findMany({
+        where: { id: { in: requestIdsToLoad } },
+        include: {
+          provider: true,
+          ...REQUEST_LIBRARY_RELATION_SELECT
+        }
+      })).map((request) => hydrateLegacyRequestFields(request))
+    : [];
+  const requestsById = new Map(requests.map((request) => [request.id, request]));
+  const requestDownloadIds = [...new Set(requests.map((request) => request.downloadId).filter((value): value is string => Boolean(value)))];
+  const importWhere = [
+    ...(directImportIds.length > 0 ? [{ id: { in: directImportIds } }] : []),
+    ...(requestIdsToLoad.length > 0 ? [{ requestId: { in: requestIdsToLoad } }] : []),
+    ...(requestDownloadIds.length > 0 ? [{ downloadId: { in: requestDownloadIds } }] : [])
+  ];
+  const imports = importWhere.length > 0
+    ? await prisma.importItem.findMany({
+        where: { OR: importWhere },
+        include: {
+          symlinks: { orderBy: { updatedAt: "desc" } },
+          mediaFiles: {
+            select: {
+              movieId: true,
+              episodeId: true,
+              episode: {
+                select: {
+                  seasonId: true,
+                  tvShowId: true
+                }
+              }
+            }
+          }
+        }
+      })
+    : [];
+  const importsById = new Map(imports.map((item) => [item.id, item]));
+  const uniqueImports = [...importsById.values()];
+  const importRequestIds = new Set(uniqueImports.map((item) => item.requestId).filter((value): value is string => Boolean(value)));
+  const importDownloadIds = new Set(uniqueImports.map((item) => item.downloadId).filter((value): value is string => Boolean(value)));
+  const requestDownloads = requestDownloadIds.length > 0
+    ? await prisma.download.findMany({ where: { id: { in: requestDownloadIds } }, select: { id: true, status: true } })
+    : [];
+  const requestDownloadsById = new Map(requestDownloads.map((download) => [download.id, download]));
+  const sourceKeys = [
+    ...requests.map((request) => `request:${request.id}`),
+    ...uniqueImports.map((item) => `import:${item.id}`)
+  ];
+  const relatedDownloadIds = [...new Set(uniqueImports.map((item) => item.downloadId).filter((value): value is string => Boolean(value)))];
+  const existingWhere = [
+    ...(sourceKeys.length > 0 ? [{ sourceKey: { in: sourceKeys } }] : []),
+    ...(requestIdsToLoad.length > 0 ? [{ requestId: { in: requestIdsToLoad } }] : []),
+    ...(relatedDownloadIds.length > 0 ? [{ downloadId: { in: relatedDownloadIds } }] : [])
+  ];
+  const existingLibraryItems = existingWhere.length > 0
+    ? (await prisma.mediaLibraryItem.findMany({
+        where: { OR: existingWhere },
+        select: LIBRARY_LIST_SELECT
+      })).map((item) => hydrateLegacyMediaFields(item))
+    : [];
+  const existingByIdentity = new Map(existingLibraryItems.map((item) => [item.identityKey, item]));
+  const touched = new Set<string>();
+  const touchedIds = new Set<string>();
+
+  const requestItems = await mapWithConcurrency(requests, 12, async (request) => {
+    const sourceKey = `request:${request.id}`;
+    const hasFilesystemEntry = importRequestIds.has(request.id) || (request.downloadId ? importDownloadIds.has(request.downloadId) : false);
+    const linkedDownload = request.downloadId ? requestDownloadsById.get(request.downloadId) ?? null : null;
+    const nextLibraryStatus = statusFromRequestAndDownload({
+      requestStatus: request.status,
+      downloadStatus: linkedDownload?.status,
+      hasFilesystemEntry
+    });
+    const identityKey = mediaIdentityKey({
+      mediaType: request.mediaType,
+      title: request.title,
+      year: request.year,
+      tmdbId: request.tmdbId,
+      tvdbId: request.tvdbId,
+      imdbId: request.imdbId
+    });
+    await prisma.mediaLibraryItem.deleteMany({
+      where: {
+        sourceKey,
+        identityKey: { not: identityKey }
+      }
+    });
+    const row = await prisma.mediaLibraryItem.upsert({
+      where: { identityKey },
+      update: {
+        sourceKey,
+        identityKey,
+        mediaType: request.mediaType,
+        movieId: request.movieId,
+        tvShowId: request.tvShowId,
+        seasonId: request.seasonId,
+        episodeId: request.episodeId,
+        title: request.title,
+        sortTitle: sortTitle(request.title),
+        year: request.year,
+        tmdbId: request.tmdbId,
+        tvdbId: request.tvdbId,
+        imdbId: request.imdbId,
+        requestedBy: request.requestedBy,
+        requestProvider: request.provider?.name ?? undefined,
+        requestId: request.id,
+        qualityProfileId: request.selectedProfileId,
+        downloadId: request.downloadId,
+        libraryStatus: nextLibraryStatus,
+        healthStatus: healthFromStatus(request.status),
+        quality: request.requestedQuality ?? selectedReleaseField(request.selectedRelease, "resolution"),
+        source: selectedReleaseField(request.selectedRelease, "source"),
+        codec: selectedReleaseField(request.selectedRelease, "codec"),
+        audio: selectedReleaseField(request.selectedRelease, "audio"),
+        hdr: selectedReleaseBoolean(request.selectedRelease, "hdr"),
+        dv: selectedReleaseBoolean(request.selectedRelease, "dv"),
+        releaseGroup: selectedReleaseField(request.selectedRelease, "releaseGroup")
+      },
+      create: {
+        sourceKey,
+        identityKey,
+        mediaType: request.mediaType,
+        movieId: request.movieId,
+        tvShowId: request.tvShowId,
+        seasonId: request.seasonId,
+        episodeId: request.episodeId,
+        title: request.title,
+        sortTitle: sortTitle(request.title),
+        year: request.year,
+        tmdbId: request.tmdbId,
+        tvdbId: request.tvdbId,
+        imdbId: request.imdbId,
+        requestedBy: request.requestedBy,
+        requestProvider: request.provider?.name ?? undefined,
+        requestId: request.id,
+        qualityProfileId: request.selectedProfileId,
+        downloadId: request.downloadId,
+        libraryStatus: nextLibraryStatus,
+        healthStatus: healthFromStatus(request.status),
+        quality: request.requestedQuality ?? selectedReleaseField(request.selectedRelease, "resolution"),
+        source: selectedReleaseField(request.selectedRelease, "source"),
+        codec: selectedReleaseField(request.selectedRelease, "codec"),
+        audio: selectedReleaseField(request.selectedRelease, "audio"),
+        hdr: selectedReleaseBoolean(request.selectedRelease, "hdr"),
+        dv: selectedReleaseBoolean(request.selectedRelease, "dv"),
+        releaseGroup: selectedReleaseField(request.selectedRelease, "releaseGroup")
+      }
+    });
+    touched.add(sourceKey);
+    touchedIds.add(row.id);
+    return row;
+  });
+
+  const importItems = await mapWithConcurrency(uniqueImports, 12, async (item) => {
+    const resolved = await resolveImportMedia(item).catch(() => null);
+    const request = item.requestId ? requestsById.get(item.requestId) ?? null : null;
+    const link = item.symlinks[0];
+    const strategy = importStrategy(link?.status);
+    const sourceKey = `import:${item.id}`;
+    const identityKey = mediaIdentityKey({
+      mediaType: resolved?.mediaType ?? item.mediaType,
+      title: request?.title ?? resolved?.title ?? item.title,
+      year: request?.year ?? resolved?.year ?? item.year,
+      tmdbId: request?.tmdbId ?? null,
+      tvdbId: request?.tvdbId ?? null,
+      imdbId: request?.imdbId ?? null,
+      season: resolved?.season ?? item.season,
+      episode: resolved?.episode ?? item.episode
+    });
+    await prisma.mediaLibraryItem.deleteMany({
+      where: {
+        sourceKey,
+        identityKey: { not: identityKey }
+      }
+    });
+    const existing = existingByIdentity.get(identityKey);
+    const title = request?.title ?? resolved?.title ?? existing?.title ?? item.title;
+    const year = request?.year ?? resolved?.year ?? existing?.year ?? item.year;
+    const fileTarget = item.mediaFiles[0];
+    const movieId = request?.movieId ?? existing?.movieId ?? fileTarget?.movieId ?? undefined;
+    const episodeId = request?.episodeId ?? existing?.episodeId ?? fileTarget?.episodeId ?? undefined;
+    const seasonId = request?.seasonId ?? existing?.seasonId ?? fileTarget?.episode?.seasonId ?? undefined;
+    const tvShowId = request?.tvShowId ?? existing?.tvShowId ?? fileTarget?.episode?.tvShowId ?? undefined;
+    const row = await prisma.mediaLibraryItem.upsert({
+      where: { identityKey },
+      update: {
+        sourceKey,
+        identityKey,
+        mediaType: resolved?.mediaType ?? item.mediaType,
+        movieId,
+        tvShowId,
+        seasonId,
+        episodeId,
+        title,
+        sortTitle: sortTitle(title),
+        year,
+        tmdbId: request?.tmdbId ?? existing?.tmdbId ?? undefined,
+        tvdbId: request?.tvdbId ?? existing?.tvdbId ?? undefined,
+        imdbId: request?.imdbId ?? existing?.imdbId ?? undefined,
+        season: resolved?.season ?? item.season,
+        episode: resolved?.episode ?? item.episode,
+        requestId: item.requestId,
+        downloadId: item.downloadId,
+        requestedBy: request?.requestedBy,
+        requestProvider: request?.provider?.name,
+        qualityProfileId: request?.selectedProfileId,
+        importStrategy: strategy,
+        libraryStatus: "available",
+        streamStatus: item.completedPath.startsWith("/mounted/") ? "streamable" : "local",
+        healthStatus: link?.status === "broken" ? "symlink_broken" : "healthy",
+        folderPath: link?.linkPath ? dirname(link.linkPath) : dirname(item.completedPath),
+        filePath: item.completedPath,
+        symlinkPath: strategy === "symlink" ? link?.linkPath : undefined,
+        strmPath: strategy === "strm" ? link?.linkPath : undefined
+      },
+      create: {
+        sourceKey,
+        identityKey,
+        mediaType: resolved?.mediaType ?? item.mediaType,
+        movieId,
+        tvShowId,
+        seasonId,
+        episodeId,
+        title,
+        sortTitle: sortTitle(title),
+        year,
+        tmdbId: request?.tmdbId ?? existing?.tmdbId ?? undefined,
+        tvdbId: request?.tvdbId ?? existing?.tvdbId ?? undefined,
+        imdbId: request?.imdbId ?? existing?.imdbId ?? undefined,
+        season: resolved?.season ?? item.season,
+        episode: resolved?.episode ?? item.episode,
+        requestId: item.requestId,
+        downloadId: item.downloadId,
+        requestedBy: request?.requestedBy,
+        requestProvider: request?.provider?.name,
+        qualityProfileId: request?.selectedProfileId,
+        importStrategy: strategy,
+        libraryStatus: "available",
+        streamStatus: item.completedPath.startsWith("/mounted/") ? "streamable" : "local",
+        healthStatus: link?.status === "broken" ? "symlink_broken" : "healthy",
+        folderPath: link?.linkPath ? dirname(link.linkPath) : dirname(item.completedPath),
+        filePath: item.completedPath,
+        symlinkPath: strategy === "symlink" ? link?.linkPath : undefined,
+        strmPath: strategy === "strm" ? link?.linkPath : undefined
+      }
+    });
+    touched.add(sourceKey);
+    touchedIds.add(row.id);
+    return row;
+  });
+
+  const settings = await getSettings();
+  const metadataCandidates = [...requestItems, ...importItems];
+  await mapWithConcurrency(metadataCandidates, 6, async (item) => enrichLibraryItem(item, settings).catch(() => item));
+  await dedupeLibraryItems();
+  return { refreshed: touched.size, items: input.includeItems ? await listLibraryItems() : [] };
 }
 
 async function runLibraryRefreshCycle(options?: { includeItems?: boolean }) {
@@ -419,16 +713,59 @@ export async function refreshMediaLibrary(options?: { includeItems?: boolean }) 
     return refreshPromise;
   }
 
+  const includeItems = options?.includeItems ?? false;
+  if (!includeItems && lastRefreshResult && Date.now() - lastRefreshCompletedAt < REFRESH_THROTTLE_MS) {
+    return lastRefreshResult;
+  }
+
   refreshPromise = (async () => {
     let result = await runLibraryRefreshCycle(options);
     while (refreshQueued) {
       refreshQueued = false;
       result = await runLibraryRefreshCycle(options);
     }
+    lastRefreshCompletedAt = Date.now();
+    lastRefreshResult = result;
     return result;
   })().finally(() => {
     refreshPromise = null;
   });
 
   return refreshPromise;
+}
+
+export function refreshLibraryTargets(input: { requestIds?: string[]; importIds?: string[]; includeItems?: boolean }) {
+  return runTargetedLibraryRefresh(input);
+}
+
+export function refreshLibraryRequestRows(requestIds: string[], options?: { includeItems?: boolean }) {
+  return runTargetedLibraryRefresh({ requestIds, includeItems: options?.includeItems });
+}
+
+export function refreshLibraryImportRows(importIds: string[], options?: { includeItems?: boolean }) {
+  return runTargetedLibraryRefresh({ importIds, includeItems: options?.includeItems });
+}
+
+export function requestMediaLibraryRefresh(delayMs = BACKGROUND_REFRESH_DEBOUNCE_MS) {
+  if (!scheduledRefreshPromise) {
+    scheduledRefreshPromise = new Promise((resolve, reject) => {
+      scheduledRefreshResolve = resolve;
+      scheduledRefreshReject = reject;
+    });
+  }
+
+  if (scheduledRefreshTimer) clearTimeout(scheduledRefreshTimer);
+  scheduledRefreshTimer = setTimeout(() => {
+    scheduledRefreshTimer = null;
+    void refreshMediaLibrary()
+      .then((result) => scheduledRefreshResolve?.(result))
+      .catch((error) => scheduledRefreshReject?.(error))
+      .finally(() => {
+        scheduledRefreshPromise = null;
+        scheduledRefreshResolve = null;
+        scheduledRefreshReject = null;
+      });
+  }, Math.max(0, delayMs));
+
+  return scheduledRefreshPromise;
 }

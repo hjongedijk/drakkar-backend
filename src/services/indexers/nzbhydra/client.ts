@@ -41,6 +41,7 @@ const MAX_FEED_RESULTS_BY_MEDIA_TYPE = {
   tv: 1000
 } as const;
 const MIN_FEED_CACHE_TTL_SECONDS = 3600;
+const FEED_STALE_CACHE_TTL_SECONDS = 24 * 60 * 60;
 const DEFAULT_MAX_RESULTS_BY_KIND: Record<SearchKind, number> = {
   movie: 120,
   tv: 160,
@@ -226,6 +227,10 @@ function feedCacheKey(settings: AppSettings, mediaType: "movie" | "tv") {
   return `nzbhydra:feed:${createHash("sha1").update(JSON.stringify(normalized)).digest("hex")}`;
 }
 
+function staleFeedCacheKey(settings: AppSettings, mediaType: "movie" | "tv") {
+  return `${feedCacheKey(settings, mediaType)}:stale`;
+}
+
 function resolvedFeedMaxResults(settings: AppSettings, mediaType: "movie" | "tv") {
   return Math.min(
     Math.max(1, settings.nzbhydraFeedMaxResults),
@@ -283,6 +288,13 @@ async function cachedFeedResults(settings: AppSettings, mediaType: "movie" | "tv
   return JSON.parse(cached) as Release[];
 }
 
+async function staleFeedResults(settings: AppSettings, mediaType: "movie" | "tv") {
+  const cached = await redis.get(staleFeedCacheKey(settings, mediaType)).catch(() => null);
+  if (!cached) return null;
+  await incrementSearchMetric("feedCacheHits");
+  return JSON.parse(cached) as Release[];
+}
+
 async function searchFromFeeds(settings: AppSettings, params: SearchParams) {
   const mediaType = ["tv", "season", "episode"].includes(params.kind) ? "tv" : params.kind === "movie" ? "movie" : null;
   if (!mediaType) return null;
@@ -314,9 +326,29 @@ async function refreshFeed(settings: AppSettings, mediaType: "movie" | "tv") {
   const cacheKey = feedCacheKey(settings, mediaType);
   const cached = await redis.get(cacheKey).catch(() => null);
   if (cached) {
-    await incrementSearchMetric("feedCacheHits");
-    return JSON.parse(cached) as Release[];
+    const parsed = JSON.parse(cached) as Release[];
+    if (parsed.length > 0) {
+      await incrementSearchMetric("feedCacheHits");
+      return parsed;
+    }
   }
+  const existing = inFlightFeedRefreshes.get(cacheKey);
+  if (existing) return existing;
+  const stale = await staleFeedResults(settings, mediaType);
+  if (stale) {
+    void (async () => {
+      try {
+        await refreshFeedUncached(settings, mediaType, cacheKey);
+      } catch {
+        // Stale feed is intentionally kept serving while background refresh retries later.
+      }
+    })();
+    return stale;
+  }
+  return refreshFeedUncached(settings, mediaType, cacheKey);
+}
+
+async function refreshFeedUncached(settings: AppSettings, mediaType: "movie" | "tv", cacheKey: string) {
   const existing = inFlightFeedRefreshes.get(cacheKey);
   if (existing) return existing;
   const promise = (async () => {
@@ -329,6 +361,7 @@ async function refreshFeed(settings: AppSettings, mediaType: "movie" | "tv") {
       categories: mediaType === "tv" ? TV_CATEGORIES : MOVIE_CATEGORIES
     }, Math.min(FEED_PAGE_LIMIT, maxResults), maxResults, deadlineAt);
     await redis.set(cacheKey, JSON.stringify(releases), "EX", Math.max(settings.nzbhydraFeedCacheTtlSeconds, MIN_FEED_CACHE_TTL_SECONDS));
+    await redis.set(staleFeedCacheKey(settings, mediaType), JSON.stringify(releases), "EX", FEED_STALE_CACHE_TTL_SECONDS).catch(() => undefined);
     return releases;
   })();
   inFlightFeedRefreshes.set(cacheKey, promise);
@@ -339,15 +372,20 @@ async function refreshFeed(settings: AppSettings, mediaType: "movie" | "tv") {
   }
 }
 
+async function forceRefreshFeed(settings: AppSettings, mediaType: "movie" | "tv") {
+  const cacheKey = feedCacheKey(settings, mediaType);
+  return refreshFeedUncached(settings, mediaType, cacheKey);
+}
+
 export async function refreshNzbhydraUpdateFeeds(settings: AppSettings) {
   if (!isNzbhydraConfigured(settings)) {
     return { movies: 0, tv: 0, errors: ["NZBHydra2 is not configured; update feed skipped"] };
   }
-  const movies = await Promise.resolve(refreshFeed(settings, "movie")).then(
+  const movies = await Promise.resolve(forceRefreshFeed(settings, "movie")).then(
     (value) => ({ status: "fulfilled" as const, value }),
     (reason) => ({ status: "rejected" as const, reason })
   );
-  const tv = await Promise.resolve(refreshFeed(settings, "tv")).then(
+  const tv = await Promise.resolve(forceRefreshFeed(settings, "tv")).then(
     (value) => ({ status: "fulfilled" as const, value }),
     (reason) => ({ status: "rejected" as const, reason })
   );

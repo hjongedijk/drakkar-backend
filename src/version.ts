@@ -1,1 +1,1 @@
-export const DRAKKAR_VERSION = "0.3.3";
+export const DRAKKAR_VERSION = "0.3.4";
