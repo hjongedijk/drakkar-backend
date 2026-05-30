@@ -10,6 +10,8 @@ import { getSettings } from "../../settings/settingsStore.js";
 import { addNzbFromPath, findReusableDownload, promoteDownloadPriority } from "../../downloadService.js";
 import { mediaIdentityKey, normalizeTitleForIdentity, titlesLikelyMatch } from "../../media-library/identity.js";
 import { upsertMovie, upsertTvEpisode, upsertTvSeason, upsertTvShow } from "../../media-library/normalizedMedia.js";
+import { mapWithConcurrency } from "../../media-library/libraryShared.js";
+import { subtitleLanguagesForItem } from "../../media-library/libraryQueries.js";
 import { parseReleaseTitle } from "../../quality/parser.js";
 import { scoreRelease } from "../../quality/scoring.js";
 import { ensureDefaultProfiles } from "../../quality/profileService.js";
@@ -22,16 +24,21 @@ import { hydrateLegacyRequestFields } from "../../media-library/normalizedMedia.
 
 const TV_ACTIVE_DOWNLOAD_STATUSES = ["queued", "fetching_nzb", "verifying", "prepared", "waiting_for_provider", "waiting_for_nzb", "downloading", "paused"];
 const SEARCH_COOLDOWN_SECONDS = 300;
+const REQUEST_MISSING_ARTICLE_TV_COOLDOWN_SECONDS = 2 * 60 * 60;
+const REQUEST_MISSING_ARTICLE_TV_SEASON_COOLDOWN_SECONDS = 8 * 60 * 60;
+const REQUEST_MISSING_ARTICLE_MOVIE_COOLDOWN_SECONDS = 8 * 60 * 60;
+const REQUEST_MISSING_ARTICLE_FOLLOWUP_COOLDOWN_SECONDS = 15 * 60;
 const REQUEST_RELEASE_CACHE_SECONDS = 6 * 60 * 60;
-const TV_SEASONS_PER_MONITOR_PASS = 16;
+const TV_SEASONS_PER_MONITOR_PASS = 1;
 const TV_EPISODE_DOWNLOADS_PER_REQUEST_PASS = 6;
 const MOVIE_NZB_FETCH_ATTEMPTS_PER_PASS = 1;
 const TV_NZB_FETCH_ATTEMPTS_PER_SEASON_PASS = 2;
 const REQUEST_GRAB_COOLDOWN_SECONDS = 30 * 60;
 const REQUEST_WANTED_SEARCH_COOLDOWN_SECONDS = 6 * 60 * 60;
-const REQUEST_WANTED_SEARCH_TIMEOUT_COOLDOWN_SECONDS = 60 * 60;
+const REQUEST_WANTED_SEARCH_TIMEOUT_COOLDOWN_SECONDS = 5 * 60;
 const LOCAL_REDIS_NEGATIVE_CACHE_MS = 30 * 1000;
 const localRequestCooldownCache = new LocalTtlCache<boolean>();
+const tvMonitorCursorCache = new LocalTtlCache<number | null>();
 
 const REQUEST_RELATION_SELECT = {
   movie: {
@@ -412,7 +419,7 @@ export function effectiveRequestStatus(input: {
   const linkedDownloadStatus = input.downloadStatus ?? null;
   if (linkedDownloadStatus === "available" || linkedDownloadStatus === "completed") {
     if (input.request.mediaType === "tv") {
-      return input.monitorSummary?.hasMissingEpisodes ? "grabbed" : "available";
+      return input.monitorSummary?.hasMissingEpisodes ? "approved" : "available";
     }
     return "available";
   }
@@ -875,6 +882,58 @@ async function summarizeTvRequestCountsBatch(
   };
 }
 
+async function fillMissingSeasonCountsForSummary(
+  requests: Array<{
+    id: string;
+    mediaType: string;
+    title: string;
+    year: number | null;
+    tmdbId: string | null;
+    tvdbId: string | null;
+    imdbId: string | null;
+    tvShowId?: string | null;
+    seasons: Prisma.JsonValue | null;
+    episodes: Prisma.JsonValue | null;
+  }>,
+  seasonCountsByShow: Map<string, Map<number, number>>
+) {
+  const candidates = requests.filter((request) => {
+    if (request.mediaType !== "tv" || !request.tvShowId) return false;
+    const explicitSeasons = requestedSeasons(request.seasons);
+    if (explicitSeasons.length === 0 || requestedEpisodeTotals(request).size > 0) return false;
+    const known = seasonCountsByShow.get(request.tvShowId);
+    return explicitSeasons.some((seasonNumber) => !known?.get(seasonNumber));
+  });
+  if (candidates.length === 0) return;
+
+  const settings = await getSettings();
+  await mapWithConcurrency(candidates, 3, async (request) => {
+    const structure = await fetchSeriesStructure(settings, {
+      mediaType: "tv",
+      title: request.title,
+      year: request.year ?? undefined,
+      tmdbId: request.tmdbId ?? undefined,
+      tvdbId: request.tvdbId ?? undefined,
+      imdbId: request.imdbId ?? undefined
+    }).catch(() => undefined);
+    if (!structure?.seasons.length || !request.tvShowId) return;
+    const requested = new Set(requestedSeasons(request.seasons));
+    const known = seasonCountsByShow.get(request.tvShowId) ?? new Map<number, number>();
+    for (const season of structure.seasons) {
+      if (!requested.has(season.seasonNumber) || !season.episodeCount) continue;
+      known.set(season.seasonNumber, season.episodeCount);
+      await upsertTvSeason(prisma, {
+        tvShowId: request.tvShowId,
+        seasonNumber: season.seasonNumber,
+        title: season.name ?? `Season ${String(season.seasonNumber).padStart(2, "0")}`,
+        airDate: season.airDate ? new Date(season.airDate) : undefined,
+        episodeCount: season.episodeCount
+      }).catch(() => undefined);
+    }
+    seasonCountsByShow.set(request.tvShowId, known);
+  });
+}
+
 export async function listRequests() {
   return listRequestsPage();
 }
@@ -967,6 +1026,7 @@ export async function listRequestsPage(options?: { page?: number; limit?: number
       seasonCountsByShow.set(season.tvShowId, bySeason);
     }
   }
+  await fillMissingSeasonCountsForSummary(requests, seasonCountsByShow);
   const availableByRequest = new Map<string, Array<{ season: number | null; episode: number | null }>>();
   for (const item of availableImports) {
     const key = item.requestId;
@@ -1006,9 +1066,18 @@ export async function listRequestsPage(options?: { page?: number; limit?: number
 
 export async function getRequestMonitor(id: string) {
   const request = await getRequest(id);
+  const requestTitleClauses = titleSearchClauses(request.title);
   const availableImports = await prisma.importItem.findMany({
     where: {
-      mediaType: request.mediaType,
+      OR: [
+        { requestId: request.id },
+        {
+          mediaType: request.mediaType,
+          year: request.year ?? undefined,
+          ...(request.mediaType === "movie" ? { season: null, episode: null } : {}),
+          OR: requestTitleClauses
+        }
+      ],
       symlinks: { some: { status: { not: "broken" } } }
     },
     include: { symlinks: true }
@@ -1044,6 +1113,32 @@ export async function getRequestMonitor(id: string) {
   });
 
   const availableBySeason = new Map<number, Set<number>>();
+  const importIds = availableImports.map((item) => item.id);
+  const libraryItems = await prisma.mediaLibraryItem.findMany({
+    where: {
+      OR: [
+        { requestId: request.id },
+        ...(importIds.length > 0 ? [{ sourceKey: { in: importIds.map((importId) => `import:${importId}`) } }] : [])
+      ]
+    },
+    select: {
+      id: true,
+      mediaType: true,
+      season: true,
+      episode: true,
+      symlinkPath: true,
+      strmPath: true,
+      filePath: true
+    }
+  });
+  const libraryItemByEpisode = new Map<string, { id: string; subtitleLanguages: string[] }>();
+  await Promise.all(libraryItems.map(async (item) => {
+    if (item.season == null || item.episode == null) return;
+    libraryItemByEpisode.set(`${item.season}:${item.episode}`, {
+      id: item.id,
+      subtitleLanguages: await subtitleLanguagesForItem(item).catch(() => [])
+    });
+  }));
   for (const item of availableImports) {
     const sameRequest = item.requestId === request.id;
     const sameTitle = normalizeTitleForIdentity(item.title) === normalizeTitleForIdentity(request.title);
@@ -1107,6 +1202,7 @@ export async function getRequestMonitor(id: string) {
         const available = availableBySeason.get(season.seasonNumber)?.has(episodeNumber) ?? false;
         const downloading = downloadingBySeason.get(season.seasonNumber)?.has(episodeNumber) ?? false;
         const status = available ? "available" : downloading ? "downloading" : "missing_monitored";
+        const libraryItem = libraryItemByEpisode.get(`${season.seasonNumber}:${episodeNumber}`);
         return {
           episodeNumber,
           title: episodeNameByNumber.get(episodeNumber),
@@ -1114,7 +1210,9 @@ export async function getRequestMonitor(id: string) {
           monitored,
           available,
           downloading,
-          status
+          status,
+          libraryItemId: libraryItem?.id,
+          subtitleLanguages: libraryItem?.subtitleLanguages ?? []
         };
       });
 
@@ -1155,6 +1253,23 @@ export function setRequestStatus(id: string, status: string) {
   return prisma.mediaRequest.update({ where: { id }, data: { status } });
 }
 
+export async function setRequestProfile(id: string, profileId: string) {
+  const current = await prisma.mediaRequest.findUniqueOrThrow({
+    where: { id },
+    select: { id: true, mediaType: true }
+  });
+  const profile = await resolveProfile(profileId, current.mediaType);
+  await prisma.mediaRequest.update({
+    where: { id },
+    data: {
+      selectedProfileId: profile.id,
+      requestedQuality: profile.name
+    }
+  });
+  await refreshLibraryRequestRows([id]).catch(() => undefined);
+  return getRequest(id);
+}
+
 export async function searchForRequest(id: string, options?: { cachedOnly?: boolean; limit?: number; recordHistory?: boolean; skipFallback?: boolean; cacheResult?: boolean }) {
   const request = await getRequest(id);
   const useRequestCache = options?.cacheResult !== false;
@@ -1185,6 +1300,7 @@ function requestReleaseCacheKey(request: MediaRequest) {
     imdbId: request.imdbId,
     tmdbId: request.tmdbId,
     tvdbId: request.tvdbId,
+    selectedProfileId: request.selectedProfileId,
     seasons: request.seasons,
     episodes: request.episodes
   })).toString("base64url")}`;
@@ -1464,6 +1580,7 @@ export async function grabMissingTvForRequest(id: string, options?: { priorityBo
           seasonsNeedingSearch.push({ season, existingEpisodes, requestedSeasonEpisodes });
         }
         if (seasonsNeedingSearch.length === 0) {
+          await setTvMonitorCursor(request.id, null).catch(() => undefined);
           await prisma.mediaRequest.update({ where: { id: request.id }, data: { status: "available" } }).catch(() => undefined);
           await refreshLibraryRequestRows([request.id]).catch(() => undefined);
           return {
@@ -1471,8 +1588,9 @@ export async function grabMissingTvForRequest(id: string, options?: { priorityBo
             seasonsNeedingSearch: []
           };
         }
+        const seasonSlice = await takeMonitoredSeasonSlice(request.id, seasonsNeedingSearch);
         return {
-          seasonsNeedingSearch: seasonsNeedingSearch.slice(0, TV_SEASONS_PER_MONITOR_PASS)
+          seasonsNeedingSearch: seasonSlice
         };
       },
       loadBroadReleases: async (request) =>
@@ -1506,6 +1624,7 @@ export async function grabMissingTvForRequest(id: string, options?: { priorityBo
         const activeDownloadId = activeDownloads[0]?.id ?? grabbedDownloadId ?? null;
         const refreshedMonitor = await getRequestMonitor(request.id).catch(() => null);
         const hasMissingEpisodes = refreshedMonitor?.seasons.some((season) => season.missingCount > 0) ?? false;
+        if (!hasMissingEpisodes) await setTvMonitorCursor(request.id, null).catch(() => undefined);
         await prisma.mediaRequest.update({
           where: { id: request.id },
           data: {
@@ -1603,14 +1722,18 @@ export async function findWorkingImportForRequest(request: MediaRequest) {
   });
   if (direct) return direct;
 
+  const requestTitleClauses = titleSearchClauses(request.title);
   const candidates = await prisma.importItem.findMany({
     where: {
       mediaType: request.mediaType,
       year: request.year ?? undefined,
       ...(request.mediaType === "movie" ? { season: null, episode: null } : {}),
-      symlinks: { some: { status: { not: "broken" } } }
+      symlinks: { some: { status: { not: "broken" } } },
+      OR: requestTitleClauses
     },
-    include: { symlinks: { orderBy: { updatedAt: "desc" } } }
+    include: { symlinks: { orderBy: { updatedAt: "desc" } } },
+    orderBy: [{ updatedAt: "desc" }, { createdAt: "desc" }],
+    take: 50
   });
   const key = mediaIdentityKey({
     mediaType: request.mediaType,
@@ -2084,6 +2207,74 @@ function wantedSearchCooldownKey(requestId: string) {
   return `request:wanted-search-cooldown:${requestId}`;
 }
 
+function tvMonitorCursorKey(requestId: string) {
+  return `request-monitor.tv.next-season:${requestId}`;
+}
+
+async function getTvMonitorCursor(requestId: string) {
+  const key = tvMonitorCursorKey(requestId);
+  const cached = tvMonitorCursorCache.get(key);
+  if (cached !== undefined) return cached;
+  const row = await prisma.setting.findUnique({ where: { key } }).catch(() => null);
+  const value = row?.value as { nextSeason?: unknown } | undefined;
+  const nextSeason = typeof value?.nextSeason === "number" && Number.isFinite(value.nextSeason) && value.nextSeason > 0
+    ? Math.floor(value.nextSeason)
+    : null;
+  tvMonitorCursorCache.set(key, nextSeason, 5 * 60 * 1000);
+  return nextSeason;
+}
+
+async function setTvMonitorCursor(requestId: string, nextSeason: number | null) {
+  const key = tvMonitorCursorKey(requestId);
+  tvMonitorCursorCache.set(key, nextSeason, 5 * 60 * 1000);
+  if (!nextSeason) {
+    await prisma.setting.delete({ where: { key } }).catch(() => undefined);
+    return;
+  }
+  await prisma.setting.upsert({
+    where: { key },
+    update: { value: { nextSeason } },
+    create: { key, value: { nextSeason } }
+  });
+}
+
+export function rotateMonitoredSeasonSlice<T extends { season: number }>(
+  seasonsNeedingSearch: T[],
+  nextSeason: number | null | undefined,
+  limit = TV_SEASONS_PER_MONITOR_PASS
+) {
+  if (seasonsNeedingSearch.length <= limit) {
+    return {
+      slice: seasonsNeedingSearch,
+      nextCursor: seasonsNeedingSearch.length === 0 ? null : seasonsNeedingSearch[0]?.season ?? null
+    };
+  }
+
+  const startIndex = nextSeason
+    ? Math.max(0, seasonsNeedingSearch.findIndex((item) => item.season >= nextSeason))
+    : 0;
+  const rotated = [
+    ...seasonsNeedingSearch.slice(startIndex),
+    ...seasonsNeedingSearch.slice(0, startIndex)
+  ];
+  const slice = rotated.slice(0, limit);
+  const remaining = rotated.slice(limit);
+  return {
+    slice,
+    nextCursor: remaining[0]?.season ?? slice[0]?.season ?? null
+  };
+}
+
+async function takeMonitoredSeasonSlice(
+  requestId: string,
+  seasonsNeedingSearch: Array<{ season: number; existingEpisodes: Set<number>; requestedSeasonEpisodes?: Set<number> }>
+) {
+  const nextSeason = await getTvMonitorCursor(requestId);
+  const { slice, nextCursor } = rotateMonitoredSeasonSlice(seasonsNeedingSearch, nextSeason);
+  await setTvMonitorCursor(requestId, nextCursor);
+  return slice;
+}
+
 async function seasonSearchCoolingDown(requestId: string, season: number) {
   const key = seasonCooldownKey(requestId, season);
   const local = localRequestCooldownCache.get(key);
@@ -2093,10 +2284,10 @@ async function seasonSearchCoolingDown(requestId: string, season: number) {
   return remote;
 }
 
-async function markSeasonSearchCooldown(requestId: string, season: number) {
+export async function markSeasonSearchCooldown(requestId: string, season: number, ttlSeconds = SEARCH_COOLDOWN_SECONDS) {
   const key = seasonCooldownKey(requestId, season);
-  localRequestCooldownCache.set(key, true, SEARCH_COOLDOWN_SECONDS * 1000);
-  await redis.set(key, "1", "EX", SEARCH_COOLDOWN_SECONDS);
+  localRequestCooldownCache.set(key, true, ttlSeconds * 1000);
+  await redis.set(key, "1", "EX", ttlSeconds);
 }
 
 async function requestGrabCoolingDown(requestId: string) {
@@ -2131,6 +2322,59 @@ export async function markWantedSearchCooldown(requestId: string, ttlSeconds = R
 
 export async function markWantedSearchTimeoutCooldown(requestId: string) {
   return markWantedSearchCooldown(requestId, REQUEST_WANTED_SEARCH_TIMEOUT_COOLDOWN_SECONDS);
+}
+
+export function requestSeasonRecoveryHint(request: {
+  mediaType: string;
+  seasonTarget?: { seasonNumber?: number | null } | null;
+  episodeTarget?: { seasonNumber?: number | null } | null;
+}) {
+  if (request.mediaType !== "tv") return null;
+  const seasonNumber = request.seasonTarget?.seasonNumber ?? request.episodeTarget?.seasonNumber ?? null;
+  return typeof seasonNumber === "number" && Number.isFinite(seasonNumber) && seasonNumber > 0
+    ? Math.floor(seasonNumber)
+    : null;
+}
+
+export function missingArticleCooldownPlan(request: {
+  mediaType: string;
+  seasonTarget?: { seasonNumber?: number | null } | null;
+  episodeTarget?: { seasonNumber?: number | null } | null;
+}) {
+  const season = requestSeasonRecoveryHint(request);
+  if (request.mediaType === "movie") {
+    return {
+      wantedTtlSeconds: REQUEST_MISSING_ARTICLE_MOVIE_COOLDOWN_SECONDS,
+      season,
+      seasonTtlSeconds: null
+    };
+  }
+  if (season) {
+    return {
+      wantedTtlSeconds: REQUEST_MISSING_ARTICLE_FOLLOWUP_COOLDOWN_SECONDS,
+      season,
+      seasonTtlSeconds: REQUEST_MISSING_ARTICLE_TV_SEASON_COOLDOWN_SECONDS
+    };
+  }
+  return {
+    wantedTtlSeconds: REQUEST_MISSING_ARTICLE_TV_COOLDOWN_SECONDS,
+    season: null,
+    seasonTtlSeconds: null
+  };
+}
+
+export async function markMissingArticleSearchCooldown(request: {
+  id: string;
+  mediaType: string;
+  seasonTarget?: { seasonNumber?: number | null } | null;
+  episodeTarget?: { seasonNumber?: number | null } | null;
+}) {
+  const plan = missingArticleCooldownPlan(request);
+  await markWantedSearchCooldown(request.id, plan.wantedTtlSeconds);
+  if (plan.season && plan.seasonTtlSeconds) {
+    await markSeasonSearchCooldown(request.id, plan.season, plan.seasonTtlSeconds);
+  }
+  return plan;
 }
 
 async function queueReleaseForRequest(
@@ -2420,7 +2664,13 @@ export async function reconcileRequestLinkStates() {
       downloadStatus: linkedDownloadStatus,
       monitorSummary
     });
-    const shouldClearDownloadId = !linkedDownloadStatus || isFailedLinkedDownloadStatus(linkedDownloadStatus);
+    const shouldClearDownloadId = !linkedDownloadStatus
+      || isFailedLinkedDownloadStatus(linkedDownloadStatus)
+      || (
+        hydratedRequest.mediaType === "tv"
+        && (linkedDownloadStatus === "available" || linkedDownloadStatus === "completed")
+        && nextStatus !== "available"
+      );
     if (nextStatus === hydratedRequest.status && !shouldClearDownloadId) continue;
     await prisma.mediaRequest.update({
       where: { id: hydratedRequest.id },
@@ -2438,12 +2688,15 @@ export async function reconcileRequestLinkStates() {
 export async function markRequestAvailable(id: string) {
   const request = await getRequest(id);
   const nextStatus = request.mediaType === "tv"
-    ? await tvRequestAvailabilitySummary(request).then((summary) => summary.hasMissingEpisodes ? "grabbed" : "available").catch(() => "available")
+    ? await tvRequestAvailabilitySummary(request).then((summary) => summary.hasMissingEpisodes ? "approved" : "available").catch(() => "available")
     : "available";
   const updated = await prisma.mediaRequest.update({
     where: { id },
     data: { status: nextStatus }
   });
+  if (updated.mediaType === "tv" && nextStatus === "available") {
+    await setTvMonitorCursor(id, null).catch(() => undefined);
+  }
   await refreshLibraryRequestRows([id]).catch(() => undefined);
   return { ok: true, localOnly: true, status: updated.status };
 }

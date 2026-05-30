@@ -2,7 +2,7 @@ import { prisma } from "../../../repositories/db/prisma.js";
 import { createBlocklistItem, isReleaseBlocklisted } from "../../policyService.js";
 import { toPublicRelease } from "../../releases/public.js";
 import { grabBestForRequest, grabMissingTvForRequest } from "../sync/service.js";
-import { markWantedSearchCooldown } from "../sync/mediaRequestService.js";
+import { markMissingArticleSearchCooldown, markWantedSearchCooldown } from "../sync/mediaRequestService.js";
 import { hydrateLegacyRequestFields } from "../../media-library/normalizedMedia.js";
 
 const inFlightRecoveryByRequest = new Map<string, Promise<unknown>>();
@@ -116,7 +116,11 @@ export async function recoverFailedDownloadForRequest(input: { downloadId: strin
   });
 
   if (DEFERRED_RECOVERY_REASONS.has(reason)) {
-    await markWantedSearchCooldown(request.id).catch(() => undefined);
+    if (reason === "missing_articles") {
+      await markMissingArticleSearchCooldown(request).catch(() => undefined);
+    } else {
+      await markWantedSearchCooldown(request.id).catch(() => undefined);
+    }
     await prisma.mediaRequest.update({
       where: { id: request.id },
       data: { status: "approved" }

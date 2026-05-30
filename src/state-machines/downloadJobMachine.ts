@@ -1,3 +1,4 @@
+import { basename } from "node:path";
 import { assign, createActor, fromPromise, setup, waitFor } from "xstate";
 import type { Job } from "bullmq";
 import type { FastifyBaseLogger } from "fastify";
@@ -5,7 +6,7 @@ import { prisma, type Download } from "../repositories/db/prisma.js";
 import type { DownloadJobData } from "../workers/queues/downloadQueue.js";
 import { getAllowedDownloadConnections } from "../services/bandwidth/bandwidthScheduler.js";
 import { fetchAndStoreNzbForDownload } from "../services/usenet/urlNzb.js";
-import { getNzbImportPlan, prepareNzbDocumentForStreaming, downloadNzbDocument } from "../services/usenet/downloadEngine.js";
+import { getNzbImportPlan, prepareNzbDocumentForStreaming } from "../services/usenet/downloadEngine.js";
 import { makeMountedDownloadAvailable, reconcileRequestStatusAfterImport } from "../services/importService.js";
 import { queueDownloadJob } from "../workers/queues/downloadQueue.js";
 import { humanizeDownloadError } from "../services/downloads/presentation.js";
@@ -31,7 +32,6 @@ type DownloadJobMachineInput = {
     publicMessage: string;
     source: "import-validation" | "usenet-validation";
   }) => Promise<{ action: string; decisionKey: string | null; recovered?: boolean; recoveryQueued?: boolean }>;
-  finalizeMaterializedImport: (input: { downloadId: string; requestId?: string }) => Promise<unknown[]>;
   requeueForStreamingPriority: (input: {
     current: Download;
     job: Job<DownloadJobData>;
@@ -45,7 +45,7 @@ type MachineResult = Record<string, unknown>;
 type MachineContext = {
   current: Download | null;
   nzbDocumentId: string | null;
-  importPlan: { mode: "mounted" | "materialized" | "unsupported"; reason?: string } | null;
+  importPlan: { mode: "mounted" | "unsupported"; reason?: string } | null;
   result: MachineResult | null;
   lastError: unknown;
 };
@@ -109,27 +109,6 @@ export async function runDownloadJobMachine(input: DownloadJobMachineInput) {
         input.logger.warn({ downloadId: input.job.data.downloadId, recovery, importPlan: actorInput.importPlan }, "unsupported NZB import avoided materialized disk download");
         return { status: "failed", action: recovery.action, recovered: recovery.recovered ?? false, mode: "unsupported" };
       }),
-      processMaterialized: fromPromise(async ({ input: actorInput }: { input: { nzbDocumentId: string } }) => {
-        if ((await getAllowedDownloadConnections()) <= 0) {
-          const current = await prisma.download.findUnique({ where: { id: input.job.data.downloadId } });
-          if (!current) return { status: "missing" };
-          return input.requeueForStreamingPriority({ current, job: input.job, logger: input.logger });
-        }
-        const result = await downloadNzbDocument({
-          downloadId: input.job.data.downloadId,
-          nzbDocumentId: actorInput.nzbDocumentId,
-          logger: input.logger
-        });
-        if (result.status === "completed") {
-          const imported = await input.finalizeMaterializedImport({
-            downloadId: input.job.data.downloadId,
-            requestId: input.job.data.requestId
-          });
-          input.logger.info({ downloadId: input.job.data.downloadId, imported: imported.length }, "archive/materialized NZB downloaded and imported");
-          return { status: "available", imports: imported.length, mode: "materialized" };
-        }
-        return result;
-      }),
       processMounted: fromPromise(async ({ input: actorInput }: { input: { nzbDocumentId: string } }) => {
         const allowedConnections = await getAllowedDownloadConnections();
         if (allowedConnections <= 0) {
@@ -154,7 +133,7 @@ export async function runDownloadJobMachine(input: DownloadJobMachineInput) {
             requestId: input.job.data.requestId ?? request?.id
           });
           await reconcileRequestStatusAfterImport(request?.id, input.job.data.downloadId);
-          input.logger.info({ downloadId: input.job.data.downloadId, streamPath: available.streamPath }, "streaming NZB prepared and symlinked");
+          input.logger.info({ downloadId: input.job.data.downloadId, file: basename(available.streamPath ?? input.job.data.title) }, "streaming NZB prepared");
           return result;
         } catch (error) {
           const rawMessage = error instanceof Error ? error.message : "import failed";
@@ -257,7 +236,6 @@ export async function runDownloadJobMachine(input: DownloadJobMachineInput) {
       hasTerminalCheck: ({ event }) => Boolean(getEventOutput<{ terminal: MachineResult | null }>(event)?.terminal),
       needsPriorityDelay: ({ event }) => Boolean(getEventOutput<MachineResult | null>(event)),
       importUnsupported: ({ context }) => context.importPlan?.mode === "unsupported",
-      importMaterialized: ({ context }) => context.importPlan?.mode === "materialized",
       importMounted: ({ context }) => context.importPlan?.mode === "mounted"
     },
     actions: {
@@ -270,7 +248,7 @@ export async function runDownloadJobMachine(input: DownloadJobMachineInput) {
         return terminal ? { result: terminal } : {};
       }),
       setNzbDocumentId: assign(({ event }) => ({ nzbDocumentId: getEventOutput<string>(event) })),
-      setImportPlan: assign(({ event }) => ({ importPlan: getEventOutput<{ mode: "mounted" | "materialized" | "unsupported"; reason?: string }>(event) }))
+      setImportPlan: assign(({ event }) => ({ importPlan: getEventOutput<{ mode: "mounted" | "unsupported"; reason?: string }>(event) }))
       ,
       setLastError: assign(({ event }) => ("error" in event ? { lastError: event.error } : {}))
     }
@@ -333,7 +311,6 @@ export async function runDownloadJobMachine(input: DownloadJobMachineInput) {
       routingImportMode: {
         always: [
           { guard: "importUnsupported", target: "processingUnsupported" },
-          { guard: "importMaterialized", target: "processingMaterialized" },
           { guard: "importMounted", target: "processingMounted" },
           { target: "done", actions: assign({ result: () => ({ status: "missing_import_mode" }) }) }
         ]
@@ -342,14 +319,6 @@ export async function runDownloadJobMachine(input: DownloadJobMachineInput) {
         invoke: {
           src: "processUnsupported",
           input: ({ context }) => ({ current: context.current as Download, importPlan: context.importPlan as { reason?: string } }),
-          onDone: { target: "done", actions: "setTerminalResult" },
-          onError: { target: "handlingError", actions: "setLastError" }
-        }
-      },
-      processingMaterialized: {
-        invoke: {
-          src: "processMaterialized",
-          input: ({ context }) => ({ nzbDocumentId: context.nzbDocumentId as string }),
           onDone: { target: "done", actions: "setTerminalResult" },
           onError: { target: "handlingError", actions: "setLastError" }
         }

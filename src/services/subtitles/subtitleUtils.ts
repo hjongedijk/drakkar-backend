@@ -1,5 +1,5 @@
-import { access } from "node:fs/promises";
-import { extname } from "node:path";
+import { access, readdir } from "node:fs/promises";
+import { basename, dirname, extname } from "node:path";
 import type { AppSettings } from "../settings/settingsStore.js";
 import type { SubtitleLookup } from "../../state-machines/subtitleDownloadMachine.js";
 
@@ -123,6 +123,25 @@ export async function pathExists(path: string) {
   } catch {
     return false;
   }
+}
+
+function escapeRegExp(value: string) {
+  return value.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+}
+
+export async function listSubtitleLanguagesForPath(mediaPath: string) {
+  const directory = dirname(mediaPath);
+  const extension = extname(mediaPath);
+  const stem = extension ? basename(mediaPath, extension) : basename(mediaPath);
+  const entries = await readdir(directory, { withFileTypes: true });
+  const languages = entries
+    .filter((entry) => entry.isFile())
+    .map((entry) => entry.name)
+    .flatMap((name) => {
+      const match = name.match(new RegExp(`^${escapeRegExp(stem)}\\.([a-z0-9-]+)\\.(srt|ass|ssa|vtt|sub)$`, "i"));
+      return match?.[1] ? [match[1].toUpperCase()] : [];
+    });
+  return [...new Set(languages)].sort();
 }
 
 export async function missingLanguagesForPath(mediaPath: string, languages: string[]) {

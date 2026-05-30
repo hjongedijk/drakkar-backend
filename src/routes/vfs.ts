@@ -42,12 +42,23 @@ export async function vfsRoutes(app: FastifyInstance): Promise<void> {
     return planMountedFileRange(query.path, query.range);
   });
   app.get("/api/vfs/bandwidth", async () => getBandwidthStatus());
-  app.get("/api/vfs/fuse", async () => getFuseMountStatus());
+  app.get("/api/vfs/mount", async () => getFuseMountStatus());
 
   async function sendFile(request: FastifyRequest<{ Querystring: { path?: string } }>, reply: FastifyReply) {
     const query = request.query as { path?: string };
     if (!query.path) return reply.status(400).send({ error: "path is required" });
-    const result = await streamVfsFile(query.path, request.headers.range);
+    const controller = new AbortController();
+    let aborted = false;
+    const abort = () => {
+      if (aborted) return;
+      aborted = true;
+      controller.abort();
+    };
+    request.raw.once("aborted", abort);
+    reply.raw.once("close", () => {
+      if (!reply.raw.writableEnded) abort();
+    });
+    const result = await streamVfsFile(query.path, request.headers.range, controller.signal);
     reply.header("accept-ranges", "bytes");
     reply.header("content-length", String(result.end - result.start + 1));
     if ("sessionId" in result) reply.header("x-stream-session-id", result.sessionId);

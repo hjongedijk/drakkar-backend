@@ -14,15 +14,38 @@ export type MountedVfsNode = {
   status?: string;
 };
 
+type MountedPathStat = {
+  path: string;
+  type: "folder" | "virtual-release" | "streamable-file" | "archive-file";
+  size: number;
+  modifiedAt: string;
+  isDirectory: boolean;
+  requiresStreaming?: boolean;
+  requiresExtract?: boolean;
+  status?: string;
+};
+
 type MountSummary = Awaited<ReturnType<typeof loadMountSummaryByDocumentId>>;
 type MountWithFileSegments = Awaited<ReturnType<typeof loadMountWithFileSegments>>;
+type MountMeta = Awaited<ReturnType<typeof loadMountMetaByDocumentId>>;
+type MountedFileMeta = Awaited<ReturnType<typeof loadMountedFileMetaByDocumentIdAndFileId>>;
 
 const MOUNT_CACHE_TTL_MS = 30_000;
 const MOUNT_NOT_FOUND_TTL_MS = 15_000;
+const MOUNT_STAT_CACHE_TTL_MS = 60_000;
+const MOUNT_LIST_CACHE_TTL_MS = 5 * 60_000;
+const MOUNT_DIR_CACHE_TTL_MS = 5 * 60_000;
+const ENSURE_MOUNTS_INTERVAL_MS = 5 * 60_000;
 const mountSummaryCache = new Map<string, { value: NonNullable<MountSummary>; expiresAt: number }>();
 const mountFileCache = new Map<string, { value: NonNullable<MountWithFileSegments>; expiresAt: number }>();
+const mountMetaCache = new Map<string, { value: NonNullable<MountMeta>; expiresAt: number }>();
+const mountedFileMetaCache = new Map<string, { value: NonNullable<MountedFileMeta>; expiresAt: number }>();
+const mountedPathStatCache = new Map<string, { value: MountedPathStat; expiresAt: number }>();
+const mountedListCache = new Map<string, { value: MountedVfsNode[]; expiresAt: number }>();
+const mountedDirCache = new Map<string, { value: MountedVfsNode[]; expiresAt: number }>();
 const missingMountedPathCache = new Map<string, number>();
 let mountsEnsuredAt = 0;
+let ensureMountsPromise: Promise<void> | null = null;
 
 function isCachedMissingMountedPath(path: string) {
   const expiresAt = missingMountedPathCache.get(path);
@@ -42,6 +65,21 @@ function clearMissingMountedPath(path: string) {
   missingMountedPathCache.delete(path);
 }
 
+function cachedMapGet<T>(cache: Map<string, { value: T; expiresAt: number }>, key: string) {
+  const cached = cache.get(key);
+  if (!cached) return null;
+  if (cached.expiresAt <= Date.now()) {
+    cache.delete(key);
+    return null;
+  }
+  return cached.value;
+}
+
+function cachedMapSet<T>(cache: Map<string, { value: T; expiresAt: number }>, key: string, value: T, ttlMs = MOUNT_CACHE_TTL_MS) {
+  cache.set(key, { value, expiresAt: Date.now() + ttlMs });
+  return value;
+}
+
 function safeFileName(value: string, index: number) {
   const extracted = filenameFromSubject(value, index);
   if (/\.(mkv|mp4|avi|mov|m4v|ts|srt|ass|ssa|vtt|sub|par2|zip|7z(?:\.\d+)?|rar|part\d+\.rar)$/i.test(extracted)) return extracted;
@@ -56,36 +94,60 @@ function safeFileName(value: string, index: number) {
 }
 
 export async function ensureMountsForExistingNzbs() {
-  if (mountsEnsuredAt > Date.now() - MOUNT_CACHE_TTL_MS) return;
-  const documents = await prisma.nzbDocument.findMany({ include: { mounts: true } });
-  for (const document of documents) {
-    if (document.mounts.length > 0) continue;
-    await prisma.vfsMount.upsert({
-      where: { path: `/mounted/${document.id}` },
-      update: {
-        streamable: false,
-        status: "pending"
+  if (mountsEnsuredAt > Date.now() - ENSURE_MOUNTS_INTERVAL_MS) return;
+  if (ensureMountsPromise) return ensureMountsPromise;
+  ensureMountsPromise = (async () => {
+    const documents = await prisma.nzbDocument.findMany({
+      where: {
+        mounts: {
+          none: {}
+        }
       },
-      create: {
-        nzbDocumentId: document.id,
-        name: document.title.replace(/[<>:"/\\|?*\x00-\x1F]+/g, "_").slice(0, 180) || document.id,
-        path: `/mounted/${document.id}`,
-        status: "pending",
-        streamable: false
+      select: {
+        id: true,
+        title: true
       }
     });
-  }
-  mountsEnsuredAt = Date.now();
+    for (const document of documents) {
+      await prisma.vfsMount.upsert({
+        where: { path: `/mounted/${document.id}` },
+        update: {
+          streamable: false,
+          status: "pending"
+        },
+        create: {
+          nzbDocumentId: document.id,
+          name: document.title.replace(/[<>:"/\\|?*\x00-\x1F]+/g, "_").slice(0, 180) || document.id,
+          path: `/mounted/${document.id}`,
+          status: "pending",
+          streamable: false
+        }
+      });
+    }
+    mountsEnsuredAt = Date.now();
+  })().finally(() => {
+    ensureMountsPromise = null;
+  });
+  return ensureMountsPromise;
 }
 
 function cacheMountSummary(mount: NonNullable<MountSummary>) {
-  mountSummaryCache.set(mount.nzbDocumentId, { value: mount, expiresAt: Date.now() + MOUNT_CACHE_TTL_MS });
+  cachedMapSet(mountSummaryCache, mount.nzbDocumentId, mount);
 }
 
 function cacheMountFile(mount: NonNullable<MountWithFileSegments>) {
   const file = mount.nzbDocument.files[0];
   if (!file) return;
-  mountFileCache.set(`${mount.nzbDocumentId}:${file.id}`, { value: mount, expiresAt: Date.now() + MOUNT_CACHE_TTL_MS });
+  cachedMapSet(mountFileCache, `${mount.nzbDocumentId}:${file.id}`, mount);
+}
+
+function cacheMountMeta(mount: NonNullable<MountMeta>) {
+  cachedMapSet(mountMetaCache, mount.nzbDocumentId, mount);
+}
+
+function cacheMountedPathStat(path: string, value: MountedPathStat) {
+  cachedMapSet(mountedPathStatCache, path, value, MOUNT_STAT_CACHE_TTL_MS);
+  return value;
 }
 
 async function loadMountSummaryByDocumentId(documentId: string) {
@@ -108,6 +170,29 @@ async function loadMountSummaryByDocumentId(documentId: string) {
   });
 }
 
+async function loadMountMetaByDocumentId(documentId: string) {
+  return prisma.vfsMount.findFirst({
+    where: { OR: [{ path: `/mounted/${documentId}` }, { nzbDocumentId: documentId }, { id: documentId }] },
+    select: {
+      id: true,
+      name: true,
+      path: true,
+      status: true,
+      streamable: true,
+      createdAt: true,
+      updatedAt: true,
+      nzbDocumentId: true,
+      nzbDocument: {
+        select: {
+          id: true,
+          title: true,
+          totalSize: true
+        }
+      }
+    }
+  });
+}
+
 async function loadMountWithFileSegments(documentId: string, fileId: string) {
   return prisma.vfsMount.findFirst({
     where: { OR: [{ path: `/mounted/${documentId}` }, { nzbDocumentId: documentId }, { id: documentId }] },
@@ -124,6 +209,46 @@ async function loadMountWithFileSegments(documentId: string, fileId: string) {
       }
     }
   });
+}
+
+async function loadMountedFileMetaByDocumentIdAndFileId(documentId: string, fileId: string) {
+  return prisma.nzbFile.findFirst({
+    where: {
+      id: fileId,
+      nzbDocumentId: documentId
+    },
+    select: {
+      id: true,
+      subject: true,
+      size: true,
+      date: true,
+      nzbDocumentId: true
+    }
+  });
+}
+
+export function parseMountedPath(path: string) {
+  const parts = path.split("/").filter(Boolean);
+  if (parts[0] !== "mounted") return null;
+  const isReleasePath = parts[1] === "releases";
+  const documentId = isReleasePath ? parts[2] : parts[1];
+  if (!documentId || ["completed", "downloads", "nzb"].includes(documentId)) return null;
+  const fileIndex = isReleasePath ? 3 : 2;
+  const rawSegment = parts[fileIndex] ?? "";
+  const decodedSegment = decodeMountedPathSegment(rawSegment);
+  const fileId = decodeURIComponent(decodedSegment.split("-")[0] ?? "");
+  return {
+    parts,
+    documentId,
+    mountPath: isReleasePath ? `/mounted/releases/${documentId}` : `/${parts.slice(0, 2).join("/")}`,
+    isReleasePath,
+    isRoot: parts.length === (isReleasePath ? 3 : 2),
+    isArchivePath: parts[fileIndex] === "archive",
+    fileIndex,
+    rawSegment,
+    decodedSegment,
+    fileId
+  };
 }
 
 function decodeMountedPathSegment(value?: string) {
@@ -163,12 +288,14 @@ function mountedFileForPath(
 }
 
 export async function listMounts(basePath = "/mounted"): Promise<MountedVfsNode[]> {
+  const cached = cachedMapGet(mountedListCache, basePath);
+  if (cached) return cached;
   await ensureMountsForExistingNzbs();
   const mounts = await prisma.vfsMount.findMany({
     orderBy: { createdAt: "desc" },
     include: { nzbDocument: true }
   });
-  return mounts.map((mount) => ({
+  return cachedMapSet(mountedListCache, basePath, mounts.map((mount) => ({
     name: mount.name,
     path: `${basePath}/${mount.nzbDocumentId}`,
     type: "virtual-release" as const,
@@ -177,44 +304,36 @@ export async function listMounts(basePath = "/mounted"): Promise<MountedVfsNode[
     mountId: mount.id,
     nzbDocumentId: mount.nzbDocumentId,
     status: mount.status
-  })).sort((a, b) => a.name.localeCompare(b.name, undefined, { numeric: true, sensitivity: "base" }));
+  })).sort((a, b) => a.name.localeCompare(b.name, undefined, { numeric: true, sensitivity: "base" })), MOUNT_LIST_CACHE_TTL_MS);
 }
 
 export async function getMountByPath(path: string) {
-  const parts = path.split("/").filter(Boolean);
-  if (parts[0] !== "mounted") return null;
-  const documentId = parts[1] === "releases" ? parts[2] : parts[1];
-  if (!documentId || ["completed", "downloads", "nzb"].includes(documentId)) return null;
+  const parsed = parseMountedPath(path);
+  if (!parsed) return null;
   await ensureMountsForExistingNzbs();
-  const cached = mountSummaryCache.get(documentId);
-  if (cached && cached.expiresAt > Date.now()) return cached.value;
-  const mount = await loadMountSummaryByDocumentId(documentId);
+  const cached = cachedMapGet(mountSummaryCache, parsed.documentId);
+  if (cached) return cached;
+  const mount = await loadMountSummaryByDocumentId(parsed.documentId);
   if (mount) cacheMountSummary(mount);
   return mount;
 }
 
 export async function getMountFileByPath(path: string) {
-  const parts = path.split("/").filter(Boolean);
-  if (parts[0] !== "mounted") return null;
-  const documentId = parts[1] === "releases" ? parts[2] : parts[1];
-  const fileIndex = parts[1] === "releases" ? 3 : 2;
-  const fileId = decodeURIComponent(parts[fileIndex]?.split("-")[0] ?? "");
-  if (!documentId || !fileId || ["completed", "downloads", "nzb"].includes(documentId)) return null;
+  const parsed = parseMountedPath(path);
+  if (!parsed?.fileId) return null;
   await ensureMountsForExistingNzbs();
-  const rawSegment = parts[fileIndex] ?? "";
-  const decodedSegment = decodeMountedPathSegment(rawSegment);
-  const cacheKey = `${documentId}:${fileId || decodedSegment}`;
-  const cached = mountFileCache.get(cacheKey);
-  if (cached && cached.expiresAt > Date.now()) return cached.value;
+  const cacheKey = `${parsed.documentId}:${parsed.fileId || parsed.decodedSegment}`;
+  const cached = cachedMapGet(mountFileCache, cacheKey);
+  if (cached) return cached;
 
-  let mount = fileId ? await loadMountWithFileSegments(documentId, fileId) : null;
+  let mount = parsed.fileId ? await loadMountWithFileSegments(parsed.documentId, parsed.fileId) : null;
   if (mount && mount.nzbDocument.files.length === 0) mount = null;
-  let resolvedFileId = fileId;
+  let resolvedFileId = parsed.fileId;
   if (!mount) {
-    const mountSummary = await getMountByPath(parts[1] === "releases" ? `/mounted/releases/${documentId}` : `/mounted/${documentId}`);
+    const mountSummary = await getMountByPath(parsed.mountPath);
     if (!mountSummary) return null;
     resolvedFileId = mountedFileForPath(mountSummary, path).file?.id ?? "";
-    mount = resolvedFileId ? await loadMountWithFileSegments(documentId, resolvedFileId) : null;
+    mount = resolvedFileId ? await loadMountWithFileSegments(parsed.documentId, resolvedFileId) : null;
     if (mount && mount.nzbDocument.files.length === 0) mount = null;
   }
 
@@ -232,14 +351,40 @@ export async function getMountFileByPath(path: string) {
       }
     });
     cacheMountFile(mount);
-    if (cacheKey !== `${documentId}:${resolvedFileId}`) {
-      mountFileCache.set(cacheKey, { value: mount, expiresAt: Date.now() + MOUNT_CACHE_TTL_MS });
+    if (cacheKey !== `${parsed.documentId}:${resolvedFileId}`) {
+      cachedMapSet(mountFileCache, cacheKey, mount);
     }
   }
   return mount;
 }
 
+async function getMountMetaByPath(path: string) {
+  const parsed = parseMountedPath(path);
+  if (!parsed) return null;
+  await ensureMountsForExistingNzbs();
+  const cached = cachedMapGet(mountMetaCache, parsed.documentId);
+  if (cached) return cached;
+  const mount = await loadMountMetaByDocumentId(parsed.documentId);
+  if (mount) cacheMountMeta(mount);
+  return mount;
+}
+
+async function getMountedFileMetaByPath(path: string) {
+  const parsed = parseMountedPath(path);
+  if (!parsed?.fileId) return null;
+  const cacheKey = `${parsed.documentId}:${parsed.fileId}`;
+  const cached = cachedMapGet(mountedFileMetaCache, cacheKey);
+  if (cached) return cached;
+  const file = await loadMountedFileMetaByDocumentIdAndFileId(parsed.documentId, parsed.fileId);
+  if (!file) return null;
+  return cachedMapSet(mountedFileMetaCache, cacheKey, file);
+}
+
 export async function listMountedFiles(path: string): Promise<MountedVfsNode[]> {
+  const cached = cachedMapGet(mountedDirCache, path);
+  if (cached) return cached;
+  const parsed = parseMountedPath(path);
+  if (!parsed) throw new Error("mounted NZB not found");
   const parts = path.split("/").filter(Boolean);
   const mountPath = parts[1] === "releases" ? `/mounted/releases/${parts[2]}` : `/${parts.slice(0, 2).join("/")}`;
   const mount = await getMountByPath(mountPath);
@@ -260,48 +405,79 @@ export async function listMountedFiles(path: string): Promise<MountedVfsNode[]> 
     };
   }).sort((a, b) => a.name.localeCompare(b.name, undefined, { numeric: true, sensitivity: "base" }));
   const archiveFiles = await listStoredArchiveEntries(mount.nzbDocumentId);
-  const virtualFiles = archiveFiles.map((file) => ({
-    name: file.name,
-    path: `${basePath}/archive/${encodeURIComponent(file.name)}`,
-    type: "streamable-file" as const,
-    size: file.size,
-    modifiedAt: file.modifiedAt.toISOString(),
-    mountId: mount.id,
-    nzbDocumentId: mount.nzbDocumentId,
-    status: "streamable_archive"
-  }));
-  return [...virtualFiles, ...directFiles].sort((a, b) => a.name.localeCompare(b.name, undefined, { numeric: true, sensitivity: "base" }));
+  if (parsed.isArchivePath) {
+    const virtualFiles = archiveFiles.map((file) => ({
+      name: file.name,
+      path: `${basePath}/archive/${encodeURIComponent(file.name)}`,
+      type: "streamable-file" as const,
+      size: file.size,
+      modifiedAt: file.modifiedAt.toISOString(),
+      mountId: mount.id,
+      nzbDocumentId: mount.nzbDocumentId,
+      status: "streamable_archive"
+    }));
+    return cachedMapSet(
+      mountedDirCache,
+      path,
+      virtualFiles.sort((a, b) => a.name.localeCompare(b.name, undefined, { numeric: true, sensitivity: "base" })),
+      MOUNT_DIR_CACHE_TTL_MS
+    );
+  }
+  const hasArchiveFiles = archiveFiles.length > 0;
+  const archiveFolder = hasArchiveFiles
+    ? [{
+        name: "archive",
+        path: `${basePath}/archive`,
+        type: "folder" as const,
+        size: archiveFiles.length,
+        modifiedAt: mount.updatedAt.toISOString(),
+        mountId: mount.id,
+        nzbDocumentId: mount.nzbDocumentId,
+        status: "streamable_archive"
+      }]
+    : [];
+  return cachedMapSet(
+    mountedDirCache,
+    path,
+    [...archiveFolder, ...directFiles].sort((a, b) => a.name.localeCompare(b.name, undefined, { numeric: true, sensitivity: "base" })),
+    MOUNT_DIR_CACHE_TTL_MS
+  );
 }
 
 export async function statMountedPath(path: string) {
+  const cachedStat = cachedMapGet(mountedPathStatCache, path);
+  if (cachedStat) return cachedStat;
   if (isCachedMissingMountedPath(path)) throw new Error("mounted NZB file not found");
   if (path === "/mounted/releases") {
     const mounts = await listMounts("/mounted/releases");
-    return { path, type: "folder", size: mounts.length, modifiedAt: new Date().toISOString(), isDirectory: true };
+    return cacheMountedPathStat(path, { path, type: "folder", size: mounts.length, modifiedAt: new Date().toISOString(), isDirectory: true });
   }
 
-  const parts = path.split("/").filter(Boolean);
-  const mountPath = parts[1] === "releases" ? `/mounted/releases/${parts[2]}` : `/${parts.slice(0, 2).join("/")}`;
-  const mount = await getMountByPath(mountPath);
+  const parsed = parseMountedPath(path);
+  if (!parsed) {
+    cacheMissingMountedPath(path);
+    throw new Error("mounted VFS path not found");
+  }
+  const mount = await getMountMetaByPath(parsed.mountPath);
   if (!mount) {
     cacheMissingMountedPath(path);
     throw new Error("mounted VFS path not found");
   }
   if (path === mount.path || path === `/mounted/${mount.nzbDocumentId}` || path === `/mounted/${mount.id}` || path === `/mounted/releases/${mount.nzbDocumentId}` || path === `/mounted/releases/${mount.id}`) {
     clearMissingMountedPath(path);
-    return {
+    return cacheMountedPathStat(path, {
       path,
       type: "virtual-release",
       size: mount.nzbDocument.totalSize,
       modifiedAt: mount.updatedAt.toISOString(),
       isDirectory: true
-    };
+    });
   }
 
-  const archiveEntry = await getStoredArchiveEntryByPath(path).catch(() => null);
+  const archiveEntry = parsed.isArchivePath ? await getStoredArchiveEntryByPath(path).catch(() => null) : null;
   if (archiveEntry) {
     clearMissingMountedPath(path);
-    return {
+    return cacheMountedPathStat(path, {
       path,
       type: "streamable-file",
       size: archiveEntry.size,
@@ -310,10 +486,43 @@ export async function statMountedPath(path: string) {
       requiresStreaming: true,
       requiresExtract: false,
       status: "streamable_archive"
-    };
+    });
+  }
+  if (parsed.isArchivePath && path.endsWith("/archive")) {
+    clearMissingMountedPath(path);
+    return cacheMountedPathStat(path, {
+      path,
+      type: "folder",
+      size: 0,
+      modifiedAt: mount.updatedAt.toISOString(),
+      isDirectory: true,
+      status: "streamable_archive"
+    });
   }
 
-  const { file, index: subjectIndex } = mountedFileForPath(mount, path);
+  const mountedFile = await getMountedFileMetaByPath(path);
+  if (mountedFile) {
+    clearMissingMountedPath(path);
+    const name = safeFileName(mountedFile.subject, 0);
+    const archive = detectArchive(name) !== "none" || isPar2File(name);
+    return cacheMountedPathStat(path, {
+      path,
+      type: archive ? "archive-file" : "streamable-file",
+      size: mountedFile.size,
+      modifiedAt: (mountedFile.date ?? mount.updatedAt).toISOString(),
+      isDirectory: false,
+      requiresStreaming: false,
+      requiresExtract: archive,
+      status: archive ? "requires_extract" : mount.streamable ? "streamable" : "not_streamable"
+    });
+  }
+
+  const mountSummary = await getMountByPath(parsed.mountPath);
+  if (!mountSummary) {
+    cacheMissingMountedPath(path);
+    throw new Error("mounted NZB file not found");
+  }
+  const { file, index: subjectIndex } = mountedFileForPath(mountSummary, path);
   if (!file) {
     cacheMissingMountedPath(path);
     throw new Error("mounted NZB file not found");
@@ -321,16 +530,16 @@ export async function statMountedPath(path: string) {
   clearMissingMountedPath(path);
   const name = safeFileName(file.subject, subjectIndex);
   const archive = detectArchive(name) !== "none" || isPar2File(name);
-  return {
+  return cacheMountedPathStat(path, {
     path,
     type: archive ? "archive-file" : "streamable-file",
     size: file.size,
-    modifiedAt: (file.date ?? mount.updatedAt).toISOString(),
+    modifiedAt: (file.date ?? mountSummary.updatedAt).toISOString(),
     isDirectory: false,
     requiresStreaming: false,
     requiresExtract: archive,
-    status: archive ? "requires_extract" : mount.streamable ? "streamable" : "not_streamable"
-  };
+    status: archive ? "requires_extract" : mountSummary.streamable ? "streamable" : "not_streamable"
+  });
 }
 
 export function isMountedPath(path = "/") {

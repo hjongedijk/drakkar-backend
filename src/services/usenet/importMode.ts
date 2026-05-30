@@ -1,6 +1,6 @@
 import { filenameFromSubject } from "./filename.js";
 
-export type NzbImportMode = "mounted" | "materialized" | "unsupported";
+export type NzbImportMode = "mounted" | "unsupported";
 export type NzbImportPlan = {
   mode: NzbImportMode;
   reason?: "archive_payload" | "no_direct_video";

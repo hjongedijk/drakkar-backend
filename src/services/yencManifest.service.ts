@@ -10,13 +10,13 @@ export type DecodedManifestSegment<TSegment> = {
 
 type BuildDecodedManifestMode = "exact" | "fast";
 
-type SegmentLike = {
+export type SegmentLike = {
   number: number;
   bytes: number;
   articleId: string;
 };
 
-type FileLike<TSegment extends SegmentLike> = {
+export type FileLike<TSegment extends SegmentLike> = {
   id: string;
   nzbDocumentId?: string;
   size: number;
@@ -134,6 +134,38 @@ async function getYencPartInfo(fileId: string, segment: SegmentLike, providers: 
   const value = await fetchYencPartInfo(segment.articleId, providers, signal);
   yencHeaderCache.set(key, { value, expiresAt: Date.now() + HEADER_CACHE_TTL_MS });
   return value;
+}
+
+export async function getDecodedYencPartInfo(
+  fileId: string,
+  segment: SegmentLike,
+  providers: UsenetServer[],
+  signal?: AbortSignal
+) {
+  return getYencPartInfo(fileId, segment, providers, signal);
+}
+
+export async function getDecodedYencFileSize<TSegment extends SegmentLike>(
+  file: FileLike<TSegment>,
+  providers: UsenetServer[],
+  signal?: AbortSignal
+) {
+  const ordered = [...file.segments].sort((a, b) => a.number - b.number);
+  const last = ordered.at(-1);
+  if (!last) return Math.max(0, Math.floor(file.size));
+  const info = await getYencPartInfo(file.id, last, providers, signal);
+  if (
+    info &&
+    Number.isFinite(info.partOffset) &&
+    Number.isFinite(info.partSize) &&
+    (info.partOffset ?? 0) >= 0 &&
+    (info.partSize ?? 0) > 0
+  ) {
+    const exactSize = Math.floor(info.partOffset! + info.partSize!);
+    void persistDecodedSize(file, exactSize);
+    return exactSize;
+  }
+  return Math.max(0, Math.floor(file.size));
 }
 
 async function mapWithConcurrency<TInput, TOutput>(

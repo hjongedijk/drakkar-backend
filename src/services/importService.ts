@@ -391,10 +391,23 @@ export async function importCompletedPath(input: { sourcePath: string; downloadI
       episode: item.episode
     });
     const updated = await prisma.importItem.update({ where: { id: item.id }, data: metadata });
-    await createLibraryEntryForImport(updated);
-    imported.push(updated);
+    try {
+      await createLibraryEntryForImport(updated);
+      imported.push(updated);
+    } catch (error) {
+      await prisma.importItem.update({
+        where: { id: updated.id },
+        data: { status: "import_failed" }
+      }).catch(() => undefined);
+      if (input.downloadId) {
+        await safeUpdateDownload(input.downloadId, {
+          error: error instanceof Error ? error.message : String(error)
+        }).catch(() => undefined);
+      }
+    }
   }
 
+  if (imported.length === 0) throw new Error("no validated media files were eligible for library symlinks");
   return imported;
 }
 
@@ -543,9 +556,20 @@ export async function makeMountedDownloadAvailable(input: { downloadId: string; 
         })
       : item;
 
-    const link = await createLibraryEntryForImport(ensured);
-    imported.push({ item: ensured, link, streamPath: selected.path });
+    try {
+      const link = await createLibraryEntryForImport(ensured);
+      imported.push({ item: ensured, link, streamPath: selected.path });
+    } catch (error) {
+      await prisma.importItem.update({
+        where: { id: ensured.id },
+        data: { status: "import_failed" }
+      }).catch(() => undefined);
+      await safeUpdateDownload(download.id, {
+        error: error instanceof Error ? error.message : String(error)
+      }).catch(() => undefined);
+    }
   }
+  if (imported.length === 0) throw new Error("no validated mounted media files were eligible for library symlinks");
   await safeUpdateDownload(download.id, {
     status: "available",
     progress: 100,

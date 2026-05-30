@@ -21,6 +21,7 @@ import {
   seerrWebhookHandler,
   syncRequestsHandler,
   testRequestProviderHandler,
+  updateRequestProfileHandler,
   updateRequestProviderHandler
 } from "../controllers/requestController.js";
 
@@ -39,6 +40,7 @@ export async function requestRoutes(app: FastifyInstance): Promise<void> {
   app.post("/api/webhooks/seerr", seerrWebhookHandler);
   app.post("/api/requests/:id/approve", approveRequestHandler);
   app.post("/api/requests/:id/reject", rejectRequestHandler);
+  app.patch("/api/requests/:id/profile", updateRequestProfileHandler);
   app.post("/api/requests/:id/search", searchRequestReleasesHandler);
   app.post("/api/requests/:id/episodes/:season/:episode/search", searchRequestEpisodeReleasesHandler);
   app.post("/api/requests/:id/episodes/:season/:episode/download", downloadRequestEpisodeHandler);

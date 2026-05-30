@@ -22,21 +22,25 @@ export async function getBandwidthStatus() {
   );
   const reservedStreamingCapacity = activeStreamCount > 0 ? allocatedStreamingConnections : 0;
   const remainingAfterStreamingReservation = Math.max(0, maxTotalConnections - reservedStreamingCapacity);
-  const effectiveDownloadCap = activeStreamCount > 0
-    ? Math.min(maxDownloadConnections, remainingAfterStreamingReservation)
-    : Math.min(maxTotalConnections, maxDownloadConnections + Math.max(0, maxStreamingConnections - allocatedStreamingConnections));
-  const maintenanceFloor = activeStreamCount > 0 ? 0 : maxDownloadConnections > 0 ? 1 : 0;
+  const effectiveDownloadCap = Math.min(
+    maxTotalConnections,
+    maxDownloadConnections + Math.max(0, maxStreamingConnections - allocatedStreamingConnections)
+  );
+  const maintenanceFloor = maxDownloadConnections > 0 ? 1 : 0;
+  const playbackDownloadLane = activeStreamCount > 0
+    ? Math.min(2, maxDownloadConnections, remainingAfterStreamingReservation)
+    : effectiveDownloadCap;
   const allocatedDownloadConnections = activeStreamCount > 0
-    ? clamp(
+    ? clamp(playbackDownloadLane, 0, effectiveDownloadCap)
+    : clamp(
         Math.min(effectiveDownloadCap, Math.max(maintenanceFloor, remainingAfterStreamingReservation)),
         0,
         effectiveDownloadCap
-      )
-    : Math.min(effectiveDownloadCap, maxTotalConnections);
+      );
 
   return {
     activeStreamCount,
-    queueThrottleActive: activeStreamCount > 0,
+    queueThrottleActive: false,
     policy: {
       streamingPriority: policies.streamingPriority,
       maxDownloadConnections: policies.maxDownloadConnections,

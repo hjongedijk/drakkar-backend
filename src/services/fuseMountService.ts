@@ -4,6 +4,7 @@ import { execFile } from "node:child_process";
 import { promisify } from "node:util";
 import Fuse, { type OPERATIONS, type Stats } from "@zkochan/fuse-native";
 import type { FastifyBaseLogger } from "fastify";
+import { LocalTtlCache } from "../services/cache/localTtlCache.js";
 import { env } from "../services/config/env.js";
 import { getPolicySettings } from "../services/policyService.js";
 import { closeMountedReadSession } from "../services/mountedStream.service.js";
@@ -13,6 +14,11 @@ let fuseInstance: Fuse | null = null;
 let lastError: string | null = null;
 let loggerRef: FastifyBaseLogger | null = null;
 let nextFd = 10;
+const FUSE_METADATA_CACHE_SECONDS = 45;
+const FUSE_LOCAL_STAT_CACHE_MS = 8_000;
+const FUSE_LOCAL_READDIR_CACHE_MS = 8_000;
+const fuseStatCache = new LocalTtlCache<StatLikeNode>();
+const fuseReaddirCache = new LocalTtlCache<{ names: string[]; stats: Stats[] }>();
 
 const execFileAsync = promisify(execFile);
 const fileHandles = new Map<number, string>();
@@ -37,6 +43,13 @@ function inodeForPath(path: string) {
     hash = Math.imul(hash, 16777619);
   }
   return Math.abs(hash) || 1;
+}
+
+function basenameForFusePath(path: string) {
+  const trimmed = path.replace(/\/+$/, "") || "/";
+  if (trimmed === "/") return "";
+  const parts = trimmed.split("/").filter(Boolean);
+  return parts.at(-1) ?? "";
 }
 
 function toFuseStats(node: StatLikeNode): Stats {
@@ -85,7 +98,11 @@ function fuseOperations(): OPERATIONS {
   return {
     getattr(path, callback) {
       asyncFuse(
-        () => statVfs(path),
+        async () => {
+          const cached = fuseStatCache.get(path);
+          if (cached) return cached;
+          return fuseStatCache.set(path, await statVfs(path), FUSE_LOCAL_STAT_CACHE_MS);
+        },
         (node) => callback(0, toFuseStats(node)),
         (code) => callback(code)
       );
@@ -94,9 +111,12 @@ function fuseOperations(): OPERATIONS {
     readdir(path, callback) {
       asyncFuse(
         async () => {
+          const cached = fuseReaddirCache.get(path);
+          if (cached) return cached;
           const entries = await listVfs(path);
-          return {
-            names: entries.map((entry: Awaited<ReturnType<typeof listVfs>>[number]) => entry.name),
+          const result = {
+            // FUSE must return stable directory entry names that round-trip through getattr/open.
+            names: entries.map((entry: Awaited<ReturnType<typeof listVfs>>[number]) => basenameForFusePath(entry.path) || entry.name),
             stats: entries.map((entry: Awaited<ReturnType<typeof listVfs>>[number]) =>
               toFuseStats({
                 path: entry.path,
@@ -107,6 +127,7 @@ function fuseOperations(): OPERATIONS {
               })
             )
           };
+          return fuseReaddirCache.set(path, result, FUSE_LOCAL_READDIR_CACHE_MS);
         },
         ({ names, stats }) => callback(0, names, stats),
         (code) => callback(code)
@@ -177,8 +198,8 @@ function fuseOperations(): OPERATIONS {
 export async function startFuseMount(logger: FastifyBaseLogger) {
   loggerRef = logger;
   if (!env.FUSE_MOUNT_ENABLED) {
-    logger.info("FUSE mount disabled");
-    return { enabled: false, mounted: false, path: env.FUSE_MOUNT_PATH };
+    logger.info("native mount disabled");
+    return getFuseMountStatus();
   }
   if (fuseInstance) return getFuseMountStatus();
 
@@ -192,9 +213,10 @@ export async function startFuseMount(logger: FastifyBaseLogger) {
       debug: env.FUSE_DEBUG,
       allowOther: env.FUSE_ALLOW_OTHER,
       defaultPermissions: true as never,
-      entryTimeout: 1,
-      attrTimeout: 1,
-      acAttrTimeout: 1,
+      // Short metadata caching absorbs Plex/Radarr repeat-stat bursts without hiding new imports for long.
+      entryTimeout: FUSE_METADATA_CACHE_SECONDS,
+      attrTimeout: FUSE_METADATA_CACHE_SECONDS,
+      acAttrTimeout: FUSE_METADATA_CACHE_SECONDS,
       force: env.FUSE_FORCE_MOUNT,
       fsname: "drakkar"
     });
@@ -222,6 +244,8 @@ export async function stopFuseMount(logger: FastifyBaseLogger) {
   const active = fuseInstance;
   fuseInstance = null;
   fileHandles.clear();
+  fuseStatCache.clear();
+  fuseReaddirCache.clear();
   if (active) {
     await new Promise<void>((resolve) => {
       active.unmount((error: Error | null) => {
@@ -236,12 +260,13 @@ export async function stopFuseMount(logger: FastifyBaseLogger) {
   logger.info({ mountPath: env.FUSE_MOUNT_PATH }, "native TypeScript FUSE mount stopped");
 }
 
-export function getFuseMountStatus() {
+export async function getFuseMountStatus() {
+  const externalMounted = await probeExternalMount(env.FUSE_MOUNT_PATH);
   return {
-    enabled: env.FUSE_MOUNT_ENABLED,
-    mounted: Boolean(fuseInstance),
+    enabled: env.FUSE_MOUNT_ENABLED || externalMounted,
+    mounted: Boolean(fuseInstance) || externalMounted,
     path: env.FUSE_MOUNT_PATH,
-    error: lastError
+    error: externalMounted ? null : lastError
   };
 }
 
@@ -293,5 +318,14 @@ async function unmountStaleFuse(mountPath: string, logger: FastifyBaseLogger) {
         logger.debug({ err: error, mountPath, command }, "FUSE pre-unmount skipped");
       }
     }
+  }
+}
+
+async function probeExternalMount(mountPath: string) {
+  try {
+    await execFileAsync("mountpoint", ["-q", mountPath]);
+    return true;
+  } catch {
+    return false;
   }
 }

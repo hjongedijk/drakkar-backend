@@ -5,6 +5,7 @@ import { downloadNzb } from "../services/indexers/nzbhydra/client.js";
 import { createBlocklistItem, isReleaseBlocklisted } from "../services/policyService.js";
 import { toPublicReleases } from "../services/releases/public.js";
 import type { Release } from "../services/releases/types.js";
+import { scoreRelease } from "../services/quality/scoring.js";
 import { runSearch } from "../services/searchService.js";
 import { getSettings } from "../services/settings/settingsStore.js";
 import { getLibraryItem, libraryStats, listLibraryItems } from "./media-library/libraryQueries.js";
@@ -24,10 +25,24 @@ function searchParamsForLibraryItem(item: Pick<MediaLibraryItem, "mediaType" | "
 
 export { getLibraryItem, libraryStats, listLibraryItems, refreshMediaLibrary };
 
+async function rankedLibraryReplacementReleases(item: Pick<MediaLibraryItem, "qualityProfileId">, releases: Release[]) {
+  if (!item.qualityProfileId) return releases;
+  const profile = await prisma.qualityProfile.findUnique({ where: { id: item.qualityProfileId } });
+  if (!profile) return releases;
+  return [...releases]
+    .map((release) => ({ release, decision: scoreRelease(release, profile) }))
+    .sort((left, right) => {
+      const acceptedOrder = Number(right.decision.accepted) - Number(left.decision.accepted);
+      if (acceptedOrder !== 0) return acceptedOrder;
+      return right.decision.score - left.decision.score;
+    })
+    .map((item) => item.release);
+}
+
 export async function searchLibraryItemReplacements(id: string) {
   const item = await getLibraryItem(id);
   const releases = await runSearch(searchParamsForLibraryItem(item));
-  return { item, releases: toPublicReleases(releases) };
+  return { item, releases: toPublicReleases(await rankedLibraryReplacementReleases(item, releases)) };
 }
 
 export async function deleteLibraryItem(id: string, options: { blocklist?: boolean; reason?: string } = {}) {

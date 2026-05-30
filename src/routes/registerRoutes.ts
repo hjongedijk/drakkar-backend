@@ -18,6 +18,7 @@ import { statusRoutes } from "./status.js";
 import { taskRoutes } from "./tasks.js";
 import { usenetRoutes } from "./usenet.js";
 import { vfsRoutes } from "./vfs.js";
+import { webdavRoutes } from "./webdav.js";
 
 const routeRegistrations = [
   statusRoutes,
@@ -27,6 +28,7 @@ const routeRegistrations = [
   profileRoutes,
   downloadRoutes,
   vfsRoutes,
+  webdavRoutes,
   sabRoutes,
   usenetRoutes,
   requestRoutes,

@@ -9,6 +9,7 @@ type PlexLibrary = {
   title: string;
   type?: string;
   locations: string[];
+  refreshing?: boolean;
 };
 
 const PLEX_PRODUCT = "Drakkar";
@@ -56,12 +57,20 @@ function parsePlexLibraries(input: unknown): PlexLibrary[] {
   const dirs = container.MediaContainer?.Directory ?? container.mediaContainer?.directory;
   if (Array.isArray(dirs)) {
     return dirs.map((dir) => {
-      const row = dir as { key?: string | number; title?: string; type?: string; Location?: Array<{ path?: string }>; location?: Array<{ path?: string }> };
+      const row = dir as {
+        key?: string | number;
+        title?: string;
+        type?: string;
+        refreshing?: boolean | number | string;
+        Location?: Array<{ path?: string }>;
+        location?: Array<{ path?: string }>;
+      };
       return {
         key: String(row.key ?? ""),
         title: row.title ?? String(row.key ?? ""),
         type: row.type,
-        locations: (row.Location ?? row.location ?? []).map((location) => location.path).filter(Boolean) as string[]
+        locations: (row.Location ?? row.location ?? []).map((location) => location.path).filter(Boolean) as string[],
+        refreshing: row.refreshing === true || row.refreshing === 1 || row.refreshing === "1"
       };
     }).filter((library) => library.key);
   }
@@ -83,10 +92,41 @@ function parsePlexLibrariesXml(xml: string): PlexLibrary[] {
       key,
       title: attr(block, "title") ?? key,
       type: attr(block, "type"),
-      locations
+      locations,
+      refreshing: attr(block, "refreshing") === "1"
     });
   }
   return libraries;
+}
+
+function normalizePlexText(value: string | undefined) {
+  return value?.trim().toLowerCase().replace(/\s+/g, " ") ?? "";
+}
+
+function parsePlexActivityTitles(input: unknown) {
+  const container = input as {
+    MediaContainer?: { Activity?: unknown[] };
+    mediaContainer?: { activity?: unknown[] };
+  };
+  const rows = container.MediaContainer?.Activity ?? container.mediaContainer?.activity;
+  if (!Array.isArray(rows)) return [];
+  return rows.map((row) => {
+    const activity = row as { title?: string; subtitle?: string };
+    return {
+      title: normalizePlexText(activity.title),
+      subtitle: normalizePlexText(activity.subtitle)
+    };
+  });
+}
+
+function parsePlexActivityTitlesXml(xml: string) {
+  return Array.from(xml.matchAll(/<Activity\b[^>]*>/g)).map((match) => {
+    const block = match[0];
+    return {
+      title: normalizePlexText(attr(block, "title")),
+      subtitle: normalizePlexText(attr(block, "subtitle"))
+    };
+  });
 }
 
 async function plexFetch(path: string, init: RequestInit = {}) {
@@ -113,10 +153,30 @@ export async function listPlexLibraries(): Promise<PlexLibrary[]> {
   }
 }
 
+async function plexLibraryBusyByActivity(library: PlexLibrary) {
+  const response = await plexFetch("/activities");
+  if (!response.ok) return false;
+  const text = await response.text();
+  const normalizedTitle = normalizePlexText(library.title);
+  const activities = (() => {
+    try {
+      return parsePlexActivityTitles(JSON.parse(text));
+    } catch {
+      return parsePlexActivityTitlesXml(text);
+    }
+  })();
+  return activities.some((activity) => {
+    const title = activity.title;
+    const subtitle = activity.subtitle;
+    const scanLike = title.includes("scan") || title.includes("refresh");
+    return scanLike && (subtitle.includes(normalizedTitle) || title.includes(normalizedTitle));
+  });
+}
+
 function pathCandidates(path: string, plexLibraryPath: string) {
   const normalized = resolve(path);
   const parent = dirname(normalized);
-  const configuredRoot = resolve(plexLibraryPath || "/mnt/media");
+  const configuredRoot = resolve(plexLibraryPath || "/mnt/drakkar/media");
   const mapped = normalized.startsWith(configuredRoot) ? normalized : resolve(configuredRoot, normalized.replace(/^\/+/, ""));
   const mappedParent = dirname(mapped);
   return Array.from(new Set([mappedParent, parent, mapped, normalized]));
@@ -194,5 +254,5 @@ export async function pollPlexOauth(pinId: number) {
 }
 
 export function plexDefaultLibraryPath() {
-  return env.MEDIA_MOVIES_DIR.startsWith("/mnt/") ? "/mnt/media" : env.MEDIA_MOVIES_DIR;
+  return env.MEDIA_MOVIES_DIR.startsWith("/mnt/") ? "/mnt/drakkar/media" : env.MEDIA_MOVIES_DIR;
 }

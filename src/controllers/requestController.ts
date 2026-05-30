@@ -1,6 +1,6 @@
 import type { FastifyReply, FastifyRequest } from "fastify";
 import { requireAdmin } from "../middleware/requireAdmin.js";
-import { episodeParamsSchema, manualRequestSchema, providerSchema, releaseGrabSchema, syncRequestsSchema } from "../models/schemas/requestSchemas.js";
+import { episodeParamsSchema, manualRequestSchema, providerSchema, releaseGrabSchema, requestProfileSchema, syncRequestsSchema } from "../models/schemas/requestSchemas.js";
 import { toPublicRelease } from "../services/releases/public.js";
 import {
   createManualRequest,
@@ -19,6 +19,7 @@ import {
   rankReleasesForRequest,
   rankTvEpisodeForRequest,
   refreshRequest,
+  setRequestProfile,
   setRequestStatus,
   enqueueWebhookSync,
   syncRequestFromWebhook,
@@ -85,7 +86,6 @@ export async function getRequestMonitorHandler(request: FastifyRequest) {
 export async function syncRequestsHandler(request: FastifyRequest) {
   const body = syncRequestsSchema.parse(request.body ?? {});
   const result = await syncRequests(body.providerId, { full: body.full });
-  void runDeferredRequestRecovery(request.log);
   return publicResult({
     ...result,
     recovery: { recovered: 0, deferred: true },
@@ -124,6 +124,10 @@ export async function approveRequestHandler(request: FastifyRequest) {
 
 export async function rejectRequestHandler(request: FastifyRequest) {
   return publicRequest(await setRequestStatus(idParam(request), "rejected"));
+}
+
+export async function updateRequestProfileHandler(request: FastifyRequest) {
+  return publicRequest(await setRequestProfile(idParam(request), requestProfileSchema.parse(request.body).profileId));
 }
 
 export async function searchRequestReleasesHandler(request: FastifyRequest) {

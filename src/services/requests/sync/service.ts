@@ -1,4 +1,5 @@
 import type { FastifyBaseLogger } from "fastify";
+import { readFile } from "node:fs/promises";
 import { prisma, Prisma, type MediaRequest, type RequestProvider } from "../../../repositories/db/prisma.js";
 import { refreshMediaLibrary } from "../../libraryService.js";
 import { refreshLibraryRequestRows } from "../../media-library/libraryRefresh.js";
@@ -10,15 +11,22 @@ import type { ExternalMediaRequest } from "../types.js";
 import {
   blocklistSelectedRelease,
   existingActiveDownload,
+  getRequest,
+  getRequestMonitor,
+  grabTvEpisodeForRequest,
   reconcileRequestLinkStates,
+  rankReleasesForRequest,
+  rankTvEpisodeForRequest,
   findWorkingImportForRequest,
-  grabBestForRequest,
   grabMissingTvForRequest,
+  grabBestForRequest,
   grabReleaseForRequest,
   markWantedSearchCooldown,
   markWantedSearchTimeoutCooldown,
   requestedEpisodesBySeason,
   requestedSeasons,
+  setRequestProfile,
+  setRequestStatus,
   shouldAutoGrabSyncedRequest,
   tvRequestAvailabilitySummary,
   upsertRequest,
@@ -28,8 +36,8 @@ import { hydrateLegacyRequestFields } from "../../media-library/normalizedMedia.
 
 const MONITOR_QUEUE_SEED_STATUSES = ["queued", "fetching_nzb", "verifying", "waiting_for_provider", "waiting_for_nzb", "downloading", "paused"];
 const MONITORED_REQUEST_STATUSES = ["approved", "grabbed", "available", "release_failed", "no_release_found", "auto_grab_failed"];
-const MONITORED_REQUESTS_MAX_DURATION_MS = 60_000;
-const MONITORED_REQUEST_OPERATION_TIMEOUT_MS = 20_000;
+const MONITORED_REQUESTS_MAX_DURATION_MS = 90_000;
+const MONITORED_REQUEST_OPERATION_TIMEOUT_MS = 30_000;
 const REQUEST_RECOVERY_MAX_DURATION_MS = 45_000;
 const REQUEST_SYNC_MAX_DURATION_MS = 35_000;
 const REQUEST_SYNC_PROVIDER_MAX_REQUESTS = 200;
@@ -39,9 +47,11 @@ const ACTIVE_WANTED_SEARCHES_PER_CYCLE = 1;
 const MONITORED_REQUEST_TIMEOUT_BUDGET = 4;
 const MONITORED_REQUEST_BATCH_SIZE = 120;
 const MONITORED_TV_BATCH_SIZE = 12;
-const MONITORED_MOVIE_SEARCH_LIMIT = 30;
-const MONITORED_TV_SEARCH_LIMIT = 30;
+const MONITORED_MOVIE_SEARCH_LIMIT = 10;
+const MONITORED_TV_SEARCH_LIMIT = 5;
 const MONITORED_TV_CURSOR_KEY = "request-recovery.tv.cursor";
+const SELECTED_RELEASE_RECOVERY_CURSOR_KEY = "request-recovery.selected-release.cursor";
+const FAILED_REQUEST_RECOVERY_CURSOR_KEY = "request-recovery.failed.cursor";
 const MONITORED_SEARCH_OPTIONS = {
   searchLimit: MONITORED_MOVIE_SEARCH_LIMIT,
   skipFallback: true,
@@ -192,6 +202,70 @@ async function fetchMonitoredTvRequestsBatch() {
   const nextSkip = skip + rows.length >= total ? 0 : skip + rows.length;
   await setMonitoredTvCursor(nextSkip).catch(() => undefined);
   return rows.map((request) => hydrateLegacyRequestFields(request));
+}
+
+async function getRecoveryCursor(key: string) {
+  const row = await prisma.setting.findUnique({ where: { key } });
+  const value = row?.value as { skip?: unknown } | undefined;
+  const skip = typeof value?.skip === "number" && Number.isFinite(value.skip) && value.skip >= 0 ? Math.floor(value.skip) : 0;
+  return skip;
+}
+
+async function setRecoveryCursor(key: string, skip: number) {
+  await prisma.setting.upsert({
+    where: { key },
+    update: { value: { skip } },
+    create: { key, value: { skip } }
+  });
+}
+
+async function fetchRecoveryRequestBatch<T extends Prisma.MediaRequestFindManyArgs>(
+  cursorKey: string,
+  where: NonNullable<T["where"]>,
+  take: number,
+  args: Omit<T, "where" | "skip" | "take" | "orderBy">
+) {
+  const total = await prisma.mediaRequest.count({ where });
+  if (total === 0) {
+    await setRecoveryCursor(cursorKey, 0).catch(() => undefined);
+    return [] as Prisma.MediaRequestGetPayload<T>[];
+  }
+
+  let skip = await getRecoveryCursor(cursorKey);
+  if (skip >= total) skip = 0;
+
+  let rows = await prisma.mediaRequest.findMany({
+    where,
+    orderBy: [{ updatedAt: "asc" }, { id: "asc" }],
+    skip,
+    take,
+    ...args
+  } as T);
+
+  if (rows.length === 0) {
+    skip = 0;
+    rows = await prisma.mediaRequest.findMany({
+      where,
+      orderBy: [{ updatedAt: "asc" }, { id: "asc" }],
+      take,
+      ...args
+    } as T);
+  }
+
+  const nextSkip = skip + rows.length >= total ? 0 : skip + rows.length;
+  await setRecoveryCursor(cursorKey, nextSkip).catch(() => undefined);
+  return rows as Prisma.MediaRequestGetPayload<T>[];
+}
+
+async function ioPressureAvg10() {
+  try {
+    const raw = await readFile("/proc/pressure/io", "utf8");
+    const line = raw.split("\n").find((entry) => entry.startsWith("some "));
+    const match = line?.match(/\bavg10=(\d+(?:\.\d+)?)\b/);
+    return match ? Number(match[1]) : 0;
+  } catch {
+    return 0;
+  }
 }
 
 async function fetchProviderRequests(
@@ -586,33 +660,50 @@ export function enqueueWebhookSync(logger: FastifyBaseLogger, payload: unknown, 
 export async function recoverFailedRequestDownloads(options: { limit?: number } = {}) {
   const limit = Math.max(1, options.limit ?? FAILED_REQUEST_RECOVERY_MAX_PER_CYCLE);
   const startedAt = Date.now();
-  const requests = (await prisma.mediaRequest.findMany({
-    where: {
+  const requests = (await fetchRecoveryRequestBatch(
+    FAILED_REQUEST_RECOVERY_CURSOR_KEY,
+    {
       downloadId: { not: null },
       status: { not: "available" }
     },
-    orderBy: { updatedAt: "asc" },
-    take: limit,
-    include: REQUEST_SYNC_RELATION_SELECT
-  })).map((request) => hydrateLegacyRequestFields(request));
+    limit,
+    {
+      select: {
+        id: true,
+        mediaType: true,
+        status: true,
+        downloadId: true,
+        selectedRelease: true,
+        title: true,
+        year: true,
+        tmdbId: true,
+        tvdbId: true,
+        imdbId: true,
+        seasons: true,
+        episodes: true
+      }
+    }
+  )).map((request) => hydrateLegacyRequestFields(request));
   const downloadIds = [...new Set(requests.flatMap((request) => request.downloadId ? [request.downloadId] : []))];
   const downloads = downloadIds.length > 0
-    ? await prisma.download.findMany({ where: { id: { in: downloadIds } } })
+    ? await prisma.download.findMany({ where: { id: { in: downloadIds } }, select: { id: true, status: true, error: true } })
     : [];
   const downloadMap = new Map(downloads.map((download) => [download.id, download]));
-  const recovered = [];
+  const recovered: Array<{ requestId: string; grabbed: boolean; reason?: string | null }> = [];
   for (const request of requests) {
     if (Date.now() - startedAt >= REQUEST_RECOVERY_MAX_DURATION_MS) break;
     const download = request.downloadId ? downloadMap.get(request.downloadId) ?? null : null;
     if (!download) {
       await prisma.mediaRequest.update({ where: { id: request.id }, data: { status: "release_failed", downloadId: null } });
-      recovered.push(await grabForRequestMediaType(request.id, request.mediaType));
+      const result = await grabForRequestMediaType(request.id, request.mediaType);
+      recovered.push({ requestId: request.id, grabbed: Boolean(result?.grabbed), reason: result?.reason ?? null });
       continue;
     }
     if (!["failed", "replaced", "cancelled"].includes(download.status)) continue;
     await blocklistSelectedRelease(request, download.error ?? "download failed", "request-recovery");
     await prisma.mediaRequest.update({ where: { id: request.id }, data: { status: "release_failed", downloadId: null } });
-    recovered.push(await grabForRequestMediaType(request.id, request.mediaType));
+    const result = await grabForRequestMediaType(request.id, request.mediaType);
+    recovered.push({ requestId: request.id, grabbed: Boolean(result?.grabbed), reason: result?.reason ?? null });
   }
   if (recovered.length > 0) await refreshLibraryRequestRows(requests.map((request) => request.id)).catch(() => undefined);
   return { scanned: requests.length, recovered: recovered.length, results: recovered };
@@ -621,18 +712,33 @@ export async function recoverFailedRequestDownloads(options: { limit?: number } 
 export async function recoverSelectedReleaseDownloads(options: { limit?: number } = {}) {
   const limit = Math.max(1, options.limit ?? SELECTED_RELEASE_RECOVERY_MAX_PER_CYCLE);
   const startedAt = Date.now();
-  const requests = (await prisma.mediaRequest.findMany({
-    where: {
+  const requests = (await fetchRecoveryRequestBatch(
+    SELECTED_RELEASE_RECOVERY_CURSOR_KEY,
+    {
       downloadId: null,
       selectedRelease: { not: Prisma.JsonNull },
       status: { in: ["approved", "grabbed", "searching", "release_failed", "auto_grab_failed", "no_release_found", "import_failed"] }
     },
-    orderBy: { updatedAt: "asc" },
-    take: limit,
-    include: REQUEST_SYNC_RELATION_SELECT
-  })).map((request) => hydrateLegacyRequestFields(request));
+    limit,
+    {
+      select: {
+        id: true,
+        mediaType: true,
+        status: true,
+        downloadId: true,
+        selectedRelease: true,
+        title: true,
+        year: true,
+        tmdbId: true,
+        tvdbId: true,
+        imdbId: true,
+        seasons: true,
+        episodes: true
+      }
+    }
+  )).map((request) => hydrateLegacyRequestFields(request));
 
-  const recovered = [];
+  const recovered: Array<{ requestId: string; grabbed: boolean; reason?: string | null }> = [];
   for (const request of requests) {
     if (Date.now() - startedAt >= REQUEST_RECOVERY_MAX_DURATION_MS) break;
     const workingImport = await findWorkingImportForRequest(request).catch(() => null);
@@ -644,13 +750,13 @@ export async function recoverSelectedReleaseDownloads(options: { limit?: number 
           downloadId: workingImport.downloadId
         }
       }).catch(() => undefined);
-      recovered.push({ requestId: request.id, result: { grabbed: false, reason: "working import already exists", import: workingImport } });
+      recovered.push({ requestId: request.id, grabbed: false, reason: "working import already exists" });
       continue;
     }
     if (!request.selectedRelease || typeof request.selectedRelease !== "object") continue;
     try {
       const result = await grabReleaseForRequest(request.id, request.selectedRelease);
-      recovered.push({ requestId: request.id, result });
+      recovered.push({ requestId: request.id, grabbed: Boolean(result?.grabbed), reason: result?.reason ?? null });
     } catch (error) {
       const message = error instanceof Error ? error.message : "selected release recovery failed";
       await blocklistSelectedRelease(request, message, "selected-release-recovery");
@@ -662,13 +768,11 @@ export async function recoverSelectedReleaseDownloads(options: { limit?: number 
           downloadId: null
         }
       }).catch(() => undefined);
-      recovered.push({
-        requestId: request.id,
-        result: await grabForRequestMediaType(request.id, request.mediaType).catch((retryError) => ({
-          grabbed: false,
-          reason: retryError instanceof Error ? retryError.message : "replacement search failed"
-        }))
-      });
+      const retryResult = await grabForRequestMediaType(request.id, request.mediaType).catch((retryError) => ({
+        grabbed: false,
+        reason: retryError instanceof Error ? retryError.message : "replacement search failed"
+      }));
+      recovered.push({ requestId: request.id, grabbed: Boolean(retryResult?.grabbed), reason: retryResult?.reason ?? null });
     }
   }
 
@@ -745,13 +849,18 @@ async function monitoredQueuePendingCount() {
   });
 }
 
-export async function ensureMonitoredRequests(logger?: FastifyBaseLogger) {
+export async function ensureMonitoredRequests(
+  logger?: FastifyBaseLogger,
+  options?: { activeWantedSearchLimit?: number; timeoutBudget?: number }
+) {
   const settings = await getSettings();
   const queueSeedTarget = Math.max(1, settings.monitorQueueSeedTarget);
   const startedAt = Date.now();
   let pendingQueueItems = await monitoredQueuePendingCount();
   let activeWantedSearches = 0;
   let timedOutOperations = 0;
+  const activeWantedSearchLimit = Math.max(0, options?.activeWantedSearchLimit ?? ACTIVE_WANTED_SEARCHES_PER_CYCLE);
+  const timeoutBudget = Math.max(1, options?.timeoutBudget ?? MONITORED_REQUEST_TIMEOUT_BUDGET);
   if (pendingQueueItems >= queueSeedTarget) {
     return { retried: 0, queueSeedTarget, pendingQueueItems, skippedBecauseQueueFull: 1, results: [] };
   }
@@ -767,11 +876,11 @@ export async function ensureMonitoredRequests(logger?: FastifyBaseLogger) {
   const tvRequests = await fetchMonitoredTvRequestsBatch();
   const requests = [...tvRequests, ...movieRequests];
 
-  const retried = [];
+  const retried: Array<{ requestId: string; grabbed: boolean; remainingSeasonSearches?: number }> = [];
   let skippedBecauseQueueFull = 0;
   for (const request of requests) {
     if (Date.now() - startedAt >= MONITORED_REQUESTS_MAX_DURATION_MS) break;
-    if (timedOutOperations >= MONITORED_REQUEST_TIMEOUT_BUDGET) {
+    if (timedOutOperations >= timeoutBudget) {
       logger?.warn({ timedOutOperations, queueSeedTarget, pendingQueueItems }, "monitored request recovery stopped early after timeout budget was exhausted");
       break;
     }
@@ -831,15 +940,12 @@ export async function ensureMonitoredRequests(logger?: FastifyBaseLogger) {
         grabMissingTvForRequest(request.id, { cachedOnly: true, ...MONITORED_TV_SEARCH_OPTIONS }).catch(() => null),
         MONITORED_REQUEST_OPERATION_TIMEOUT_MS
       );
+      let result = cachedResult.timedOut ? null : cachedResult.value;
       if (cachedResult.timedOut) {
         timedOutOperations += 1;
-        await markWantedSearchTimeoutCooldown(request.id).catch(() => undefined);
-        await prisma.mediaRequest.update({ where: { id: request.id }, data: { updatedAt: new Date() } }).catch(() => undefined);
-        logger?.warn({ requestId: request.id, title: request.title, mediaType: request.mediaType, cachedOnly: true }, "monitored request search timed out; skipping request for this cycle");
-        continue;
+        logger?.warn({ requestId: request.id, title: request.title, mediaType: request.mediaType, cachedOnly: true }, "monitored request cached search timed out; trying active search if budget allows");
       }
-      let result = cachedResult.value;
-      if (!result?.grabbed && activeWantedSearches < ACTIVE_WANTED_SEARCHES_PER_CYCLE) {
+      if (!result?.grabbed && activeWantedSearches < activeWantedSearchLimit) {
         attemptedActiveSearch = true;
         activeWantedSearches += 1;
         const activeResult = await withSoftTimeout(
@@ -864,7 +970,11 @@ export async function ensureMonitoredRequests(logger?: FastifyBaseLogger) {
         && Number((result as Record<string, unknown>).remainingSeasonSearches) > 0
       );
       if (result?.grabbed || hasRemainingSeasonSearches || attemptedActiveSearch) {
-        retried.push({ requestId: request.id, result });
+        retried.push({
+          requestId: request.id,
+          grabbed: Boolean(result?.grabbed),
+          ...(hasRemainingSeasonSearches ? { remainingSeasonSearches: Number((result as Record<string, unknown>).remainingSeasonSearches) } : {})
+        });
         await prisma.mediaRequest.update({ where: { id: request.id }, data: { updatedAt: new Date() } }).catch(() => undefined);
       }
       pendingQueueItems = await monitoredQueuePendingCount();
@@ -901,15 +1011,12 @@ export async function ensureMonitoredRequests(logger?: FastifyBaseLogger) {
       grabBestForRequest(request.id, { cachedOnly: true, ...MONITORED_SEARCH_OPTIONS }).catch(() => null),
       MONITORED_REQUEST_OPERATION_TIMEOUT_MS
     );
+    let result = cachedResult.timedOut ? null : cachedResult.value;
     if (cachedResult.timedOut) {
       timedOutOperations += 1;
-      await markWantedSearchTimeoutCooldown(request.id).catch(() => undefined);
-      await prisma.mediaRequest.update({ where: { id: request.id }, data: { updatedAt: new Date() } }).catch(() => undefined);
-      logger?.warn({ requestId: request.id, title: request.title, mediaType: request.mediaType, cachedOnly: true }, "monitored request search timed out; skipping request for this cycle");
-      continue;
+      logger?.warn({ requestId: request.id, title: request.title, mediaType: request.mediaType, cachedOnly: true }, "monitored request cached search timed out; trying active search if budget allows");
     }
-    let result = cachedResult.value;
-    if (!result?.grabbed && activeWantedSearches < ACTIVE_WANTED_SEARCHES_PER_CYCLE) {
+    if (!result?.grabbed && activeWantedSearches < activeWantedSearchLimit) {
       attemptedActiveSearch = true;
       activeWantedSearches += 1;
       const activeResult = await withSoftTimeout(
@@ -927,7 +1034,7 @@ export async function ensureMonitoredRequests(logger?: FastifyBaseLogger) {
       await markWantedSearchCooldown(request.id).catch(() => undefined);
     }
     if (result?.grabbed || attemptedActiveSearch) {
-      retried.push({ requestId: request.id, result });
+      retried.push({ requestId: request.id, grabbed: Boolean(result?.grabbed) });
       await prisma.mediaRequest.update({ where: { id: request.id }, data: { updatedAt: new Date() } }).catch(() => undefined);
     }
     pendingQueueItems = await monitoredQueuePendingCount();

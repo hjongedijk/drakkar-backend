@@ -15,24 +15,24 @@ export const LOG_PRUNE_TASK_ID = "log-prune";
 export const SUBTITLE_BACKFILL_TASK_ID = "subtitle-backfill";
 
 export const REQUEST_SYNC_INTERVAL_MS = 15 * 60_000;
-export const REQUEST_RECOVERY_INTERVAL_MS = 1 * 60_000;
+export const REQUEST_RECOVERY_INTERVAL_MS = 10 * 60_000;
 export const NZBHYDRA_RSS_SYNC_INTERVAL_MS = 15 * 60_000;
 export const BACKGROUND_REPAIR_INTERVAL_MS = 30 * 60_000;
 export const LOG_PRUNE_INTERVAL_MS = 6 * 60 * 60_000;
 export const SUBTITLE_BACKFILL_INTERVAL_MS = 6 * 60 * 60_000;
 
 export const DEFAULT_TASK_INTERVALS: Record<string, number | null> = {
-  [REQUEST_SYNC_TASK_ID]: REQUEST_SYNC_INTERVAL_MS,
-  [REQUEST_RECOVERY_TASK_ID]: REQUEST_RECOVERY_INTERVAL_MS,
-  [NZBHYDRA_RSS_SYNC_TASK_ID]: NZBHYDRA_RSS_SYNC_INTERVAL_MS,
-  [BACKGROUND_REPAIR_TASK_ID]: BACKGROUND_REPAIR_INTERVAL_MS,
+  [REQUEST_SYNC_TASK_ID]: null,
+  [REQUEST_RECOVERY_TASK_ID]: null,
+  [NZBHYDRA_RSS_SYNC_TASK_ID]: null,
+  [BACKGROUND_REPAIR_TASK_ID]: null,
   [QUEUE_RECONCILE_TASK_ID]: null,
   [IMPORT_RECONCILE_TASK_ID]: null,
   [INTERRUPTED_RECOVERY_TASK_ID]: REQUEST_SYNC_INTERVAL_MS,
   [NAMING_MIGRATION_TASK_ID]: null,
   [LIBRARY_CLEANUP_TASK_ID]: null,
   [LOG_PRUNE_TASK_ID]: LOG_PRUNE_INTERVAL_MS,
-  [SUBTITLE_BACKFILL_TASK_ID]: SUBTITLE_BACKFILL_INTERVAL_MS
+  [SUBTITLE_BACKFILL_TASK_ID]: null
 };
 
 export function resolveTaskIntervalMs(taskId: string, settings?: Pick<AppSettings, "taskIntervals"> | null) {
@@ -46,7 +46,7 @@ export function registerCoreTasks(settings?: Pick<AppSettings, "taskIntervals"> 
   registerTask({
     id: REQUEST_SYNC_TASK_ID,
     name: "Request Sync",
-    description: "Periodic bulk Seerr sync for large libraries. Single approved requests should arrive immediately through the Seerr webhook; this task handles wider request reconciliation.",
+    description: "One-shot startup Seerr import plus manual full sync. Day-to-day request updates should arrive through the Seerr webhook.",
     intervalMs: resolveTaskIntervalMs(REQUEST_SYNC_TASK_ID, settings),
     enabled: env.REQUEST_SYNC_ENABLED,
     manualRunnable: true

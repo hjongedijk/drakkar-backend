@@ -29,6 +29,10 @@ export const syncRequestsSchema = z.object({
   full: z.boolean().optional()
 });
 
+export const requestProfileSchema = z.object({
+  profileId: z.string().min(1)
+});
+
 export const episodeParamsSchema = z.object({
   id: z.string(),
   season: z.coerce.number().int().positive(),

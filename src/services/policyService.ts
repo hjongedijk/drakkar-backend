@@ -67,15 +67,15 @@ export const blocklistQuerySchema = z.object({
 });
 
 export const policySettingsSchema = z.object({
-  streamingPriority: z.number().int().min(0).max(100).default(80),
-  maxDownloadConnections: z.number().int().min(0).default(20),
-  maxStreamingConnections: z.number().int().min(0).default(10),
+  streamingPriority: z.number().int().min(0).max(100).default(70),
+  maxDownloadConnections: z.number().int().min(0).default(12),
+  maxStreamingConnections: z.number().int().min(0).default(14),
   maxTotalUsenetConnections: z.number().int().positive().default(30),
-  streamCacheEnabled: z.boolean().default(true),
+  streamCacheEnabled: z.boolean().default(false),
   streamCacheMaxSizeGb: z.number().positive().default(20),
   streamCacheMaxAgeHours: z.number().positive().default(24),
   streamChunkSizeBytes: z.number().int().positive().default(4 * 1024 * 1024),
-  streamReadAheadBytes: z.number().int().min(0).default(64 * 1024 * 1024),
+  streamReadAheadBytes: z.number().int().min(0).default(512 * 1024 * 1024),
   duplicateNzbBehavior: duplicateBehaviorSchema.default("mark_failed"),
   failNzbWithoutVideo: z.boolean().default(true),
   manualUploadCategory: z.string().min(1).default("manual"),
@@ -88,15 +88,15 @@ export const ignoredPatternsSchema = z.array(z.string().min(1));
 export type PolicySettings = z.infer<typeof policySettingsSchema>;
 
 export const DEFAULT_POLICIES: PolicySettings = {
-  streamingPriority: 80,
-  maxDownloadConnections: 20,
-  maxStreamingConnections: 10,
+  streamingPriority: 70,
+  maxDownloadConnections: 12,
+  maxStreamingConnections: 14,
   maxTotalUsenetConnections: 30,
-  streamCacheEnabled: true,
+  streamCacheEnabled: false,
   streamCacheMaxSizeGb: 20,
   streamCacheMaxAgeHours: 24,
   streamChunkSizeBytes: 4 * 1024 * 1024,
-  streamReadAheadBytes: 64 * 1024 * 1024,
+  streamReadAheadBytes: 512 * 1024 * 1024,
   duplicateNzbBehavior: "mark_failed",
   failNzbWithoutVideo: true,
   manualUploadCategory: "manual",

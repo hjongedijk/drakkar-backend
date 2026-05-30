@@ -19,6 +19,7 @@ export type ScheduledTask = TaskDefinition & {
 };
 
 const tasks = new Map<string, ScheduledTask>();
+const STALE_RUNNING_TASK_MS = 30 * 60_000;
 
 function toIso(value: Date | string | null | undefined) {
   if (!value) return null;
@@ -70,7 +71,14 @@ export async function runTrackedTask<T>(id: string, action: () => Promise<T>): P
   }
   // A long-running operation cannot be safely cancelled or duplicated in-process.
   // Restarting the service is the recovery path for a genuinely hung task.
-  if (task.status === "running") return undefined;
+  if (task.status === "running") {
+    const startedAtMs = task.lastStartedAt ? new Date(task.lastStartedAt).getTime() : 0;
+    if (startedAtMs > 0 && Date.now() - startedAtMs > STALE_RUNNING_TASK_MS) {
+      markTaskCompleted(id, new Error("stale running task state cleared"));
+    } else {
+      return undefined;
+    }
+  }
 
   const startedAt = Date.now();
   task.status = "running";

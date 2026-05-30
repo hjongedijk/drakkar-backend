@@ -3,6 +3,7 @@ import { prisma } from "../../../repositories/db/prisma.js";
 import { cleanupDownloadHistory } from "../../downloadService.js";
 import { refreshNzbhydraUpdateFeeds } from "../../indexers/nzbhydra/client.js";
 import { refreshMediaLibrary } from "../../libraryService.js";
+import { listActiveStreamSessions } from "../../mountedStream.service.js";
 import { reconcileAvailableDownloadsWithoutImports, recoverInterruptedDownloads } from "../../../workers/usenetWorkers.js";
 import { pruneLogData } from "../../logPruneService.js";
 import { getSettings } from "../../settings/settingsStore.js";
@@ -17,6 +18,7 @@ import {
   recoverSelectedReleaseDownloads,
   syncRequests
 } from "./service.js";
+import { getRecentWebdavActivitySummary } from "../../webdavActivity.js";
 
 const scheduleHandles = new Map<string, NodeJS.Timeout>();
 let running = false;
@@ -24,8 +26,58 @@ let rssRunning = false;
 let logPruneRunning = false;
 const FULL_REQUEST_SYNC_BATCH_SIZE = 100;
 const INCREMENTAL_REQUEST_SYNC_BATCH_SIZE = 200;
-const REQUEST_RECOVERY_BATCH_LIMIT = 25;
+const REQUEST_RECOVERY_BATCH_LIMIT = 2;
+const REQUEST_RECOVERY_HOT_IO_AVG10 = 8;
 const REQUEST_SYNC_CURSOR_KEY_PREFIX = "request-sync.cursor:";
+const STARTUP_REQUEST_SYNC_COMPLETED_KEY = "request-sync.startup.completed";
+const STARTUP_REQUEST_SYNC_DELAY_MS = 3 * 60_000;
+const STARTUP_REQUEST_SYNC_RETRY_DELAY_MS = 2 * 60_000;
+let startupRequestSyncScheduled = false;
+let startupRequestSyncHandle: NodeJS.Timeout | null = null;
+
+async function ioPressureAvg10() {
+  try {
+    const raw = await import("node:fs/promises").then(({ readFile }) => readFile("/proc/pressure/io", "utf8"));
+    const line = raw.split("\n").find((entry) => entry.startsWith("some "));
+    const match = line?.match(/\bavg10=(\d+(?:\.\d+)?)\b/);
+    return match ? Number(match[1]) : 0;
+  } catch {
+    return 0;
+  }
+}
+
+async function activeStreamCount() {
+  try {
+    const streams = await listActiveStreamSessions();
+    return streams.filter((stream) => stream.status === "active").length;
+  } catch {
+    return 0;
+  }
+}
+
+async function playbackGate() {
+  const [ioAvg10, streams] = await Promise.all([ioPressureAvg10(), activeStreamCount()]);
+  return { ioAvg10, streams, playbackActive: streams > 0 };
+}
+
+async function shouldDeferHeavyStartupSync() {
+  const [ioAvg10, streams] = await Promise.all([ioPressureAvg10(), activeStreamCount()]);
+  const webdav = getRecentWebdavActivitySummary();
+  return {
+    ioAvg10,
+    streams,
+    webdav,
+    defer: streams > 0 || ioAvg10 >= REQUEST_RECOVERY_HOT_IO_AVG10 || webdav.scanActive
+  };
+}
+
+async function shouldDeferRequestRecoveryWork() {
+  const gate = await shouldDeferHeavyStartupSync();
+  return {
+    ...gate,
+    defer: gate.defer
+  };
+}
 
 async function getRequestSyncCursor(providerId: string) {
   const row = await prisma.setting.findUnique({ where: { key: `${REQUEST_SYNC_CURSOR_KEY_PREFIX}${providerId}` } });
@@ -42,10 +94,24 @@ async function setRequestSyncCursor(providerId: string, skip: number) {
   });
 }
 
+async function hasCompletedStartupRequestSync() {
+  const row = await prisma.setting.findUnique({ where: { key: STARTUP_REQUEST_SYNC_COMPLETED_KEY } });
+  return Boolean(row);
+}
+
+async function markStartupRequestSyncCompleted() {
+  await prisma.setting.upsert({
+    where: { key: STARTUP_REQUEST_SYNC_COMPLETED_KEY },
+    update: { value: { completedAt: new Date().toISOString() } },
+    create: { key: STARTUP_REQUEST_SYNC_COMPLETED_KEY, value: { completedAt: new Date().toISOString() } }
+  });
+}
+
 async function configuredTaskInterval(taskId: string, fallback: number | null) {
   const settings = await getSettings().catch(() => null);
   registerCoreTasks(settings ?? undefined);
-  return resolveTaskIntervalMs(taskId, settings) ?? fallback;
+  const resolved = resolveTaskIntervalMs(taskId, settings);
+  return resolved === undefined ? fallback : resolved;
 }
 
 async function setDynamicTaskNextRun(taskId: string, fallback: number | null) {
@@ -136,6 +202,16 @@ export async function runNzbhydraRssSyncCycle(logger: FastifyBaseLogger) {
 }
 
 export async function runDeferredRequestRecovery(logger: FastifyBaseLogger) {
+  const gate = await shouldDeferRequestRecoveryWork();
+  if (gate.defer) {
+    logger.info({
+      activeStreamCount: gate.streams,
+      ioAvg10: gate.ioAvg10,
+      mediaPropfindCount: gate.webdav.mediaPropfindCount,
+      propfindCount: gate.webdav.propfindCount
+    }, "request recovery deferred because playback, library scan, or hot IO is active");
+    return { started: false, reason: "hot_io_or_scan_active" as const, ...gate };
+  }
   const conflictingTaskId = hasConflictingHeavyTask([
     IMPORT_RECONCILE_TASK_ID,
     INTERRUPTED_RECOVERY_TASK_ID,
@@ -147,9 +223,13 @@ export async function runDeferredRequestRecovery(logger: FastifyBaseLogger) {
   }
   try {
     const result = await runTrackedTask(REQUEST_RECOVERY_TASK_ID, async () => {
+      const recoveryBatchLimit = REQUEST_RECOVERY_BATCH_LIMIT;
       const linkReconcile = await reconcileRequestLinkStates();
       if (linkReconcile.updated > 0) logger.info(linkReconcile, "request/download link states reconciled");
-      const monitored = await ensureMonitoredRequests(logger);
+      const monitored = await ensureMonitoredRequests(logger, {
+        activeWantedSearchLimit: undefined,
+        timeoutBudget: undefined
+      });
       if (monitored.retried > 0 || monitored.skippedBecauseQueueFull > 0) {
         logger.info({
           retried: monitored.retried,
@@ -158,11 +238,11 @@ export async function runDeferredRequestRecovery(logger: FastifyBaseLogger) {
           skippedBecauseQueueFull: monitored.skippedBecauseQueueFull
         }, "monitored request queue seeding completed");
       }
-      const selectedReleaseRecovery = await recoverSelectedReleaseDownloads({ limit: REQUEST_RECOVERY_BATCH_LIMIT });
+      const selectedReleaseRecovery = await recoverSelectedReleaseDownloads({ limit: recoveryBatchLimit });
       if (selectedReleaseRecovery.recovered > 0) {
         logger.info({ recovered: selectedReleaseRecovery.recovered }, "selected releases without downloads were re-queued");
       }
-      const failedRecovery = await recoverFailedRequestDownloads({ limit: REQUEST_RECOVERY_BATCH_LIMIT });
+      const failedRecovery = await recoverFailedRequestDownloads({ limit: recoveryBatchLimit });
       if (failedRecovery.recovered > 0) {
         logger.info({ recovered: failedRecovery.recovered }, "failed request downloads were recovered");
       }
@@ -176,6 +256,15 @@ export async function runDeferredRequestRecovery(logger: FastifyBaseLogger) {
 }
 
 export async function runImportReconcileCycle(logger: FastifyBaseLogger) {
+  const gate = await playbackGate();
+  if (gate.playbackActive) {
+    return {
+      started: false,
+      reason: "playback_active" as const,
+      activeStreamCount: gate.streams,
+      ioAvg10: gate.ioAvg10
+    };
+  }
   if (isLibraryMaintenanceRunning(NAMING_MIGRATION_TASK_ID) || isLibraryMaintenanceRunning(LIBRARY_CLEANUP_TASK_ID)) {
     return { started: false, reason: "conflicting_task_running" as const };
   }
@@ -189,7 +278,7 @@ export async function runImportReconcileCycle(logger: FastifyBaseLogger) {
   try {
     const result = await runTrackedTask(IMPORT_RECONCILE_TASK_ID, async () => {
       const reconciliation = await reconcileAvailableDownloadsWithoutImports(logger);
-      if (reconciliation.mountedFixed > 0 || reconciliation.materializedImported > 0 || reconciliation.requeued > 0 || reconciliation.failed > 0) {
+      if (reconciliation.mountedFixed > 0 || reconciliation.requeued > 0 || reconciliation.failed > 0) {
         logger.info(reconciliation, "stale prepared/available imports reconciled");
       }
       return reconciliation;
@@ -292,7 +381,6 @@ export async function runFullRequestSyncRefresh(logger: FastifyBaseLogger, provi
       }, "full request resync and library refresh completed");
       return aggregate;
     });
-    void runDeferredRequestRecovery(logger);
     return { started: true };
   } catch (error) {
     logger.warn({ err: error }, "full request resync and library refresh failed");
@@ -305,6 +393,16 @@ export async function runFullRequestSyncRefresh(logger: FastifyBaseLogger, provi
 
 export async function runRequestSyncCycle(logger: FastifyBaseLogger) {
   if (running) return;
+  const gate = await shouldDeferHeavyStartupSync();
+  if (gate.defer) {
+    logger.info({
+      activeStreamCount: gate.streams,
+      ioAvg10: gate.ioAvg10,
+      mediaPropfindCount: gate.webdav.mediaPropfindCount,
+      propfindCount: gate.webdav.propfindCount
+    }, "request sync deferred because playback, library scan, or hot IO is active");
+    return;
+  }
   running = true;
   try {
     await runTrackedTask(REQUEST_SYNC_TASK_ID, async () => {
@@ -386,7 +484,6 @@ export async function runRequestSyncCycle(logger: FastifyBaseLogger) {
     });
     await runInterruptedRecoveryCycle(logger);
     await runImportReconcileCycle(logger);
-    await runDeferredRequestRecovery(logger);
   } catch (error) {
     logger.warn({ err: error }, "request sync/recovery failed");
   } finally {
@@ -396,44 +493,90 @@ export async function runRequestSyncCycle(logger: FastifyBaseLogger) {
 
 export function startRequestSyncSchedule(logger: FastifyBaseLogger) {
   void getSettings().then((settings) => registerCoreTasks(settings)).catch(() => registerCoreTasks());
-  if (!scheduleHandles.has(REQUEST_SYNC_TASK_ID)) {
-    scheduleDynamicTask({
-      taskId: REQUEST_SYNC_TASK_ID,
-      initialDelayMs: 3 * 60_000,
-      fallbackIntervalMs: REQUEST_SYNC_INTERVAL_MS,
-      runner: () => runRequestSyncCycle(logger)
+  if (!startupRequestSyncScheduled) {
+    startupRequestSyncScheduled = true;
+    void hasCompletedStartupRequestSync().then((completed) => {
+      if (completed) {
+        logger.info("startup request sync skipped because it already completed on a previous boot");
+        setTaskNextRun(REQUEST_SYNC_TASK_ID, null);
+        return;
+      }
+      setTaskNextRun(REQUEST_SYNC_TASK_ID, new Date(Date.now() + STARTUP_REQUEST_SYNC_DELAY_MS));
+      const scheduleStartupAttempt = (delayMs: number) => {
+        startupRequestSyncHandle = setTimeout(() => {
+          void (async () => {
+            const gate = await shouldDeferHeavyStartupSync();
+            if (gate.defer) {
+              logger.info({ activeStreamCount: gate.streams, ioAvg10: gate.ioAvg10, mediaPropfindCount: gate.webdav.mediaPropfindCount, propfindCount: gate.webdav.propfindCount, retryDelayMs: STARTUP_REQUEST_SYNC_RETRY_DELAY_MS }, "startup request sync deferred because playback, library scan, or hot IO is active");
+              setTaskNextRun(REQUEST_SYNC_TASK_ID, new Date(Date.now() + STARTUP_REQUEST_SYNC_RETRY_DELAY_MS));
+              scheduleStartupAttempt(STARTUP_REQUEST_SYNC_RETRY_DELAY_MS);
+              return;
+            }
+            await runFullRequestSyncRefresh(logger);
+            await markStartupRequestSyncCompleted().catch((error) => {
+              logger.warn({ err: error }, "failed to persist startup request sync stamp");
+            });
+            setTaskNextRun(REQUEST_SYNC_TASK_ID, null);
+          })();
+        }, delayMs);
+      };
+      scheduleStartupAttempt(STARTUP_REQUEST_SYNC_DELAY_MS);
     });
   }
   if (!scheduleHandles.has(REQUEST_RECOVERY_TASK_ID)) {
-    scheduleDynamicTask({
-      taskId: REQUEST_RECOVERY_TASK_ID,
-      initialDelayMs: 90_000,
-      fallbackIntervalMs: REQUEST_RECOVERY_INTERVAL_MS,
-      runner: () => runDeferredRequestRecovery(logger).then(() => undefined)
+    void configuredTaskInterval(REQUEST_RECOVERY_TASK_ID, REQUEST_RECOVERY_INTERVAL_MS).then((intervalMs) => {
+      if (!intervalMs) {
+        setTaskNextRun(REQUEST_RECOVERY_TASK_ID, null);
+        return;
+      }
+      scheduleDynamicTask({
+        taskId: REQUEST_RECOVERY_TASK_ID,
+        initialDelayMs: intervalMs,
+        fallbackIntervalMs: REQUEST_RECOVERY_INTERVAL_MS,
+        runner: () => runDeferredRequestRecovery(logger).then(() => undefined)
+      });
     });
   }
   if (!scheduleHandles.has(NZBHYDRA_RSS_SYNC_TASK_ID)) {
-    scheduleDynamicTask({
-      taskId: NZBHYDRA_RSS_SYNC_TASK_ID,
-      initialDelayMs: 10 * 60_000,
-      fallbackIntervalMs: NZBHYDRA_RSS_SYNC_INTERVAL_MS,
-      runner: () => runNzbhydraRssSyncCycle(logger)
+    void configuredTaskInterval(NZBHYDRA_RSS_SYNC_TASK_ID, NZBHYDRA_RSS_SYNC_INTERVAL_MS).then((intervalMs) => {
+      if (!intervalMs) {
+        setTaskNextRun(NZBHYDRA_RSS_SYNC_TASK_ID, null);
+        return;
+      }
+      scheduleDynamicTask({
+        taskId: NZBHYDRA_RSS_SYNC_TASK_ID,
+        initialDelayMs: Math.min(intervalMs, 10 * 60_000),
+        fallbackIntervalMs: NZBHYDRA_RSS_SYNC_INTERVAL_MS,
+        runner: () => runNzbhydraRssSyncCycle(logger)
+      });
     });
   }
   if (!scheduleHandles.has(LOG_PRUNE_TASK_ID)) {
-    scheduleDynamicTask({
-      taskId: LOG_PRUNE_TASK_ID,
-      initialDelayMs: 10 * 60_000,
-      fallbackIntervalMs: LOG_PRUNE_INTERVAL_MS,
-      runner: () => runLogPruneCycle(logger)
+    void configuredTaskInterval(LOG_PRUNE_TASK_ID, LOG_PRUNE_INTERVAL_MS).then((intervalMs) => {
+      if (!intervalMs) {
+        setTaskNextRun(LOG_PRUNE_TASK_ID, null);
+        return;
+      }
+      scheduleDynamicTask({
+        taskId: LOG_PRUNE_TASK_ID,
+        initialDelayMs: Math.min(intervalMs, 10 * 60_000),
+        fallbackIntervalMs: LOG_PRUNE_INTERVAL_MS,
+        runner: () => runLogPruneCycle(logger)
+      });
     });
   }
   if (!scheduleHandles.has(SUBTITLE_BACKFILL_TASK_ID)) {
-    scheduleDynamicTask({
-      taskId: SUBTITLE_BACKFILL_TASK_ID,
-      initialDelayMs: 15 * 60_000,
-      fallbackIntervalMs: SUBTITLE_BACKFILL_INTERVAL_MS,
-      runner: () => runSubtitleBackfillCycle(logger)
+    void configuredTaskInterval(SUBTITLE_BACKFILL_TASK_ID, SUBTITLE_BACKFILL_INTERVAL_MS).then((intervalMs) => {
+      if (!intervalMs) {
+        setTaskNextRun(SUBTITLE_BACKFILL_TASK_ID, null);
+        return;
+      }
+      scheduleDynamicTask({
+        taskId: SUBTITLE_BACKFILL_TASK_ID,
+        initialDelayMs: Math.min(intervalMs, 15 * 60_000),
+        fallbackIntervalMs: SUBTITLE_BACKFILL_INTERVAL_MS,
+        runner: () => runSubtitleBackfillCycle(logger)
+      });
     });
   }
 }
@@ -441,4 +584,7 @@ export function startRequestSyncSchedule(logger: FastifyBaseLogger) {
 export function stopRequestSyncSchedule() {
   for (const handle of scheduleHandles.values()) clearTimeout(handle);
   scheduleHandles.clear();
+  if (startupRequestSyncHandle) clearTimeout(startupRequestSyncHandle);
+  startupRequestSyncHandle = null;
+  startupRequestSyncScheduled = false;
 }

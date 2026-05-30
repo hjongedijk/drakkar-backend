@@ -1,53 +1,76 @@
+---
 services:
-  backend:
+  drakkar_backend:
+    container_name: drakkar_backend
     image: ghcr.io/hjongedijk/drakkar-backend:latest
-    pull_policy: always
-    restart: unless-stopped
     user: 0:0
-    init: true
-    tty: true
-    stdin_open: true
     stop_grace_period: 45s
     depends_on:
-      postgres:
+      drakkar_postgres:
         condition: service_healthy
-      valkey:
+      drakkar_valkey:
         condition: service_healthy
+    ports:
+      - "3000:3000"
     volumes:
       - ./data:/data
-      # Add :z on SELinux hosts if Docker requires relabeling.
-      - /mnt/drakkar:/mnt:rshared
-    devices:
-      - /dev/fuse:/dev/fuse
-    cap_add:
-      - SYS_ADMIN
-    security_opt:
-      - apparmor:unconfined
+      - /mnt:/mnt:rshared
     healthcheck:
       test: ["CMD", "node", "-e", "fetch('http://127.0.0.1:3000/health').then(r=>process.exit(r.ok?0:1)).catch(()=>process.exit(1))"]
       interval: 30s
       timeout: 10s
       retries: 5
       start_period: 20s
-    logging:
-      driver: local
-      options:
-        max-size: "10m"
-        max-file: "5"
     networks:
       - drakkar
 
-  frontend:
-    image: ghcr.io/hjongedijk/drakkar-frontend:latest
-    pull_policy: always
-    restart: unless-stopped
+  drakkar_rclone:
+    container_name: drakkar_rclone
+    image: rclone/rclone:latest
     user: 0:0
+    restart: unless-stopped
     init: true
-    tty: true
-    stdin_open: true
+    stop_grace_period: 10s
+    volumes:
+      - /mnt:/mnt:rshared
+      - ./data/rclone/cache:/cache
+      - ./data/rclone/rclone.conf:/config/rclone/rclone.conf
+    cap_add:
+      - SYS_ADMIN
+    security_opt:
+      - apparmor:unconfined
+    devices:
+      - /dev/fuse:/dev/fuse:rwm
     depends_on:
-      backend:
+      drakkar_backend:
         condition: service_healthy
+        restart: true
+    command: >
+      mount drakkar: /mnt/drakkar/vfs
+        --uid=0
+        --gid=0
+        --allow-other
+        --links
+        --use-cookies
+        --vfs-cache-mode=full
+        --vfs-cache-max-size=20G
+        --vfs-cache-max-age=24h
+        --cache-dir=/cache
+        --buffer-size=0M
+        --vfs-read-ahead=512M
+        --dir-cache-time=20s
+    networks:
+      - drakkar
+
+  drakkar_frontend:
+    container_name: drakkar_frontend
+    image: ghcr.io/hjongedijk/drakkar-frontend:latest
+    user: 0:0
+    depends_on:
+      drakkar_backend:
+        condition: service_healthy
+      drakkar_rclone:
+        condition: service_started
     ports:
       - "8080:80"
     volumes:
@@ -58,43 +81,35 @@ services:
       timeout: 10s
       retries: 5
       start_period: 10s
-    logging:
-      driver: local
-      options:
-        max-size: "5m"
-        max-file: "3"
     networks:
       - drakkar
 
-  postgres:
-    image: postgres:16-alpine
+  drakkar_postgres:
+    container_name: drakkar_postgress
     restart: unless-stopped
     user: 0:0
+    image: postgres:16-alpine
     environment:
       POSTGRES_USER: postgres
       POSTGRES_PASSWORD: postgres
       POSTGRES_DB: drakkar
     volumes:
-      - ./postgres-data:/var/lib/postgresql/data
+      - ./drakkar-db:/var/lib/postgresql/data
     healthcheck:
       test: ["CMD-SHELL", "pg_isready -U postgres -d drakkar"]
       interval: 10s
       timeout: 5s
       retries: 10
       start_period: 10s
-    logging:
-      driver: local
-      options:
-        max-size: "5m"
-        max-file: "3"
     networks:
       - drakkar
 
-  valkey:
-    image: valkey/valkey:8-alpine
+  drakkar_valkey:
+    container_name: drakkar_valkey
     restart: unless-stopped
     user: 0:0
-    command: ["valkey-server", "--appendonly", "no", "--save", "900", "1", "--save", "300", "10", "--save", "60", "10000"]
+    image: valkey/valkey:8-alpine
+    command: ["valkey-server", "--appendonly", "no", "--save", ""]
     volumes:
       - ./valkey-data:/data
     healthcheck:
@@ -103,93 +118,70 @@ services:
       timeout: 5s
       retries: 10
       start_period: 10s
-    logging:
-      driver: local
-      options:
-        max-size: "5m"
-        max-file: "3"
     networks:
       - drakkar
 
-  valkey-insight:
-    image: redis/redisinsight:latest
+  drakkar_valkey_insight:
+    container_name: drakkar_valkey_insight
     restart: unless-stopped
     user: 0:0
+    image: redis/redisinsight:latest
     depends_on:
-      valkey:
+      drakkar_valkey:
         condition: service_healthy
     ports:
       - "5540:5540"
     volumes:
       - ./valkey-insight-data:/data
-    logging:
-      driver: local
-      options:
-        max-size: "5m"
-        max-file: "2"
     networks:
       - drakkar
 
-  nzbhydra2:
-    image: lscr.io/linuxserver/nzbhydra2:latest
+  drakkar_nzbhydra2:
+    container_name: drakkar_nzbhydra2
     restart: unless-stopped
     user: 0:0
+    image: lscr.io/linuxserver/nzbhydra2:latest
     depends_on:
-      apprise-api:
+      drakkar_apprise_api:
         condition: service_started
     ports:
       - "5076:5076"
-    environment:
-      - PUID=0
-      - PGID=0
-      - TZ=Europe/Amsterdam
     volumes:
-      - ./nzbhydra2:/config
+      - ./nzbhydra2-data:/config
     healthcheck:
       test: ["CMD", "curl", "-fsS", "http://127.0.0.1:5076"]
       interval: 30s
       timeout: 10s
       retries: 5
       start_period: 30s
-    logging:
-      driver: local
-      options:
-        max-size: "5m"
-        max-file: "3"
     networks:
       - drakkar
 
-  apprise-api:
-    image: caronc/apprise:latest
+  drakkar_apprise_api:
+    container_name: drakkar_apprise_api
     restart: unless-stopped
     user: 0:0
+    image: caronc/apprise:latest
     ports:
       - "8000:8000"
-    environment:
-      - TZ=Europe/Amsterdam
     healthcheck:
       test: ["CMD", "curl", "-fsS", "http://127.0.0.1:8000"]
       interval: 30s
       timeout: 10s
       retries: 5
       start_period: 20s
-    logging:
-      driver: local
-      options:
-        max-size: "5m"
-        max-file: "3"
     networks:
       - drakkar
 
-  seerr:
-    image: ghcr.io/seerr-team/seerr:latest
+  drakkar_seerr:
+    container_name: drakkar_seerr
     restart: unless-stopped
     user: 0:0
+    image: ghcr.io/seerr-team/seerr:latest
     ports:
       - "5055:5055"
     environment:
       LOG_LEVEL: info
-      TZ: Europe/Amsterdam
     volumes:
       - ./seerr-data:/app/config
     healthcheck:
@@ -198,14 +190,9 @@ services:
       timeout: 10s
       retries: 5
       start_period: 20s
-    logging:
-      driver: local
-      options:
-        max-size: "5m"
-        max-file: "3"
     networks:
       - drakkar
-      
+
 networks:
   drakkar:
     driver: bridge

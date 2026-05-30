@@ -1,15 +1,18 @@
 import { copyFile, lstat, mkdir, readFile, readdir, readlink, rm, rmdir, symlink, unlink, writeFile } from "node:fs/promises";
-import { dirname, extname, join, relative } from "node:path";
+import { basename, dirname, extname, join, relative } from "node:path";
 import { env } from "../services/config/env.js";
 import { prisma, Prisma, type ImportItem } from "../repositories/db/prisma.js";
 import { canonicalizeDisplayTitle, inferMediaIdentity, normalizeTitleForIdentity, titlesLikelyMatch } from "../services/media-library/identity.js";
 import { hydrateLegacyRequestFields } from "../services/media-library/normalizedMedia.js";
 import { fetchMediaMetadata, fetchSeriesStructure } from "../services/metadataService.js";
-import { completedPathToVfsPath, getNamingSettings, libraryPathFor } from "../services/namingService.js";
+import { completedPathFor, completedPathToVfsPath, getNamingSettings, libraryPathFor } from "../services/namingService.js";
 import { getPolicySettings } from "../services/policyService.js";
 import { refreshPlexPath } from "../services/plexService.js";
+import { forgetRcloneVfsPaths, libraryForgetPaths } from "../services/rcloneRcService.js";
+import { blocklistSelectedRelease, grabBestForRequest, grabMissingTvForRequest, grabTvEpisodeForRequest } from "../services/requests/sync/mediaRequestService.js";
 import { getSettings } from "../services/settings/settingsStore.js";
 import { scheduleSubtitleSyncForLibraryPath } from "../services/subtitleService.js";
+import { probeMediaFile } from "../services/mediaProbeService.js";
 import type { AppSettings } from "../services/settings/settingsStore.js";
 
 const REQUEST_RELATION_SELECT = {
@@ -387,10 +390,25 @@ function sourcePathForImport(item: ImportItem) {
   return `${env.FUSE_MOUNT_PATH}${mountedPath}`;
 }
 
+async function ensureMountedContentPath(
+  item: ImportItem,
+  media: Awaited<ReturnType<typeof resolveImportMedia>>,
+  naming: Awaited<ReturnType<typeof getNamingSettings>>
+) {
+  const contentPath = completedPathFor({
+    media,
+    sourcePath: item.completedPath,
+    naming
+  });
+  await mkdir(dirname(contentPath), { recursive: true });
+  await ensureSymlinkTarget(contentPath, relative(dirname(contentPath), sourcePathForImport(item)));
+  return contentPath;
+}
+
 async function stagedSourcePathForImport(item: ImportItem) {
   const sourcePath = sourcePathForImport(item);
   const ext = extname(item.completedPath) || ".mkv";
-  const stagedPath = join(dirname(env.MEDIA_SYMLINKS_DIR), "completed", ".staging", "imports", `${item.id}${ext}`);
+  const stagedPath = join(env.VFS_COMPLETED_SYMLINKS_DIR, `${item.id}${ext}`);
   await mkdir(dirname(stagedPath), { recursive: true });
   await ensureSymlinkTarget(stagedPath, relative(dirname(stagedPath), sourcePath));
   return stagedPath;
@@ -489,6 +507,20 @@ async function validateTvTargetsAgainstSeriesStructure(targets: Array<Awaited<Re
   }
 }
 
+async function validateImportPlayable(item: ImportItem) {
+  if (item.completedPath.startsWith("/mounted/")) {
+    return;
+  }
+  const sourcePath = sourcePathForImport(item);
+  const probe = await probeMediaFile(sourcePath);
+  if (probe.ok && probe.hasVideo) return;
+  await prisma.importItem.update({
+    where: { id: item.id },
+    data: { status: "import_failed" }
+  }).catch(() => undefined);
+  throw new Error(`media probe failed before symlink: ${probe.reason ?? "unknown ffprobe failure"}`);
+}
+
 export async function createLibraryEntryForImport(
   item: ImportItem,
   options?: { refreshPlex?: boolean; changedPaths?: Set<string> }
@@ -500,6 +532,16 @@ export async function createLibraryEntryForImport(
   const targets = inferTvEpisodeTargets(item, media);
   validateMediaForLibraryPath(item, targets);
   await validateTvTargetsAgainstSeriesStructure(targets);
+  await validateImportPlayable(item);
+  const mountedContentPath = item.completedPath.startsWith("/mounted/")
+    ? await ensureMountedContentPath(item, targets[0]!, naming)
+    : null;
+  const mountedContentLinkPath = mountedContentPath
+    ? join(env.FUSE_MOUNT_PATH, "content", relative(env.VFS_COMPLETED_DIR, mountedContentPath))
+    : null;
+  if (item.completedPath.startsWith("/mounted/")) {
+    await stagedSourcePathForImport(item).catch(() => undefined);
+  }
   const desiredLinkPaths = targets.map((target) => libraryPathFor({ media: target, completedPath: item.completedPath, naming, strategy }));
 
   const staleLinks = await prisma.symlink.findMany({
@@ -513,16 +555,17 @@ export async function createLibraryEntryForImport(
     await unlink(stale.linkPath).catch(() => undefined);
     await pruneEmptyParents(stale.linkPath, item.mediaType === "tv" ? env.MEDIA_TV_DIR : env.MEDIA_MOVIES_DIR);
     await prisma.symlink.delete({ where: { id: stale.id } }).catch(() => undefined);
+    void forgetRcloneVfsPaths(libraryForgetPaths(stale.linkPath, stale.sourcePath))
+      .catch(() => undefined);
   }
 
-  let stagedSourcePath: string | null = null;
   const links = [];
   for (let index = 0; index < desiredLinkPaths.length; index += 1) {
     const linkPath = desiredLinkPaths[index]!;
     const targetMedia = targets[index]!;
     await mkdir(dirname(linkPath), { recursive: true });
     const existingLink = await prisma.symlink.findUnique({ where: { linkPath } }).catch(() => null);
-    let persistedSourcePath = sourcePathForImport(item);
+    let persistedSourcePath = mountedContentLinkPath ?? sourcePathForImport(item);
     let linkRefreshRequired = false;
 
     if (strategy === "copy") {
@@ -548,9 +591,7 @@ export async function createLibraryEntryForImport(
       await removeExisting(linkPath);
       await writeFile(linkPath, nextContents);
     } else {
-      stagedSourcePath ??= await stagedSourcePathForImport(item);
-      persistedSourcePath = stagedSourcePath;
-      const target = relative(dirname(linkPath), stagedSourcePath);
+      const target = relative(dirname(linkPath), persistedSourcePath);
       const existingTarget = await currentSymlinkTarget(linkPath);
       linkRefreshRequired = existingTarget !== target
         || existingLink?.sourcePath !== persistedSourcePath
@@ -570,10 +611,14 @@ export async function createLibraryEntryForImport(
     if ((options?.refreshPlex ?? true) && linkRefreshRequired) {
       void refreshPlexPath(link.linkPath)
         .then((result) => {
-          if (!result.skipped) plexLog("info", "plex targeted refresh triggered", result);
-          else if (result.reason !== "not_configured" && result.reason !== "deduped") plexLog("warn", "plex targeted refresh skipped", result);
+          if (!result.skipped) plexLog("info", "plex targeted refresh triggered", { path: basename(link.linkPath), ok: true });
+          else if (!["not_configured", "deduped", "section_refreshing"].includes(String(result.reason))) plexLog("warn", "plex targeted refresh skipped", result);
         })
         .catch((error) => plexLog("warn", "plex targeted refresh failed", { error: error instanceof Error ? error.message : error }));
+    }
+    if (linkRefreshRequired) {
+      void forgetRcloneVfsPaths(libraryForgetPaths(link.linkPath, persistedSourcePath))
+        .catch(() => undefined);
     }
     void scheduleSubtitleSyncForLibraryPath(link.linkPath, {
       mediaType: targetMedia.mediaType === "tv" ? "tv" : "movie",
@@ -684,4 +729,116 @@ export async function removeStaleLibraryFilesystemEntries() {
   await pruneEmptyTree(env.MEDIA_MOVIES_DIR);
   await pruneEmptyTree(env.MEDIA_TV_DIR);
   return { removed: removedMovies + removedTv, removedMovies, removedTv };
+}
+
+export async function revalidateLibrarySymlinks(options: { limit?: number; offset?: number } = {}) {
+  const limit = Math.max(1, Math.min(options.limit ?? 200, 2000));
+  const offset = Math.max(0, options.offset ?? 0);
+  const imports = await prisma.importItem.findMany({
+    where: {
+      symlinks: { some: {} },
+      status: { in: ["imported", "streaming_import"] }
+    },
+    include: { symlinks: true },
+    orderBy: { updatedAt: "asc" },
+    skip: offset,
+    take: limit
+  });
+
+  let validated = 0;
+  let removed = 0;
+  const failures: Array<{ importId: string; reason: string }> = [];
+  const affectedRequestIds = new Set<string>();
+
+  for (const item of imports) {
+    const sourcePath = sourcePathForImport(item);
+    const probe = await probeMediaFile(sourcePath).catch((error) => ({
+      ok: false,
+      hasVideo: false,
+      reason: error instanceof Error ? error.message : String(error)
+    }));
+    if (probe.ok && probe.hasVideo) {
+      validated += 1;
+      continue;
+    }
+
+    for (const link of item.symlinks) {
+      await rm(link.linkPath, { force: true }).catch(() => undefined);
+      void forgetRcloneVfsPaths(libraryForgetPaths(link.linkPath, link.sourcePath)).catch(() => undefined);
+      await prisma.symlink.update({
+        where: { id: link.id },
+        data: { status: "broken" }
+      }).catch(() => undefined);
+      removed += 1;
+    }
+
+    if (item.completedPath.startsWith("/mounted/")) {
+      const stagedPath = join(env.VFS_COMPLETED_SYMLINKS_DIR, `${item.id}${extname(item.completedPath) || ".mkv"}`);
+      const sourceReferencedElsewhere = await prisma.symlink.count({
+        where: {
+          sourcePath: stagedPath,
+          importId: { not: item.id }
+        }
+      }).catch(() => 0);
+      if (sourceReferencedElsewhere === 0) {
+      await rm(stagedPath, { force: true }).catch(() => undefined);
+      void forgetRcloneVfsPaths(libraryForgetPaths(stagedPath, sourcePath)).catch(() => undefined);
+      }
+    }
+
+    await prisma.importItem.update({
+      where: { id: item.id },
+      data: { status: "import_failed" }
+    }).catch(() => undefined);
+
+    if (item.requestId) {
+      const linkedRequest = await prisma.mediaRequest.findUnique({ where: { id: item.requestId } }).catch(() => null);
+      if (linkedRequest) {
+        await blocklistSelectedRelease(linkedRequest, probe.reason ?? "import validation failed", "import-revalidate").catch(() => undefined);
+        await prisma.mediaRequest.update({
+          where: { id: linkedRequest.id },
+          data: {
+            status: "approved",
+            downloadId: null,
+            selectedRelease: Prisma.JsonNull
+          }
+        }).catch(() => undefined);
+        affectedRequestIds.add(linkedRequest.id);
+        if (item.mediaType === "tv" && item.season !== null && item.episode !== null) {
+          await grabTvEpisodeForRequest(linkedRequest.id, item.season, item.episode).catch(() => undefined);
+        } else if (item.mediaType === "tv") {
+          await grabMissingTvForRequest(linkedRequest.id, { skipFallback: true }).catch(() => undefined);
+        } else {
+          await grabBestForRequest(linkedRequest.id, { skipFallback: true }).catch(() => undefined);
+        }
+      }
+    }
+
+    failures.push({
+      importId: item.id,
+      reason: probe.reason ?? "ffprobe failed"
+    });
+  }
+
+  await pruneLibraryDirectories();
+  if (affectedRequestIds.size > 0) {
+    const requestIds = [...affectedRequestIds];
+    await prisma.mediaLibraryItem.updateMany({
+      where: { requestId: { in: requestIds } },
+      data: {
+        libraryStatus: "requested",
+        streamStatus: "unknown",
+        healthStatus: "unknown"
+      }
+    }).catch(() => undefined);
+  }
+  return {
+    offset,
+    scanned: imports.length,
+    validated,
+    removed,
+    failed: failures.length,
+    nextOffset: offset + imports.length,
+    failures: failures.slice(0, 100)
+  };
 }

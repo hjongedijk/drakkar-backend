@@ -1,0 +1,22 @@
+[Unit]
+Description=Drakkar host rclone WebDAV mount
+After=network-online.target docker.service drakkar-mount.service
+Wants=network-online.target
+Requires=docker.service drakkar-mount.service
+
+[Service]
+Type=simple
+Restart=always
+RestartSec=5
+ExecStartPre=/usr/bin/mkdir -p /mnt/drakkar/vfs
+ExecStartPre=/usr/bin/mkdir -p /opt/drakkar/rclone-config
+ExecStartPre=/usr/bin/sh -c 'command -v /usr/bin/fusermount >/dev/null 2>&1 || ln -sf /usr/bin/fusermount3 /usr/bin/fusermount'
+ExecStartPre=/usr/bin/sh -c 'grep -q "^user_allow_other$" /etc/fuse.conf 2>/dev/null || echo "user_allow_other" >> /etc/fuse.conf'
+ExecStartPre=/usr/bin/sh -c 'until /usr/bin/curl -fsS http://127.0.0.1:3000/health >/dev/null 2>&1; do sleep 2; done'
+ExecStartPre=/usr/bin/sh -c 'token=$$(sed -n '\''s/.*"drakkarApiToken"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p'\'' /opt/drakkar/data/config/settings.json | head -n1); [ -n "$$token" ] || { echo "missing drakkarApiToken in settings.json" >&2; exit 1; }; pass=$$(/usr/bin/rclone obscure "$$token"); { echo "[drakkar]"; echo "type = webdav"; echo "url = http://127.0.0.1:3000/dav"; echo "vendor = other"; echo "user = drakkar"; echo "pass = $$pass"; } > /opt/drakkar/rclone-config/rclone.conf'
+ExecStartPre=/usr/bin/sh -c '/usr/bin/fusermount3 -uz /mnt/drakkar/vfs >/dev/null 2>&1 || /usr/bin/umount -l /mnt/drakkar/vfs >/dev/null 2>&1 || true'
+ExecStart=/usr/bin/rclone mount drakkar: /mnt/drakkar/vfs --config /opt/drakkar/rclone-config/rclone.conf --rc --rc-addr=127.0.0.1:5572 --rc-no-auth --uid=0 --gid=0 --allow-other --links --use-cookies --cache-dir /opt/drakkar/data/rclone-cache --vfs-cache-mode=full --vfs-cache-max-size=20G --vfs-cache-max-age=24h --buffer-size=0M --vfs-read-chunk-size=16M --vfs-read-chunk-size-limit=32M --vfs-read-ahead=64M --dir-cache-time=20s --poll-interval=0 --log-level=INFO
+ExecStop=/usr/bin/sh -c '/usr/bin/fusermount3 -uz /mnt/drakkar/vfs >/dev/null 2>&1 || /usr/bin/umount -l /mnt/drakkar/vfs >/dev/null 2>&1 || true'
+
+[Install]
+WantedBy=multi-user.target

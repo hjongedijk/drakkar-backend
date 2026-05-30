@@ -31,13 +31,13 @@ const sourcePatterns: Array<[string, RegExp]> = [
   ["cam", /\b(cam|hdcam)\b/i],
   ["telesync", /\b(ts|telesync)\b/i],
   ["screener", /\b(dvdscr|screener|scr)\b/i],
+  ["remux", /\bremux\b/i],
   ["bluray", /\b(blu-?ray|uhd|bdrip|brrip)\b/i],
   ["webdl", /\b(web-?dl|webrip\.?dl)\b/i],
   ["webrip", /\bweb-?rip\b/i],
   ["hdtv", /\bhdtv\b/i],
   ["dvdrip", /\bdvd-?rip\b/i],
-  ["hdrip", /\bhd-?rip\b/i],
-  ["remux", /\bremux\b/i]
+  ["hdrip", /\bhd-?rip\b/i]
 ];
 
 function cleanTitleStem(value: string) {

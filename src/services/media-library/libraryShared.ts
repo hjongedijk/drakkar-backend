@@ -19,6 +19,7 @@ export const LIBRARY_LIST_SELECT = {
   requestedBy: true,
   requestProvider: true,
   requestId: true,
+  qualityProfileId: true,
   downloadId: true,
   importStrategy: true,
   libraryStatus: true,

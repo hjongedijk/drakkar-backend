@@ -4,7 +4,7 @@ import { getImport, importCompletedPath, listImports, migrateImportsToCurrentNam
 import { getNamingSettings, previewNaming, updateNamingSettings } from "../services/namingService.js";
 import { refreshMediaLibrary } from "../services/libraryService.js";
 import { extractDownloadPath, listRepairJobs, runBackgroundRepairSweep, runRepair } from "../services/repairService.js";
-import { cleanupSymlinks, listSymlinks, pruneLibraryDirectories, removeStaleLibraryFilesystemEntries, repairSymlinks } from "../services/symlinkService.js";
+import { cleanupSymlinks, listSymlinks, pruneLibraryDirectories, removeStaleLibraryFilesystemEntries, repairSymlinks, revalidateLibrarySymlinks } from "../services/symlinkService.js";
 
 const reprocessSchema = z.object({
   sourcePath: z.string().optional()
@@ -57,6 +57,13 @@ export async function processingRoutes(app: FastifyInstance): Promise<void> {
 
   app.get("/api/symlinks", async () => listSymlinks());
   app.post("/api/symlinks/repair", async () => repairSymlinks());
+  app.post("/api/symlinks/revalidate", async (request) => {
+    const body = z.object({
+      limit: z.number().int().positive().max(2000).optional(),
+      offset: z.number().int().min(0).optional()
+    }).parse(request.body ?? {});
+    return revalidateLibrarySymlinks(body);
+  });
   app.post("/api/symlinks/cleanup", async () => {
     const symlinkCleanup = await cleanupSymlinks();
     const staleFilesystem = await removeStaleLibraryFilesystemEntries();

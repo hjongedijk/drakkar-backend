@@ -1,14 +1,17 @@
-import { randomUUID } from "node:crypto";
+import { createHash, randomUUID } from "node:crypto";
+import { mkdir, readdir, readFile, rename, rm, stat, writeFile } from "node:fs/promises";
+import { dirname, join } from "node:path";
 import { Readable } from "node:stream";
 import { prisma, type UsenetServer } from "../repositories/db/prisma.js";
 import { redis } from "../repositories/db/redis.js";
+import { env } from "../services/config/env.js";
 import { getPolicySettings } from "../services/policyService.js";
 import { NntpClient } from "../services/usenet/nntpClient.js";
 import { decodeYencBufferLine } from "../services/usenet/yenc.js";
 import { markLibraryItemStreamedByPath } from "../services/libraryService.js";
-import { planMountedFileRange } from "../services/rangePlanner.service.js";
+import { normalizeRange, planMountedFileRange } from "../services/rangePlanner.service.js";
 import { getMountFileByPath } from "../services/mountedNzbService.js";
-import { buildDecodedYencSegments } from "../services/yencManifest.service.js";
+import { buildDecodedYencSegments, getDecodedYencFileSize, getDecodedYencPartInfo, type FileLike, type SegmentLike } from "../services/yencManifest.service.js";
 import { getStoredArchiveEntryByPath } from "../services/archive/rarStoredIndex.js";
 import { cancelStreamSessionActor, closeStreamSessionActor, failStreamSessionActor, getStreamSessionActorSnapshot, startStreamSessionActor, stopStreamSessionActor, updateStreamSessionActor } from "../state-machines/streamSessionMachine.js";
 import { clamp, findSegmentIndex, isProviderConnectionLimit, isTemporaryProviderError, segmentCacheKey, sleep, throwIfAborted } from "../services/streaming/streamHelpers.js";
@@ -23,15 +26,231 @@ const markedStreamSessions = new Set<string>();
 const sessionSnapshots = new Map<string, Record<string, string | number>>();
 const pendingSessionUpdates = new Map<string, Record<string, string | number>>();
 const pendingMetricIncrements = new Map<string, number>();
+const inFlightVfsFileCacheWrites = new Set<string>();
 let cachedProviders: { value: UsenetServer[]; expiresAt: number } | null = null;
 let mountedPool: MountedNntpPool | null = null;
 let mountedPoolSignature: string | null = null;
 let sessionFlushTimer: NodeJS.Timeout | null = null;
 let metricsFlushTimer: NodeJS.Timeout | null = null;
+let diskCacheReady: Promise<void> | null = null;
+let diskCachePrunePromise: Promise<void> | null = null;
+let lastDiskCachePruneAt = 0;
 
 const SESSION_FLUSH_MS = 2000;
 const METRICS_FLUSH_MS = 1000;
 const STALE_ACTIVE_SESSION_MS = 15_000;
+const DISK_CACHE_PRUNE_INTERVAL_MS = 5 * 60 * 1000;
+const VFS_FILE_CACHE_INDEX_PREFIX = "vfs:file-cache:index:";
+const VFS_FILE_CACHE_CHUNK_BYTES = 8 * 1024 * 1024;
+
+function diskSegmentPath(cacheKey: string) {
+  const digest = createHash("sha1").update(cacheKey).digest("hex");
+  return join(env.STREAM_CACHE_DIR, digest.slice(0, 2), `${digest}.bin`);
+}
+
+function vfsFileWindowCacheKey(fileId: string, start: number) {
+  return `${fileId}:${start}`;
+}
+
+function vfsFileWindowIndexKey(fileId: string) {
+  return `${VFS_FILE_CACHE_INDEX_PREFIX}${fileId}`;
+}
+
+function vfsFileWindowPath(fileId: string, start: number) {
+  const digest = createHash("sha1").update(vfsFileWindowCacheKey(fileId, start)).digest("hex");
+  return join(env.STREAM_CACHE_DIR, "vfs", digest.slice(0, 2), `${digest}.bin`);
+}
+
+async function readVfsFileWindowChunk(fileId: string, start: number) {
+  try {
+    const response = await readFile(vfsFileWindowPath(fileId, start));
+    return response;
+  } catch {
+    return null;
+  }
+}
+
+async function writeVfsFileWindowChunk(fileId: string, start: number, value: Buffer) {
+  if (!value.length) return;
+  await ensureDiskCacheDir();
+  const cachePath = vfsFileWindowPath(fileId, start);
+  const parent = dirname(cachePath);
+  await mkdir(parent, { recursive: true });
+  const tempPath = `${cachePath}.${process.pid}.${Date.now()}.tmp`;
+  await writeFile(tempPath, value);
+  await rename(tempPath, cachePath).catch(async () => {
+    await rm(tempPath, { force: true }).catch(() => undefined);
+  });
+  const field = String(start);
+  await redis.hset(vfsFileWindowIndexKey(fileId), field, JSON.stringify({
+    start,
+    end: start + value.length - 1,
+    size: value.length,
+    updatedAt: Date.now()
+  }));
+  await redis.expire(vfsFileWindowIndexKey(fileId), 60 * 60 * 24 * 7);
+}
+
+async function readCachedVfsFileRange(input: { fileId: string; start: number; length: number }) {
+  if (input.length <= 0) return Buffer.alloc(0);
+  const policies = await getPolicySettings();
+  if (!policies.streamCacheEnabled) return null;
+  const maxAgeMs = policies.streamCacheMaxAgeHours * 60 * 60 * 1000;
+  const chunks: Buffer[] = [];
+  let total = 0;
+  const absoluteEnd = input.start + input.length;
+  let cursor = Math.floor(input.start / VFS_FILE_CACHE_CHUNK_BYTES) * VFS_FILE_CACHE_CHUNK_BYTES;
+
+  while (cursor < absoluteEnd) {
+    const raw = await redis.hget(vfsFileWindowIndexKey(input.fileId), String(cursor));
+    if (!raw) return null;
+    const entry = JSON.parse(raw) as { start: number; end: number; size: number; updatedAt: number };
+    if (Date.now() - entry.updatedAt > maxAgeMs) {
+      await redis.hdel(vfsFileWindowIndexKey(input.fileId), String(cursor)).catch(() => undefined);
+      await rm(vfsFileWindowPath(input.fileId, cursor), { force: true }).catch(() => undefined);
+      return null;
+    }
+    const chunk = await readVfsFileWindowChunk(input.fileId, cursor);
+    if (!chunk || chunk.length !== entry.size) return null;
+    const sliceStart = cursor === Math.floor(input.start / VFS_FILE_CACHE_CHUNK_BYTES) * VFS_FILE_CACHE_CHUNK_BYTES
+      ? input.start - cursor
+      : 0;
+    const sliceEnd = Math.min(chunk.length, absoluteEnd - cursor);
+    if (sliceEnd <= sliceStart) break;
+    chunks.push(chunk.subarray(sliceStart, sliceEnd));
+    total += sliceEnd - sliceStart;
+    cursor += VFS_FILE_CACHE_CHUNK_BYTES;
+  }
+
+  if (total < input.length) return null;
+  await incrementMetric("fileWindowCacheHits");
+  return chunks.length === 1 ? chunks[0]! : Buffer.concat(chunks, total);
+}
+
+async function persistVfsFileCacheRange(input: { fileId: string; start: number; buffer: Buffer }) {
+  if (!input.buffer.length) return;
+  const policies = await getPolicySettings();
+  if (!policies.streamCacheEnabled) return;
+  const rangeEnd = input.start + input.buffer.length;
+  let chunkStart = Math.floor(input.start / VFS_FILE_CACHE_CHUNK_BYTES) * VFS_FILE_CACHE_CHUNK_BYTES;
+  while (chunkStart < rangeEnd) {
+    const sliceStart = Math.max(0, chunkStart - input.start);
+    const sliceEnd = Math.min(input.buffer.length, chunkStart + VFS_FILE_CACHE_CHUNK_BYTES - input.start);
+    const chunk = input.buffer.subarray(sliceStart, sliceEnd);
+    if (chunk.length === VFS_FILE_CACHE_CHUNK_BYTES) {
+      await writeVfsFileWindowChunk(input.fileId, chunkStart, chunk).catch(() => undefined);
+    }
+    chunkStart += VFS_FILE_CACHE_CHUNK_BYTES;
+  }
+}
+
+function queuePersistVfsFileCacheRange(input: { fileId: string; start: number; buffer: Buffer }) {
+  if (!input.buffer.length) return;
+  const key = `${input.fileId}:${input.start}:${input.buffer.length}`;
+  if (inFlightVfsFileCacheWrites.has(key)) return;
+  inFlightVfsFileCacheWrites.add(key);
+  void persistVfsFileCacheRange(input)
+    .catch(() => undefined)
+    .finally(() => {
+      inFlightVfsFileCacheWrites.delete(key);
+    });
+}
+
+async function ensureDiskCacheDir() {
+  const policies = await getPolicySettings();
+  if (!policies.streamCacheEnabled) return;
+  if (!diskCacheReady) {
+    diskCacheReady = mkdir(env.STREAM_CACHE_DIR, { recursive: true }).then(() => undefined);
+  }
+  return diskCacheReady;
+}
+
+export async function reconcileStreamCacheDirectory() {
+  const policies = await getPolicySettings();
+  if (policies.streamCacheEnabled) {
+    await ensureDiskCacheDir();
+    return { enabled: true, path: env.STREAM_CACHE_DIR };
+  }
+
+  hotSegmentCache.clear();
+  diskCacheReady = null;
+  await rm(env.STREAM_CACHE_DIR, { recursive: true, force: true }).catch(() => undefined);
+  return { enabled: false, path: env.STREAM_CACHE_DIR };
+}
+
+async function readDiskCachedSegment(cacheKey: string) {
+  try {
+    const cachePath = diskSegmentPath(cacheKey);
+    const stats = await stat(cachePath);
+    const maxAgeMs = (await getPolicySettings()).streamCacheMaxAgeHours * 60 * 60 * 1000;
+    if (Date.now() - stats.mtimeMs > maxAgeMs) {
+      await rm(cachePath, { force: true }).catch(() => undefined);
+      return null;
+    }
+    return await readFile(cachePath);
+  } catch {
+    return null;
+  }
+}
+
+async function writeDiskCachedSegment(cacheKey: string, value: Buffer) {
+  if (!value.length) return;
+  await ensureDiskCacheDir();
+  const cachePath = diskSegmentPath(cacheKey);
+  const parent = join(env.STREAM_CACHE_DIR, createHash("sha1").update(cacheKey).digest("hex").slice(0, 2));
+  await mkdir(parent, { recursive: true });
+  const tempPath = `${cachePath}.${process.pid}.${Date.now()}.tmp`;
+  await writeFile(tempPath, value);
+  await rename(tempPath, cachePath).catch(async () => {
+    await rm(tempPath, { force: true }).catch(() => undefined);
+  });
+  void pruneDiskCacheIfNeeded().catch(() => undefined);
+}
+
+async function pruneDiskCacheIfNeeded(force = false) {
+  const now = Date.now();
+  if (!force && now - lastDiskCachePruneAt < DISK_CACHE_PRUNE_INTERVAL_MS) return;
+  if (diskCachePrunePromise) return diskCachePrunePromise;
+  diskCachePrunePromise = (async () => {
+    lastDiskCachePruneAt = now;
+    const policies = await getPolicySettings();
+    if (!policies.streamCacheEnabled) return;
+    await ensureDiskCacheDir();
+    const maxAgeMs = policies.streamCacheMaxAgeHours * 60 * 60 * 1000;
+    const maxSizeBytes = Math.max(1, Math.floor(policies.streamCacheMaxSizeGb * 1024 * 1024 * 1024));
+    const cutoff = Date.now() - maxAgeMs;
+    const dirs = await readdir(env.STREAM_CACHE_DIR, { withFileTypes: true }).catch(() => []);
+    const files: Array<{ path: string; size: number; mtimeMs: number }> = [];
+    let totalSize = 0;
+    for (const dir of dirs) {
+      if (!dir.isDirectory()) continue;
+      const childDir = join(env.STREAM_CACHE_DIR, dir.name);
+      const entries = await readdir(childDir, { withFileTypes: true }).catch(() => []);
+      for (const entry of entries) {
+        if (!entry.isFile()) continue;
+        const filePath = join(childDir, entry.name);
+        const info = await stat(filePath).catch(() => null);
+        if (!info) continue;
+        if (info.mtimeMs < cutoff) {
+          await rm(filePath, { force: true }).catch(() => undefined);
+          continue;
+        }
+        totalSize += info.size;
+        files.push({ path: filePath, size: info.size, mtimeMs: info.mtimeMs });
+      }
+    }
+    if (totalSize <= maxSizeBytes) return;
+    files.sort((a, b) => a.mtimeMs - b.mtimeMs);
+    for (const file of files) {
+      if (totalSize <= maxSizeBytes) break;
+      await rm(file.path, { force: true }).catch(() => undefined);
+      totalSize -= file.size;
+    }
+  })().finally(() => {
+    diskCachePrunePromise = null;
+  });
+  return diskCachePrunePromise;
+}
 
 async function collectDecodedArticleBody(client: NntpClient, articleId: string, signal?: AbortSignal) {
   const chunks: Buffer[] = [];
@@ -67,7 +286,8 @@ type MountedPoolDebugState = {
 let mountedPoolDebugState: MountedPoolDebugState | null = null;
 type MountedReadSession = {
   path: string;
-  manifest: MountedFileManifest;
+  manifest?: MountedFileManifest;
+  directFile?: DirectMountedFile;
   bufferStart: number;
   buffer: Buffer;
   lastReadEnd: number;
@@ -96,15 +316,29 @@ type MountedFileManifest = {
   size: number;
   segments: MountedFileSegment[];
 };
+type DirectMountedSegment = SegmentLike & {
+  fileId: string;
+  start: number;
+  end: number;
+};
+type DirectMountedFile = {
+  path: string;
+  fileId: string;
+  size: number;
+  segments: DirectMountedSegment[];
+};
+const directMountedFileCache = new Map<string, { value: DirectMountedFile; expiresAt: number }>();
+const DIRECT_MOUNTED_FILE_CACHE_TTL_MS = 30 * 60 * 1000;
 const mountedReadSessions = new Map<string, MountedReadSession>();
 const mountedPathReadWindows = new Map<string, MountedReadSession>();
 const MOUNTED_READ_SESSION_TTL_MS = 2 * 60 * 1000;
-const MOUNTED_READ_AHEAD_MAX_BYTES = 8 * 1024 * 1024;
-const MOUNTED_RANDOM_ACCESS_WINDOW_BYTES = 512 * 1024;
-const MOUNTED_SEQUENTIAL_WINDOW_BYTES = 2 * 1024 * 1024;
-const STREAM_PREFETCH_SEGMENTS = 2;
-const STREAM_RANDOM_PREFETCH_SEGMENTS = 1;
-const STREAM_READ_AHEAD_SEGMENT_LIMIT = 2;
+const MOUNTED_READ_AHEAD_MAX_BYTES = 512 * 1024 * 1024;
+const MOUNTED_RANDOM_ACCESS_WINDOW_BYTES = 4 * 1024 * 1024;
+const MOUNTED_SEQUENTIAL_WINDOW_BYTES = 512 * 1024 * 1024;
+const STREAM_PREFETCH_SEGMENTS = 0;
+const STREAM_RANDOM_PREFETCH_SEGMENTS = 0;
+const STREAM_READ_AHEAD_PREFETCH_MAX_BYTES = 512 * 1024 * 1024;
+const MAX_IDLE_WARM_CONNECTIONS = 1;
 
 class MountedNntpPool {
   private readonly slots: MountedPoolSlot[];
@@ -112,6 +346,7 @@ class MountedNntpPool {
     excludedProviders: Set<string>;
     includeBackups: boolean;
     resolve: (slot: MountedPoolSlot) => void;
+    reject: (reason: Error) => void;
   }> = [];
   private readonly primaryProviderIds: Set<string>;
   private readonly primaryProviderCount: number;
@@ -139,7 +374,7 @@ class MountedNntpPool {
 
     for (let attempt = 1; attempt <= maxAttempts; attempt += 1) {
       if (permanentFailures.size >= providerCount) break;
-      const slot = await this.acquire(permanentFailures, includeBackups);
+      const slot = await this.acquire(permanentFailures, includeBackups, signal);
       try {
         await this.ensureConnected(slot, signal);
         if (!slot.client) throw new Error("NNTP slot did not connect");
@@ -173,7 +408,7 @@ class MountedNntpPool {
 
     for (let attempt = 1; attempt <= maxAttempts; attempt += 1) {
       if (permanentFailures.size >= providerCount) break;
-      const slot = await this.acquire(permanentFailures, includeBackups);
+      const slot = await this.acquire(permanentFailures, includeBackups, signal);
       try {
         await this.ensureConnected(slot, signal);
         if (!slot.client) throw new Error("NNTP slot did not connect");
@@ -210,13 +445,27 @@ class MountedNntpPool {
 
     for (let attempt = 1; attempt <= maxAttempts; attempt += 1) {
       if (permanentFailures.size >= providerCount) break;
-      const slot = await this.acquire(permanentFailures, includeBackups);
+      const slot = await this.acquire(permanentFailures, includeBackups, signal);
       try {
         await this.ensureConnected(slot, signal);
         if (!slot.client) throw new Error("NNTP slot did not connect");
-        for await (const chunk of slot.client.decodedBodyBufferChunks(articleId, decodeYencBufferLine, signal)) {
-          yield chunk;
+        const client = slot.client;
+        let completed = false;
+        try {
+          for await (const chunk of client.decodedBodyBufferChunks(articleId, decodeYencBufferLine, signal)) {
+            yield chunk;
+          }
+          completed = true;
+        } finally {
+          // Keep fully-consumed BODY connections warm. If the caller stops early,
+          // unread multiline data remains on the socket, so that connection must die.
+          if (!completed || signal?.aborted) {
+            await client.quit().catch(() => undefined);
+            if (slot.client === client) slot.client = undefined;
+            this.syncDebug();
+          }
         }
+        if (signal?.aborted) throw new Error("NNTP operation aborted");
         return;
       } catch (error) {
         const message = error instanceof Error ? error.message : "unknown NNTP error";
@@ -245,7 +494,7 @@ class MountedNntpPool {
 
   async ensureWarm(targetConnections: number, signal?: AbortSignal) {
     const allowedConnections = await getAllowedStreamingConnections();
-    const warmTarget = Math.max(0, Math.min(targetConnections, allowedConnections, this.slots.length));
+    const warmTarget = Math.max(0, Math.min(targetConnections, MAX_IDLE_WARM_CONNECTIONS, allowedConnections, this.slots.length));
     const coldSlots = this.slots
       .filter((slot) => !slot.client)
       .sort((a, b) => Number(a.provider.isBackup) - Number(b.provider.isBackup))
@@ -254,18 +503,32 @@ class MountedNntpPool {
     await Promise.allSettled(coldSlots.map((slot) => this.ensureConnected(slot, signal)));
   }
 
-  private async acquire(excludedProviders = new Set<string>(), includeBackups = true) {
+  private async acquire(excludedProviders = new Set<string>(), includeBackups = true, signal?: AbortSignal): Promise<MountedPoolSlot> {
+    if (signal?.aborted) throw new Error("NNTP acquire aborted");
     const available = (await this.activeSlots()).find(
       (slot) => !slot.busy && !excludedProviders.has(slot.provider.id) && (includeBackups || !slot.provider.isBackup)
     );
     if (available) {
       available.busy = true;
       this.syncDebug();
-      return Promise.resolve(available);
+      return available;
     }
 
-    return new Promise<MountedPoolSlot>((resolve) => {
-      this.waiters.push({ excludedProviders: new Set(excludedProviders), includeBackups, resolve });
+    return new Promise<MountedPoolSlot>((resolve, reject) => {
+      const waiter = { excludedProviders: new Set(excludedProviders), includeBackups, resolve, reject };
+      this.waiters.push(waiter);
+      if (signal) {
+        const onAbort = () => {
+          const index = this.waiters.indexOf(waiter);
+          if (index >= 0) this.waiters.splice(index, 1);
+          reject(new Error("NNTP acquire aborted"));
+        };
+        if (signal.aborted) {
+          onAbort();
+        } else {
+          signal.addEventListener("abort", onAbort, { once: true });
+        }
+      }
     });
   }
 
@@ -286,6 +549,14 @@ class MountedNntpPool {
       return;
     }
     slot.busy = false;
+    const connectedIdleSlots = this.slots.filter((entry) => entry !== slot && Boolean(entry.client) && !entry.busy).length;
+    if (slot.client && connectedIdleSlots >= MAX_IDLE_WARM_CONNECTIONS) {
+      const client = slot.client;
+      slot.client = undefined;
+      this.syncDebug();
+      void client.quit().catch(() => undefined);
+      return;
+    }
     this.syncDebug();
   }
 
@@ -488,7 +759,7 @@ async function getMountedFileManifest(path: string): Promise<MountedFileManifest
   if (!file) throw new Error("mounted NZB file not found");
 
   const segments: MountedFileSegment[] = [];
-  const decoded = await buildDecodedYencSegments(file, await getProviders(), undefined, { mode: "fast" });
+  const decoded = await buildDecodedYencSegments(file, await getProviders(), undefined, { mode: "exact" });
   let fallbackCursor = 0;
   const sourceSegments = decoded?.segments ?? file.segments.map((segment) => {
     const bytes = Math.floor(segment.bytes);
@@ -515,6 +786,57 @@ async function getMountedFileManifest(path: string): Promise<MountedFileManifest
     size: Math.max(0, Math.floor(decoded?.size ?? file.size)),
     segments
   };
+}
+
+async function getDirectMountedFile(path: string, providers: UsenetServer[], signal?: AbortSignal): Promise<DirectMountedFile | null> {
+  const cached = directMountedFileCache.get(path);
+  if (cached && cached.expiresAt > Date.now()) return cached.value;
+  const archiveEntry = await getStoredArchiveEntryByPath(path);
+  if (archiveEntry) return null;
+  const mount = await getMountFileByPath(path);
+  if (!mount || !mount.streamable) return null;
+  const file = mount.nzbDocument.files[0];
+  if (!file) return null;
+  const directFile: FileLike<SegmentLike> = {
+    id: file.id,
+    size: file.size,
+    segments: file.segments.map((segment) => ({
+      number: segment.number,
+      bytes: segment.bytes,
+      articleId: segment.articleId
+    }))
+  };
+  const decoded = await buildDecodedYencSegments(directFile, providers, signal, { mode: "fast" });
+  const size = Math.max(0, Math.floor(decoded?.size ?? (await getDecodedYencFileSize(directFile, providers, signal)) ?? file.size));
+  const value: DirectMountedFile = {
+    path,
+    fileId: file.id,
+    size,
+    segments: (decoded?.segments ?? []).map((segment) => ({
+      ...segment.segment,
+      fileId: file.id,
+      start: segment.start,
+      end: segment.end,
+      bytes: segment.bytes
+    }))
+  };
+  if (value.segments.length === 0) {
+    let cursor = 0;
+    value.segments = directFile.segments.map((segment) => {
+      const bytes = Math.floor(segment.bytes);
+      const start = cursor;
+      cursor += bytes;
+      return {
+        ...segment,
+        fileId: file.id,
+        start,
+        end: start + bytes - 1,
+        bytes
+      };
+    });
+  }
+  directMountedFileCache.set(path, { value, expiresAt: Date.now() + DIRECT_MOUNTED_FILE_CACHE_TTL_MS });
+  return value;
 }
 
 function pruneHotCache(maxSizeBytes: number, maxAgeMs: number) {
@@ -593,16 +915,6 @@ async function downloadArticle(articleId: string, providers: UsenetServer[], sig
   return body;
 }
 
-async function downloadArticleSlice(input: {
-  articleId: string;
-  segmentOffset: number;
-  length: number;
-  pool: MountedNntpPool;
-  signal?: AbortSignal;
-}) {
-  return input.pool.bodySlice(input.articleId, input.segmentOffset, input.length, input.signal);
-}
-
 async function getOrFetchSegmentBuffer(input: {
   fileId: string;
   segmentNumber: number;
@@ -620,6 +932,13 @@ async function getOrFetchSegmentBuffer(input: {
       await incrementMetric("memoryCacheHits");
       return hot.value;
     }
+    const disk = await readDiskCachedSegment(cacheKey);
+    if (disk) {
+      hotSegmentCache.set(cacheKey, { value: disk, updatedAt: Date.now() });
+      await incrementMetric("cacheHits");
+      await incrementMetric("diskCacheHits");
+      return disk;
+    }
   }
 
   const existing = inFlightSegmentFetches.get(cacheKey);
@@ -633,6 +952,7 @@ async function getOrFetchSegmentBuffer(input: {
     const decoded = await downloadArticle(input.articleId, input.providers, input.signal);
     if (policies.streamCacheEnabled) {
       hotSegmentCache.set(cacheKey, { value: decoded, updatedAt: Date.now() });
+      await writeDiskCachedSegment(cacheKey, decoded).catch(() => undefined);
       pruneHotCache(Math.min(policies.streamCacheMaxSizeGb * 1024 * 1024 * 1024, 256 * 1024 * 1024), policies.streamCacheMaxAgeHours * 60 * 60 * 1000);
     }
     return decoded;
@@ -644,6 +964,28 @@ async function getOrFetchSegmentBuffer(input: {
   } finally {
     inFlightSegmentFetches.delete(cacheKey);
   }
+}
+
+async function getCachedSegmentBuffer(input: {
+  fileId: string;
+  segmentNumber: number;
+}) {
+  const policies = await getPolicySettings();
+  if (!policies.streamCacheEnabled) return null;
+  const cacheKey = segmentCacheKey(input.fileId, input.segmentNumber);
+  const hot = hotSegmentCache.get(cacheKey);
+  if (hot) {
+    hot.updatedAt = Date.now();
+    await incrementMetric("cacheHits");
+    await incrementMetric("memoryCacheHits");
+    return hot.value;
+  }
+  const disk = await readDiskCachedSegment(cacheKey);
+  if (!disk) return null;
+  hotSegmentCache.set(cacheKey, { value: disk, updatedAt: Date.now() });
+  await incrementMetric("cacheHits");
+  await incrementMetric("diskCacheHits");
+  return disk;
 }
 
 async function readManifestWindow(input: {
@@ -698,6 +1040,7 @@ function warmManifestSegments(input: {
 }) {
   const startIndex = findSegmentIndex(input.manifest.segments, input.start);
   const count = input.count ?? STREAM_PREFETCH_SEGMENTS;
+  if (count <= 0) return;
   for (let index = startIndex; index < Math.min(input.manifest.segments.length, startIndex + count); index += 1) {
     const segment = input.manifest.segments[index];
     if (!segment) continue;
@@ -724,7 +1067,8 @@ async function prefetchMountedFileRange(input: {
   inFlightReadAhead.add(key);
   try {
     const plan = await planMountedFileRange(input.path, `bytes=${input.start}-${input.start + input.length - 1}`);
-    let warmed = 0;
+    let warmedBytes = 0;
+    const budgetBytes = Math.min(input.length, STREAM_READ_AHEAD_PREFETCH_MAX_BYTES);
     for (const range of plan.ranges) {
       if (input.signal.aborted) break;
       if (range.segmentOffset !== 0 || range.length !== Math.floor(range.bytes)) continue;
@@ -735,8 +1079,8 @@ async function prefetchMountedFileRange(input: {
         providers: input.providers,
         signal: input.signal
       });
-      warmed += 1;
-      if (warmed >= STREAM_READ_AHEAD_SEGMENT_LIMIT) break;
+      warmedBytes += Math.floor(range.bytes);
+      if (warmedBytes >= budgetBytes) break;
     }
     await incrementMetric("readAheadBytes", plan.end - plan.start + 1);
     await incrementMetric("readAheadRequests");
@@ -775,6 +1119,14 @@ async function* streamSegmentProgressively(input: {
       yield hot.value;
       return;
     }
+    const disk = await readDiskCachedSegment(cacheKey);
+    if (disk) {
+      hotSegmentCache.set(cacheKey, { value: disk, updatedAt: Date.now() });
+      await incrementMetric("cacheHits");
+      await incrementMetric("diskCacheHits");
+      yield disk;
+      return;
+    }
   }
 
   const existing = inFlightSegmentFetches.get(cacheKey);
@@ -810,6 +1162,7 @@ async function* streamSegmentProgressively(input: {
     const complete = Buffer.concat(buffers, total);
     if (policies.streamCacheEnabled) {
       hotSegmentCache.set(cacheKey, { value: complete, updatedAt: Date.now() });
+      await writeDiskCachedSegment(cacheKey, complete).catch(() => undefined);
       pruneHotCache(Math.min(policies.streamCacheMaxSizeGb * 1024 * 1024 * 1024, 256 * 1024 * 1024), policies.streamCacheMaxAgeHours * 60 * 60 * 1000);
     }
     await incrementMetric("providerHits");
@@ -831,24 +1184,193 @@ async function readSegmentSlice(input: {
   providers: UsenetServer[];
   signal?: AbortSignal;
 }) {
-  if (input.segmentOffset === 0 && input.length <= 256 * 1024) {
-    const warmFullSegment = getOrFetchSegmentBuffer(input).catch(() => undefined);
-    try {
-      const pool = await getMountedPool();
-      const sliced = await downloadArticleSlice({
-        articleId: input.articleId,
-        segmentOffset: input.segmentOffset,
-        length: input.length,
-        pool,
-        signal: input.signal
-      });
-      return Readable.from([sliced]);
-    } catch {
-      await warmFullSegment;
+  const decoded = await getOrFetchSegmentBuffer({
+    fileId: input.fileId,
+    segmentNumber: input.segmentNumber,
+    articleId: input.articleId,
+    providers: input.providers,
+    signal: input.signal
+  });
+  return Readable.from([decoded.subarray(input.segmentOffset, input.segmentOffset + input.length)]);
+}
+
+function findDirectMountedSegmentByOffset(input: {
+  file: DirectMountedFile;
+  offset: number;
+}) {
+  const segments = input.file.segments;
+  if (segments.length === 0) return null;
+  const index = findSegmentIndex(segments, input.offset);
+  const segment = segments[index];
+  if (!segment || input.offset < segment.start || input.offset > segment.end) return null;
+  return { index, start: segment.start, end: segment.end };
+}
+
+async function findDirectMountedSegmentByOffsetExact(input: {
+  file: DirectMountedFile;
+  offset: number;
+  providers: UsenetServer[];
+  signal?: AbortSignal;
+}) {
+  const estimated = findDirectMountedSegmentByOffset({ file: input.file, offset: input.offset });
+  if (!estimated) return null;
+  const visited = new Set<number>();
+  let index = estimated.index;
+  let direction = 0;
+  for (let attempts = 0; attempts < 64; attempts += 1) {
+    if (index < 0 || index >= input.file.segments.length || visited.has(index)) break;
+    visited.add(index);
+    const segment = input.file.segments[index];
+    if (!segment) break;
+    const info = await getDecodedYencPartInfo(input.file.fileId, segment, input.providers, input.signal).catch(() => null);
+    const start = Number.isFinite(info?.partOffset) ? Math.floor(info!.partOffset!) : segment.start;
+    const bytes = Number.isFinite(info?.partSize) && (info?.partSize ?? 0) > 0 ? Math.floor(info!.partSize!) : segment.end - segment.start + 1;
+    const end = start + bytes - 1;
+    if (input.offset >= start && input.offset <= end) return { index, start, end };
+    direction = input.offset < start ? -1 : 1;
+    index += direction;
+    if (index < 0 || index >= input.file.segments.length) break;
+  }
+  return estimated;
+}
+
+async function readDirectMountedRange(input: {
+  file: DirectMountedFile;
+  start: number;
+  length: number;
+  providers: UsenetServer[];
+  signal?: AbortSignal;
+}) {
+  if (input.length <= 0 || input.start >= input.file.size) return Buffer.alloc(0);
+  const targetLength = Math.min(input.length, input.file.size - input.start);
+  const found = await findDirectMountedSegmentByOffsetExact({
+    file: input.file,
+    offset: input.start,
+    providers: input.providers,
+    signal: input.signal
+  });
+  if (!found) throw new Error(`unable to locate mounted segment for offset ${input.start}`);
+
+  const buffers: Buffer[] = [];
+  let total = 0;
+  let discard = input.start - found.start;
+
+  for (let index = found.index; index < input.file.segments.length && total < targetLength; index += 1) {
+    const segment = input.file.segments[index];
+    if (!segment) break;
+    for await (const chunk of streamSegmentProgressively({
+      fileId: input.file.fileId,
+      segmentNumber: segment.number,
+      articleId: segment.articleId,
+      providers: input.providers,
+      signal: input.signal
+    })) {
+      let buffer = Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk);
+      if (discard > 0) {
+        if (buffer.length <= discard) {
+          discard -= buffer.length;
+          continue;
+        }
+        buffer = buffer.subarray(discard);
+        discard = 0;
+      }
+      if (buffer.length > targetLength - total) {
+        buffer = buffer.subarray(0, targetLength - total);
+      }
+      if (buffer.length === 0) continue;
+      buffers.push(buffer);
+      total += buffer.length;
+      if (total >= targetLength) break;
     }
   }
-  const decoded = await getOrFetchSegmentBuffer(input);
-  return Readable.from([decoded.subarray(input.segmentOffset, input.segmentOffset + input.length)]);
+
+  return buffers.length === 1 ? buffers[0]! : Buffer.concat(buffers, total);
+}
+
+async function* streamDirectMountedRanges(input: {
+  sessionId: string;
+  file: DirectMountedFile;
+  start: number;
+  end: number;
+  providers: UsenetServer[];
+  signal: AbortSignal;
+}) {
+  const found = await findDirectMountedSegmentByOffsetExact({
+    file: input.file,
+    offset: input.start,
+    providers: input.providers,
+    signal: input.signal
+  });
+  if (!found) throw new Error(`unable to locate mounted segment for offset ${input.start}`);
+
+  let bytesSent = 0;
+  let discard = input.start - found.start;
+  let remaining = input.end - input.start + 1;
+
+  try {
+    for (let index = found.index; index < input.file.segments.length && remaining > 0; index += 1) {
+      const segment = input.file.segments[index];
+      if (!segment) break;
+      for await (const chunk of streamSegmentProgressively({
+        fileId: input.file.fileId,
+        segmentNumber: segment.number,
+        articleId: segment.articleId,
+        providers: input.providers,
+        signal: input.signal
+      })) {
+        throwIfAborted(input.signal);
+        let buffer = Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk);
+        if (discard > 0) {
+          if (buffer.length <= discard) {
+            discard -= buffer.length;
+            continue;
+          }
+          buffer = buffer.subarray(discard);
+          discard = 0;
+        }
+        if (buffer.length > remaining) {
+          buffer = buffer.subarray(0, remaining);
+        }
+        if (buffer.length === 0) continue;
+        bytesSent += buffer.length;
+        remaining -= buffer.length;
+        void incrementMetric("bytesServed", buffer.length);
+        yield buffer;
+        void updateSession(input.sessionId, {
+          bytesSent,
+          currentOffset: input.start + bytesSent
+        });
+        if (remaining <= 0) break;
+      }
+    }
+  } finally {
+    const status = input.signal.aborted ? "cancelled" : "closed";
+    if (status === "cancelled") {
+      cancelStreamSessionActor(input.sessionId, {
+        bytesSent,
+        currentOffset: input.start + bytesSent,
+        closedAt: new Date().toISOString()
+      });
+    } else {
+      closeStreamSessionActor(input.sessionId, {
+        bytesSent,
+        currentOffset: input.start + bytesSent,
+        closedAt: new Date().toISOString()
+      });
+    }
+    await updateSession(input.sessionId, {
+      status,
+      bytesSent,
+      currentOffset: input.start + bytesSent,
+      closedAt: new Date().toISOString()
+    }, { force: true });
+    await redis.expire(`vfs:stream:session:${input.sessionId}`, 300);
+    await redis.srem(sessionSetKey, input.sessionId);
+    sessionSnapshots.delete(input.sessionId);
+    pendingSessionUpdates.delete(input.sessionId);
+    sessionControllers.delete(input.sessionId);
+    stopStreamSessionActor(input.sessionId);
+  }
 }
 
 async function* streamPlannedRanges(input: {
@@ -900,11 +1422,11 @@ async function* streamPlannedRanges(input: {
         throwIfAborted(input.signal);
         const buffer = Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk);
         bytesSent += buffer.length;
-        await incrementMetric("bytesServed", buffer.length);
+        void incrementMetric("bytesServed", buffer.length);
         yield buffer;
       }
 
-      await updateSession(input.sessionId, {
+      void updateSession(input.sessionId, {
         bytesSent,
         currentOffset: range.readOffset + range.length
       });
@@ -1149,10 +1671,71 @@ async function readMountedFileRangeRaw(input: {
   if (providers.length === 0) throw new Error("No enabled Usenet providers configured");
   if (input.length <= 0) return Buffer.alloc(0);
   await pool.ensureWarm(1);
-  void pool.ensureWarm(input.start === 0 ? Math.min(4, await getAllowedStreamingConnections()) : 2);
-
+  const directFile = await getDirectMountedFile(input.path, providers);
+  if (directFile) {
+    const safeLength = Math.min(input.length, Math.max(0, directFile.size - input.start));
+    const cachedRange = await readCachedVfsFileRange({
+      fileId: directFile.fileId,
+      start: input.start,
+      length: safeLength
+    });
+    const range = `bytes=${input.start}-${input.start + Math.max(0, safeLength - 1)}`;
+    const session = input.sessionId
+      ? { id: input.sessionId, controller: sessionControllers.get(input.sessionId) ?? new AbortController() }
+      : await getOrCreateStreamSession({
+          path: input.path,
+          range,
+          userAgent: input.userAgent,
+          source: input.source ?? "api"
+        });
+    const ownsSession = !input.sessionId;
+    if (!sessionControllers.has(session.id)) sessionControllers.set(session.id, session.controller);
+    markStreamedOnce(session.id, input.path);
+    try {
+      await updateSession(session.id, {
+        fileId: directFile.fileId,
+        size: directFile.size,
+        start: input.start,
+        end: Math.min(directFile.size - 1, input.start + safeLength - 1),
+        currentOffset: input.start
+      }, { force: true });
+      const existingBytesSent = Number(sessionField(session.id, "bytesSent") ?? 0);
+      if (cachedRange) {
+        await incrementMetric("bytesServed", cachedRange.length);
+        await updateSession(session.id, {
+          bytesSent: existingBytesSent + cachedRange.length,
+          currentOffset: input.start + cachedRange.length
+        }, { force: true });
+        return cachedRange;
+      }
+      const merged = await readDirectMountedRange({
+        file: directFile,
+        start: input.start,
+        length: safeLength,
+        providers,
+        signal: session.controller.signal
+      });
+      queuePersistVfsFileCacheRange({ fileId: directFile.fileId, start: input.start, buffer: merged });
+      await incrementMetric("bytesServed", merged.length);
+      await updateSession(session.id, {
+        bytesSent: existingBytesSent + merged.length,
+        currentOffset: input.start + merged.length
+      }, { force: true });
+      return merged;
+    } catch (error) {
+      failStreamSessionActor(session.id, error instanceof Error ? error.message : "mounted read failed");
+      throw error;
+    } finally {
+      if (ownsSession) await stopStreamSession(session.id).catch(() => undefined);
+    }
+  }
   const range = `bytes=${input.start}-${input.start + input.length - 1}`;
   const plan = await planMountedFileRange(input.path, range);
+  const cachedRange = await readCachedVfsFileRange({
+    fileId: plan.fileId,
+    start: plan.start,
+    length: plan.end - plan.start + 1
+  });
   const session = input.sessionId
     ? { id: input.sessionId, controller: sessionControllers.get(input.sessionId) ?? new AbortController() }
     : await getOrCreateStreamSession({
@@ -1174,8 +1757,17 @@ async function readMountedFileRangeRaw(input: {
       end: plan.end,
       currentOffset: plan.start
     }, { force: true });
-
     const existingBytesSent = Number(sessionField(session.id, "bytesSent") ?? 0);
+
+    if (cachedRange) {
+      await incrementMetric("bytesServed", cachedRange.length);
+      await updateSession(session.id, {
+        bytesSent: existingBytesSent + cachedRange.length,
+        currentOffset: plan.start + cachedRange.length
+      }, { force: true });
+      return cachedRange;
+    }
+
     const buffers: Buffer[] = [];
     let total = 0;
 
@@ -1208,24 +1800,14 @@ async function readMountedFileRangeRaw(input: {
     }
 
     await incrementMetric("bytesServed", total);
+    const merged = buffers.length === 1 ? buffers[0]! : Buffer.concat(buffers, total);
+    queuePersistVfsFileCacheRange({ fileId: plan.fileId, start: plan.start, buffer: merged });
     await updateSession(session.id, {
       bytesSent: existingBytesSent + total,
       currentOffset: plan.end + 1
     }, { force: true });
 
-    if (input.source !== "fuse" && policies.streamReadAheadBytes > 0 && plan.end + 1 < plan.size) {
-      const readAheadStart = plan.end + 1;
-      const readAheadLength = Math.min(policies.streamReadAheadBytes, policies.streamChunkSizeBytes, plan.size - readAheadStart);
-      void prefetchMountedFileRange({
-        path: input.path,
-        start: readAheadStart,
-        length: readAheadLength,
-        providers,
-        signal: session.controller.signal
-      });
-    }
-
-    return Buffer.concat(buffers, total);
+    return merged;
   } catch (error) {
     failStreamSessionActor(session.id, error instanceof Error ? error.message : "mounted read failed");
     throw error;
@@ -1276,25 +1858,55 @@ export async function readMountedFileRange(input: {
 
   const policies = await getPolicySettings();
   const providers = await getProviders();
-  const manifest = cached?.path === input.path ? cached.manifest : await getMountedFileManifest(input.path);
-  await updateSession(streamSession.id, {
-    fileId: manifest.fileId,
-    size: manifest.size,
+  const directFile = await getDirectMountedFile(input.path, providers);
+  const manifest = directFile
+    ? undefined
+    : cached?.path === input.path
+      ? cached.manifest
+      : sharedCached?.path === input.path
+        ? sharedCached.manifest
+        : await getMountedFileManifest(input.path);
+  const cachedRange = await readCachedVfsFileRange({
+    fileId: directFile?.fileId ?? manifest!.fileId,
     start: input.start,
-    end: Math.min(manifest.size - 1, input.start + input.length - 1),
+    length: input.length
+  });
+  await updateSession(streamSession.id, {
+    fileId: directFile?.fileId ?? manifest!.fileId,
+    size: directFile?.size ?? manifest!.size,
+    start: input.start,
+    end: Math.min((directFile?.size ?? manifest!.size) - 1, input.start + input.length - 1),
     currentOffset: input.start,
     range,
     source: "fuse",
     path: input.path,
     status: "active"
   });
+  if (cachedRange) {
+    rememberMountedWindow(input.sessionId, {
+      path: input.path,
+      manifest,
+      directFile: directFile ?? undefined,
+      bufferStart: input.start,
+      buffer: cachedRange,
+      lastReadEnd: input.start + cachedRange.length,
+      updatedAt: Date.now()
+    });
+    await incrementMetric("bytesServed", cachedRange.length);
+    await updateSession(streamSession.id, {
+      bytesSent: Number(sessionField(streamSession.id, "bytesSent") ?? 0) + cachedRange.length,
+      currentOffset: input.start + cachedRange.length
+    });
+    return cachedRange;
+  }
   const sequentialRead = Boolean(cached && cached.path === input.path && input.start >= cached.lastReadEnd && input.start - cached.lastReadEnd <= 256 * 1024);
-  const reader = cached?.path === input.path && cached.reader ? cached.reader : createSequentialReader(manifest);
+  const reader = directFile ? undefined : cached?.path === input.path && cached.reader ? cached.reader : createSequentialReader(manifest!);
   const signal: AbortSignal | undefined = undefined;
 
-  if (sequentialRead || (cached?.reader && input.start === cached.lastReadEnd)) {
-    await seekSequentialReader(reader, input.start, signal);
-    const out = await readSequentialBytes(reader, input.length, signal);
+  if (!directFile && (sequentialRead || (cached?.reader && input.start === cached.lastReadEnd))) {
+    await seekSequentialReader(reader!, input.start, signal);
+    const out = await readSequentialBytes(reader!, input.length, signal);
+    queuePersistVfsFileCacheRange({ fileId: manifest!.fileId, start: input.start, buffer: out });
     rememberMountedWindow(input.sessionId, {
       path: input.path,
       manifest,
@@ -1317,36 +1929,55 @@ export async function readMountedFileRange(input: {
   const targetWindow = sequentialRead
     ? Math.max(
         input.length,
-        Math.min(Math.max(policies.streamChunkSizeBytes, 1 * 1024 * 1024), MOUNTED_SEQUENTIAL_WINDOW_BYTES)
+        Math.min(MOUNTED_SEQUENTIAL_WINDOW_BYTES, policies.streamReadAheadBytes || MOUNTED_SEQUENTIAL_WINDOW_BYTES)
       )
-    : Math.max(input.length, MOUNTED_RANDOM_ACCESS_WINDOW_BYTES);
+    : Math.max(
+        input.length,
+        Math.min(MOUNTED_RANDOM_ACCESS_WINDOW_BYTES, policies.streamReadAheadBytes || MOUNTED_RANDOM_ACCESS_WINDOW_BYTES)
+      );
   const fetchLength = Math.min(targetWindow, MOUNTED_READ_AHEAD_MAX_BYTES);
-  if (sequentialRead) {
+  const windowStart = Math.max(0, Math.floor(input.start / VFS_FILE_CACHE_CHUNK_BYTES) * VFS_FILE_CACHE_CHUNK_BYTES);
+  const alignedFetchLength = Math.min(
+    (directFile?.size ?? manifest!.size) - windowStart,
+    Math.max(fetchLength + (input.start - windowStart), input.length)
+  );
+  if (!directFile && sequentialRead) {
     warmManifestSegments({
-      manifest,
+      manifest: manifest!,
       start: input.start,
       providers,
       signal,
       count: STREAM_PREFETCH_SEGMENTS
     });
   }
-  const window = await readManifestWindow({
-    manifest,
-    start: input.start,
-    length: fetchLength,
-    providers,
-    signal
-  });
+  const window = directFile
+    ? await readDirectMountedRange({
+        file: directFile,
+        start: windowStart,
+        length: alignedFetchLength,
+        providers,
+        signal
+      })
+    : await readManifestWindow({
+        manifest: manifest!,
+        start: windowStart,
+        length: alignedFetchLength,
+        providers,
+        signal
+      });
+  queuePersistVfsFileCacheRange({ fileId: directFile?.fileId ?? manifest!.fileId, start: windowStart, buffer: window });
   rememberMountedWindow(input.sessionId, {
     path: input.path,
     manifest,
-    bufferStart: input.start,
+    directFile: directFile ?? undefined,
+    bufferStart: windowStart,
     buffer: window,
     lastReadEnd: input.start + Math.min(input.length, window.length),
     updatedAt: Date.now(),
     reader
   });
-  const out = window.subarray(0, Math.min(input.length, window.length));
+  const outOffset = input.start - windowStart;
+  const out = window.subarray(outOffset, outOffset + Math.min(input.length, window.length - outOffset));
   await incrementMetric("bytesServed", out.length);
   await updateSession(streamSession.id, {
     bytesSent: Number(sessionField(streamSession.id, "bytesSent") ?? 0) + out.length,
@@ -1355,13 +1986,46 @@ export async function readMountedFileRange(input: {
   return out;
 }
 
-export async function streamMountedFile(path: string, range?: string, options?: { userAgent?: string; source?: "http" | "fuse" | "api" }) {
+export async function streamMountedFile(path: string, range?: string, options?: { userAgent?: string; source?: "http" | "fuse" | "api"; signal?: AbortSignal }) {
   const providers = await getProviders();
   const pool = await getMountedPool();
   if (providers.length === 0) throw new Error("No enabled Usenet providers configured");
-  await pool.ensureWarm(1);
-  void pool.ensureWarm(Math.min(2, await getAllowedStreamingConnections()));
-
+  await pool.ensureWarm(1, options?.signal);
+  const directFile = await getDirectMountedFile(path, providers, options?.signal);
+  if (directFile) {
+    const partialRange = normalizeRange(range, directFile.size);
+    const session = await getOrCreateStreamSession({
+      path,
+      range,
+      userAgent: options?.userAgent,
+      source: options?.source ?? "http"
+    });
+    await updateSession(session.id, {
+      fileId: directFile.fileId,
+      size: directFile.size,
+      start: partialRange.start,
+      end: partialRange.end
+    }, { force: true });
+    markStreamedOnce(session.id, path);
+    const stream = Readable.from(
+      streamDirectMountedRanges({
+        sessionId: session.id,
+        file: directFile,
+        start: partialRange.start,
+        end: partialRange.end,
+        providers,
+        signal: session.controller.signal
+      })
+    );
+    return {
+      stream,
+      start: partialRange.start,
+      end: partialRange.end,
+      size: directFile.size,
+      partial: Boolean(range),
+      sessionId: session.id
+    };
+  }
   const plan = await planMountedFileRange(path, range);
   const session = await getOrCreateStreamSession({
     path,
@@ -1386,12 +2050,6 @@ export async function streamMountedFile(path: string, range?: string, options?: 
       signal: session.controller.signal
     })
   );
-  stream.once("close", () => {
-    void stopStreamSession(session.id).catch(() => undefined);
-  });
-  stream.once("error", () => {
-    void stopStreamSession(session.id).catch(() => undefined);
-  });
 
   return {
     stream,

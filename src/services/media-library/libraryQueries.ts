@@ -1,31 +1,15 @@
-import { dirname, basename, extname } from "node:path";
-import { readdir } from "node:fs/promises";
 import { prisma, type MediaLibraryItem } from "../../repositories/db/prisma.js";
 import { hydrateLegacyMediaFields } from "./normalizedMedia.js";
 import { getCachedSubtitleLanguages, updateSubtitleLanguageCache } from "./subtitleLanguageCache.js";
 import { LIBRARY_LIST_SELECT, mapWithConcurrency, shouldHideLibraryItem } from "./libraryShared.js";
+import { listSubtitleLanguagesForPath } from "../subtitles/subtitleUtils.js";
 
-function escapeRegExp(value: string) {
-  return value.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
-}
-
-async function subtitleLanguagesForItem(item: Pick<MediaLibraryItem, "symlinkPath" | "strmPath" | "filePath">) {
+export async function subtitleLanguagesForItem(item: Pick<MediaLibraryItem, "symlinkPath" | "strmPath" | "filePath">) {
   const mediaPath = item.symlinkPath ?? item.strmPath ?? item.filePath;
   if (!mediaPath) return [];
   const cached = getCachedSubtitleLanguages(mediaPath);
   if (cached) return cached;
-  const directory = dirname(mediaPath);
-  const extension = extname(mediaPath);
-  const stem = extension ? basename(mediaPath, extension) : basename(mediaPath);
-  const entries = await readdir(directory, { withFileTypes: true });
-  const languages = entries
-    .filter((entry) => entry.isFile())
-    .map((entry) => entry.name)
-    .flatMap((name) => {
-      const match = name.match(new RegExp(`^${escapeRegExp(stem)}\\.([a-z0-9-]+)\\.(srt|ass|ssa|vtt|sub)$`, "i"));
-      return match?.[1] ? [match[1].toUpperCase()] : [];
-    });
-  const normalized = [...new Set(languages)].sort();
+  const normalized = await listSubtitleLanguagesForPath(mediaPath);
   updateSubtitleLanguageCache(mediaPath, normalized);
   return normalized;
 }

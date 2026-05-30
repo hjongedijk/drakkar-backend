@@ -8,20 +8,26 @@ import { extractArchivesInPath } from "../services/extractService.js";
 import { importCompletedPath } from "../services/importService.js";
 import { verifyAndRepairPar2 } from "./par2Service.js";
 import { listMountedFiles, statMountedPath } from "../services/mountedNzbService.js";
-import { readMountedFileRange } from "../services/mountedStream.service.js";
+import { listActiveStreamSessions, readMountedFileRange } from "../services/mountedStream.service.js";
 import { BACKGROUND_REPAIR_INTERVAL_MS, BACKGROUND_REPAIR_TASK_ID, registerCoreTasks, resolveTaskIntervalMs } from "../workers/tasks/coreTasks.js";
 import { getSettings } from "../services/settings/settingsStore.js";
 import { runTrackedTask, setTaskNextRun } from "../workers/tasks/taskRegistry.js";
 import { runRepairAssessmentMachine } from "../state-machines/repairAssessmentMachine.js";
+import { getRecentWebdavActivitySummary } from "../services/webdavActivity.js";
 
 const BACKGROUND_HEALTHCHECK_INITIAL_DELAY_MS = 30_000;
 const BACKGROUND_HEALTHCHECK_MIN_ITEM_INTERVAL_MS = 6 * 60 * 60_000;
 const BACKGROUND_HEALTHCHECK_MAX_ITEM_INTERVAL_MS = 7 * 24 * 60 * 60_000;
-const BACKGROUND_HEALTHCHECK_MAX_CHECKS_PER_SWEEP = 8;
-const BACKGROUND_HEALTHCHECK_BACKLOG_CHECKS_PER_SWEEP = 32;
+const BACKGROUND_HEALTHCHECK_MAX_CHECKS_PER_SWEEP = 4;
+const BACKGROUND_HEALTHCHECK_BACKLOG_CHECKS_PER_SWEEP = 2;
 const BACKGROUND_HEALTHCHECK_BACKLOG_INTERVAL_MS = 5 * 60_000;
 const BACKGROUND_HEALTHCHECK_STALE_RUNNING_MS = 30 * 60_000;
 const BACKGROUND_MOUNTED_HEALTHCHECK_TYPE = "background-mounted-healthcheck";
+const BACKGROUND_MOUNTED_HEAD_PROBE_BYTES = 32 * 1024;
+const BACKGROUND_MOUNTED_MID_PROBE_BYTES = 4 * 1024;
+const BACKGROUND_MOUNTED_TAIL_PROBE_BYTES = 16 * 1024;
+const BACKGROUND_MOUNTED_TINY_TAIL_PROBE_BYTES = 4 * 1024;
+const BACKGROUND_REPAIR_HOT_IO_AVG10 = 8;
 
 async function toolAvailable(name: string) {
   const paths = (process.env.PATH ?? "").split(":").map((path) => join(path, name));
@@ -34,6 +40,32 @@ async function toolAvailable(name: string) {
     }
   }
   return false;
+}
+
+async function ioPressureAvg10() {
+  try {
+    const raw = await import("node:fs/promises").then(({ readFile }) => readFile("/proc/pressure/io", "utf8"));
+    const line = raw.split("\n").find((entry) => entry.startsWith("some "));
+    const match = line?.match(/\bavg10=(\d+(?:\.\d+)?)\b/);
+    return match ? Number(match[1]) : 0;
+  } catch {
+    return 0;
+  }
+}
+
+async function backgroundSweepGate() {
+  const [streams, ioAvg10] = await Promise.all([
+    listActiveStreamSessions().catch(() => []),
+    ioPressureAvg10()
+  ]);
+  const activeStreamCount = streams.filter((stream) => stream.status === "active").length;
+  const webdav = getRecentWebdavActivitySummary();
+  return {
+    activeStreamCount,
+    ioAvg10,
+    webdav,
+    defer: activeStreamCount > 0 || ioAvg10 >= BACKGROUND_REPAIR_HOT_IO_AVG10
+  };
 }
 
 async function listFiles(path: string): Promise<string[]> {
@@ -49,44 +81,25 @@ function mountedVideoFiles(files: Awaited<ReturnType<typeof listMountedFiles>>) 
 }
 
 async function probeMountedVideo(path: string) {
-  const head = await readMountedFileRange({
-    path,
-    start: 0,
-    length: 64 * 1024,
-    source: "api"
-  });
+  const readProbe = (start: number, length: number) => readMountedFileRange({ path, start, length, source: "api" });
+  const head = await readProbe(0, BACKGROUND_MOUNTED_HEAD_PROBE_BYTES);
   const mountedStats = await statMountedPath(path);
   const fileSize = mountedStats.size;
   if (fileSize <= head.length) return head.length;
 
-  const midStart = Math.max(0, Math.floor(fileSize / 2) - 4096);
-  const tailStart = Math.max(0, fileSize - 64 * 1024);
-  const tinyTailStart = Math.max(0, fileSize - 8192);
+  const midStart = Math.max(0, Math.floor(fileSize / 2) - Math.floor(BACKGROUND_MOUNTED_MID_PROBE_BYTES / 2));
+  const tailStart = Math.max(0, fileSize - BACKGROUND_MOUNTED_TAIL_PROBE_BYTES);
+  const tinyTailStart = Math.max(0, fileSize - BACKGROUND_MOUNTED_TINY_TAIL_PROBE_BYTES);
 
   const [mid, tail, tinyTail] = await Promise.all([
-    readMountedFileRange({
-      path,
-      start: midStart,
-      length: 8192,
-      source: "api"
-    }),
-    readMountedFileRange({
-      path,
-      start: tailStart,
-      length: Math.min(64 * 1024, fileSize - tailStart),
-      source: "api"
-    }),
-    readMountedFileRange({
-      path,
-      start: tinyTailStart,
-      length: Math.min(8192, fileSize - tinyTailStart),
-      source: "api"
-    })
+    readProbe(midStart, BACKGROUND_MOUNTED_MID_PROBE_BYTES),
+    readProbe(tailStart, Math.min(BACKGROUND_MOUNTED_TAIL_PROBE_BYTES, fileSize - tailStart)),
+    readProbe(tinyTailStart, Math.min(BACKGROUND_MOUNTED_TINY_TAIL_PROBE_BYTES, fileSize - tinyTailStart))
   ]);
 
-  if (mid.length < Math.min(8192, Math.max(0, fileSize - midStart))) throw new Error("mounted healthcheck short read in middle of file");
-  if (tail.length < Math.min(64 * 1024, Math.max(0, fileSize - tailStart))) throw new Error("mounted healthcheck short read at tail of file");
-  if (tinyTail.length < Math.min(8192, Math.max(0, fileSize - tinyTailStart))) throw new Error("mounted healthcheck short read at tiny tail window");
+  if (mid.length < Math.min(BACKGROUND_MOUNTED_MID_PROBE_BYTES, Math.max(0, fileSize - midStart))) throw new Error("mounted healthcheck short read in middle of file");
+  if (tail.length < Math.min(BACKGROUND_MOUNTED_TAIL_PROBE_BYTES, Math.max(0, fileSize - tailStart))) throw new Error("mounted healthcheck short read at tail of file");
+  if (tinyTail.length < Math.min(BACKGROUND_MOUNTED_TINY_TAIL_PROBE_BYTES, Math.max(0, fileSize - tinyTailStart))) throw new Error("mounted healthcheck short read at tiny tail window");
   return head.length + mid.length + tail.length + tinyTail.length;
 }
 
@@ -199,6 +212,20 @@ export function nextBackgroundHealthcheckAt(input: { createdAt: Date; lastChecke
 
 export async function runBackgroundRepairSweep(logger: { warn: (...args: unknown[]) => void }) {
   const summary = await runTrackedTask(BACKGROUND_REPAIR_TASK_ID, async () => {
+    const gate = await backgroundSweepGate();
+    if (gate.defer) {
+      return {
+        checked: 0,
+        skipped: 0,
+        total: 0,
+        uncheckedRemaining: 0,
+        deferred: true,
+        activeStreamCount: gate.activeStreamCount,
+        ioAvg10: gate.ioAvg10,
+        mediaPropfindCount: gate.webdav.mediaPropfindCount,
+        propfindCount: gate.webdav.propfindCount
+      };
+    }
     const downloads = await prisma.download.findMany({
       where: {
         status: { in: ["available", "completed"] }
@@ -229,6 +256,20 @@ export async function runBackgroundRepairSweep(logger: { warn: (...args: unknown
     let checkedUnchecked = 0;
     for (const download of downloads) {
       if (checked >= maxChecksPerSweep) break;
+      const gate = await backgroundSweepGate();
+      if (gate.defer) {
+        return {
+          checked,
+          skipped,
+          total: downloads.length,
+          uncheckedRemaining: Math.max(0, uncheckedDownloads - checkedUnchecked),
+          deferred: true,
+          activeStreamCount: gate.activeStreamCount,
+          ioAvg10: gate.ioAvg10,
+          mediaPropfindCount: gate.webdav.mediaPropfindCount,
+          propfindCount: gate.webdav.propfindCount
+        };
+      }
       const latest = latestHealthJobByDownload.get(download.id);
       if (latest?.status === "running") {
         const latestUpdatedAt = latest.updatedAt?.getTime?.() ?? 0;
@@ -269,6 +310,9 @@ export async function runBackgroundRepairSweep(logger: { warn: (...args: unknown
     logger.warn({ err: error }, "background repair sweep failed");
     return undefined;
   });
+  if (summary && "deferred" in summary && summary.deferred) {
+    return { ...summary, nextDelayMs: BACKGROUND_HEALTHCHECK_BACKLOG_INTERVAL_MS };
+  }
   const settings = await getSettings().catch(() => null);
   registerCoreTasks(settings ?? undefined);
   const intervalMs = resolveTaskIntervalMs(BACKGROUND_REPAIR_TASK_ID, settings) ?? BACKGROUND_REPAIR_INTERVAL_MS;

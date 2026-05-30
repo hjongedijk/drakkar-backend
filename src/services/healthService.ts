@@ -1,4 +1,5 @@
 import { redis } from "../repositories/db/redis.js";
+import { prisma } from "../repositories/db/prisma.js";
 import { classifyRepairOutcome, deriveImportHealth, estimateHealthProgress, healthRepairIsActive, isCompletedHealthJob } from "../services/health/checks.js";
 import { listAvailableDownloadsForHealth, listRecentRepairJobs, pingDatabase } from "../repositories/healthRepository.js";
 import { DRAKKAR_VERSION } from "../models/version.js";
@@ -41,9 +42,11 @@ export async function getHealthOverview() {
 }
 
 export async function getImportHealthChecks() {
-  const [downloads, repairJobs] = await Promise.all([
+  const [downloads, repairJobs, failedImportsCount, brokenSymlinksCount] = await Promise.all([
     listAvailableDownloadsForHealth(),
-    listRecentRepairJobs()
+    listRecentRepairJobs(),
+    prisma.importItem.count({ where: { status: "import_failed" } }),
+    prisma.symlink.count({ where: { status: "broken" } })
   ]);
 
   const latestRepairByDownload = new Map<string, (typeof repairJobs)[number]>();
@@ -77,6 +80,7 @@ export async function getImportHealthChecks() {
   });
 
   const checkedItems = scheduleItems.filter((item) => item.lastCheckAt);
+  const runningChecks = scheduleItems.filter((item) => item.status === "running").length;
   const totalChecked = checkedItems.length;
   const healthyCount = checkedItems.filter((item) => item.health === "healthy").length;
   const repairedCount = checkedItems.filter((item) => item.health === "repaired").length;
@@ -98,7 +102,11 @@ export async function getImportHealthChecks() {
       totalChecked,
       healthy: healthyCount,
       repaired: repairedCount,
-      deleted: deletedCount
+      deleted: deletedCount,
+      running: runningChecks,
+      pending: uncheckedCount,
+      failedImports: failedImportsCount,
+      brokenSymlinks: brokenSymlinksCount
     },
     uncheckedCount,
     schedule: scheduleItems.slice(0, 100),

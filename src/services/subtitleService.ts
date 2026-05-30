@@ -1,4 +1,4 @@
-import { mkdir, writeFile } from "node:fs/promises";
+import { mkdir, rm, writeFile } from "node:fs/promises";
 import { basename, dirname } from "node:path";
 import type { FastifyBaseLogger } from "fastify";
 import { prisma } from "../repositories/db/prisma.js";
@@ -12,6 +12,7 @@ import { runSubtitleDownloadMachine, type SubtitleLookup } from "../state-machin
 import { invalidateSubtitleLanguageCache, updateSubtitleLanguageCache } from "../services/media-library/subtitleLanguageCache.js";
 import { LocalTtlCache } from "../services/cache/localTtlCache.js";
 import { hydrateLegacyMediaFields } from "../services/media-library/normalizedMedia.js";
+import { subtitleLanguagesForItem } from "../services/media-library/libraryQueries.js";
 import {
   bestProviderCandidatesPerLanguage,
   bestSubtitlesPerLanguage,
@@ -292,4 +293,54 @@ export async function writeSubtitleFromText(mediaPath: string, language: string,
   invalidateSubtitleLanguageCache(mediaPath);
   updateSubtitleLanguageCache(mediaPath, [language]);
   return targetPath;
+}
+
+function lookupFromLibraryItem(item: Awaited<ReturnType<typeof prisma.mediaLibraryItem.findUniqueOrThrow>>): SubtitleLookup {
+  const hydrated = hydrateLegacyMediaFields(item);
+  return {
+    mediaType: hydrated.mediaType === "tv" ? "tv" : "movie",
+    title: hydrated.title,
+    year: hydrated.year,
+    tmdbId: hydrated.tmdbId,
+    tvdbId: hydrated.tvdbId,
+    imdbId: hydrated.imdbId,
+    season: hydrated.season,
+    episode: hydrated.episode
+  };
+}
+
+async function getSubtitleLibraryItem(id: string) {
+  return prisma.mediaLibraryItem.findUniqueOrThrow({
+    where: { id },
+    include: SUBTITLE_LIBRARY_RELATION_SELECT
+  });
+}
+
+export async function deleteLibraryItemSubtitle(id: string, language: string) {
+  const item = await getSubtitleLibraryItem(id);
+  const mediaPath = item.symlinkPath ?? item.strmPath ?? item.filePath;
+  if (!mediaPath) throw new Error("library item has no media path");
+  const normalized = language.trim().toUpperCase();
+  if (!normalized) throw new Error("language is required");
+  await rm(sidecarPathFor(mediaPath, normalized), { force: true });
+  invalidateSubtitleLanguageCache(mediaPath);
+  return {
+    deleted: true,
+    subtitleLanguages: await subtitleLanguagesForItem(item).catch(() => [])
+  };
+}
+
+export async function refreshLibraryItemSubtitle(id: string, language?: string) {
+  const item = await getSubtitleLibraryItem(id);
+  const mediaPath = item.symlinkPath ?? item.strmPath ?? item.filePath;
+  if (!mediaPath) throw new Error("library item has no media path");
+  if (language?.trim()) {
+    await rm(sidecarPathFor(mediaPath, language.trim().toUpperCase()), { force: true });
+  }
+  invalidateSubtitleLanguageCache(mediaPath);
+  const result = await ensureSubtitlesForMediaPath(mediaPath, lookupFromLibraryItem(item));
+  return {
+    ...result,
+    subtitleLanguages: await subtitleLanguagesForItem(item).catch(() => [])
+  };
 }

@@ -21,14 +21,6 @@ import { listLibraryItems } from "./libraryQueries.js";
 
 let refreshPromise: Promise<{ refreshed: number; items: Awaited<ReturnType<typeof listLibraryItems>> }> | null = null;
 let refreshQueued = false;
-let lastRefreshCompletedAt = 0;
-let lastRefreshResult: { refreshed: number; items: Awaited<ReturnType<typeof listLibraryItems>> } | null = null;
-const REFRESH_THROTTLE_MS = 10_000;
-const BACKGROUND_REFRESH_DEBOUNCE_MS = 1_500;
-let scheduledRefreshTimer: NodeJS.Timeout | null = null;
-let scheduledRefreshPromise: Promise<{ refreshed: number; items: Awaited<ReturnType<typeof listLibraryItems>> }> | null = null;
-let scheduledRefreshResolve: ((value: { refreshed: number; items: Awaited<ReturnType<typeof listLibraryItems>> }) => void) | null = null;
-let scheduledRefreshReject: ((reason?: unknown) => void) | null = null;
 
 async function dedupeLibraryItems() {
   const items = await prisma.mediaLibraryItem.findMany({
@@ -102,9 +94,8 @@ async function enrichLibraryItem(item: MediaLibraryItem, settings: Awaited<Retur
   });
   if (!metadata) return base;
 
-  await prisma.$transaction(async (tx) => {
-    if (base.movieId) {
-      await tx.movie.update({
+  if (base.movieId) {
+    await prisma.movie.update({
         where: { id: base.movieId },
         data: {
           tmdbId: metadata.tmdbId ?? base.tmdbId ?? undefined,
@@ -116,11 +107,14 @@ async function enrichLibraryItem(item: MediaLibraryItem, settings: Awaited<Retur
           backdropPath: normalizeTmdbImagePath(metadata.backdropUrl) ?? undefined,
           overview: metadata.overview ?? undefined
         }
-      }).catch(() => undefined);
-      return;
-    }
-    if (base.tvShowId) {
-      await tx.tvShow.update({
+    }).catch(() => undefined);
+    return (await prisma.mediaLibraryItem.findUnique({
+      where: { id: item.id },
+      select: LIBRARY_LIST_SELECT
+    }).then((value) => value ? hydrateLegacyMediaFields(value) : null)) ?? base;
+  }
+  if (base.tvShowId) {
+    await prisma.tvShow.update({
         where: { id: base.tvShowId },
         data: {
           tmdbId: metadata.tmdbId ?? base.tmdbId ?? undefined,
@@ -132,10 +126,10 @@ async function enrichLibraryItem(item: MediaLibraryItem, settings: Awaited<Retur
           backdropPath: normalizeTmdbImagePath(metadata.backdropUrl) ?? undefined,
           overview: metadata.overview ?? undefined
         }
-      }).catch(() => undefined);
-    }
-    if (base.seasonId) {
-      await tx.tvSeason.update({
+    }).catch(() => undefined);
+  }
+  if (base.seasonId) {
+    await prisma.tvSeason.update({
         where: { id: base.seasonId },
         data: {
           title: current?.seasonTarget?.title ?? undefined,
@@ -143,10 +137,10 @@ async function enrichLibraryItem(item: MediaLibraryItem, settings: Awaited<Retur
           airDate: current?.seasonTarget?.airDate ?? undefined,
           posterPath: normalizeTmdbImagePath(metadata.posterUrl) ?? current?.seasonTarget?.posterPath ?? undefined
         }
-      }).catch(() => undefined);
-    }
-    if (base.episodeId) {
-      await tx.tvEpisode.update({
+    }).catch(() => undefined);
+  }
+  if (base.episodeId) {
+    await prisma.tvEpisode.update({
         where: { id: base.episodeId },
         data: {
           tmdbId: metadata.tmdbId ?? base.tmdbId ?? undefined,
@@ -157,9 +151,8 @@ async function enrichLibraryItem(item: MediaLibraryItem, settings: Awaited<Retur
           airDate: metadata.episodeAirDate ?? current?.episodeTarget?.airDate ?? undefined,
           stillPath: normalizeTmdbImagePath(metadata.backdropUrl) ?? current?.episodeTarget?.stillPath ?? undefined
         }
-      }).catch(() => undefined);
-    }
-  }).catch(() => undefined);
+    }).catch(() => undefined);
+  }
 
   return (await prisma.mediaLibraryItem.findUnique({
     where: { id: item.id },
@@ -713,19 +706,12 @@ export async function refreshMediaLibrary(options?: { includeItems?: boolean }) 
     return refreshPromise;
   }
 
-  const includeItems = options?.includeItems ?? false;
-  if (!includeItems && lastRefreshResult && Date.now() - lastRefreshCompletedAt < REFRESH_THROTTLE_MS) {
-    return lastRefreshResult;
-  }
-
   refreshPromise = (async () => {
     let result = await runLibraryRefreshCycle(options);
     while (refreshQueued) {
       refreshQueued = false;
       result = await runLibraryRefreshCycle(options);
     }
-    lastRefreshCompletedAt = Date.now();
-    lastRefreshResult = result;
     return result;
   })().finally(() => {
     refreshPromise = null;
@@ -746,26 +732,6 @@ export function refreshLibraryImportRows(importIds: string[], options?: { includ
   return runTargetedLibraryRefresh({ importIds, includeItems: options?.includeItems });
 }
 
-export function requestMediaLibraryRefresh(delayMs = BACKGROUND_REFRESH_DEBOUNCE_MS) {
-  if (!scheduledRefreshPromise) {
-    scheduledRefreshPromise = new Promise((resolve, reject) => {
-      scheduledRefreshResolve = resolve;
-      scheduledRefreshReject = reject;
-    });
-  }
-
-  if (scheduledRefreshTimer) clearTimeout(scheduledRefreshTimer);
-  scheduledRefreshTimer = setTimeout(() => {
-    scheduledRefreshTimer = null;
-    void refreshMediaLibrary()
-      .then((result) => scheduledRefreshResolve?.(result))
-      .catch((error) => scheduledRefreshReject?.(error))
-      .finally(() => {
-        scheduledRefreshPromise = null;
-        scheduledRefreshResolve = null;
-        scheduledRefreshReject = null;
-      });
-  }, Math.max(0, delayMs));
-
-  return scheduledRefreshPromise;
+export function requestMediaLibraryRefresh() {
+  return refreshMediaLibrary();
 }

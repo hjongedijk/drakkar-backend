@@ -13,6 +13,35 @@ const colors = {
   dim: "\x1b[2m"
 };
 
+const fieldColors = {
+  key: "\x1b[36m",
+  value: "\x1b[37m"
+};
+
+const compactKeys = new Set([
+  "reqId",
+  "method",
+  "path",
+  "statusCode",
+  "ms",
+  "downloadId",
+  "requestId",
+  "title",
+  "status",
+  "streams",
+  "ioAvg10",
+  "recovered",
+  "retried",
+  "queueSeedTarget",
+  "pendingQueueItems",
+  "recoveryBatchLimit",
+  "activeStreamCount",
+  "mediaPropfindCount",
+  "propfindCount",
+  "error",
+  "err.message"
+]);
+
 const levelOrder: Record<string, number> = {
   trace: 10,
   debug: 20,
@@ -31,10 +60,19 @@ function cleanLine(value: unknown) {
 function formatPrimitive(value: unknown): string {
   if (value instanceof Error) return cleanLine(value.message);
   if (Array.isArray(value)) return value.map((entry) => formatPrimitive(entry)).filter(Boolean).join(",");
-  if (typeof value === "string") return cleanLine(value);
+  if (typeof value === "string") {
+    const cleaned = cleanLine(value);
+    if (cleaned.length > 180) return `${cleaned.slice(0, 177)}...`;
+    return cleaned;
+  }
   if (typeof value === "number" || typeof value === "boolean") return String(value);
   if (value === null || value === undefined) return "";
   return cleanLine(JSON.stringify(value));
+}
+
+function basenameLike(value: string) {
+  const normalized = value.replace(/\\/g, "/");
+  return normalized.includes("/") ? normalized.split("/").filter(Boolean).pop() ?? value : value;
 }
 
 function flattenFields(value: LogValue, prefix = ""): string[] {
@@ -45,11 +83,13 @@ function flattenFields(value: LogValue, prefix = ""): string[] {
     if (raw === undefined || typeof raw === "function") continue;
     const name = prefix ? `${prefix}.${key}` : key;
     if (raw instanceof Error) {
+      if (compactKeys.size > 0 && prefix === "" && !compactKeys.has(name)) continue;
       fields.push(`${name}="${formatPrimitive(raw)}"`);
     } else if (raw && typeof raw === "object" && !Array.isArray(raw) && !(raw instanceof Date)) {
       fields.push(...flattenFields(raw as Record<string, unknown>, name));
     } else {
-      const formatted = formatPrimitive(raw);
+      if (compactKeys.size > 0 && !compactKeys.has(name)) continue;
+      const formatted = name.toLowerCase().includes("path") ? basenameLike(formatPrimitive(raw)) : formatPrimitive(raw);
       if (formatted) fields.push(`${name}="${formatted}"`);
     }
   }
@@ -79,8 +119,14 @@ export function buildLineLogger(minLevel = "info", bindings: Record<string, unkn
     const bindingFields = flattenFields(bindings);
     const time = new Date().toISOString();
     const color = colors[level as keyof typeof colors] ?? "";
-    const suffix = [...bindingFields, ...fields].join(" ");
-    const line = `${colors.dim}${time}${colors.reset} ${color}${level.toUpperCase().padEnd(5)}${colors.reset} ${message}${suffix ? ` ${colors.dim}${suffix}${colors.reset}` : ""}`;
+    const suffix = [...bindingFields, ...fields]
+      .map((field) => {
+        const [key, ...rest] = field.split("=");
+        return `${fieldColors.key}${key}${colors.reset}=${fieldColors.value}${rest.join("=")}${colors.reset}`;
+      })
+      .join(" ");
+    const shortTime = time.slice(11, 19);
+    const line = `${colors.dim}${shortTime}${colors.reset} ${color}${level.toUpperCase().padEnd(5)}${colors.reset} ${message}${suffix ? ` ${suffix}` : ""}`;
     process[level === "error" || level === "fatal" ? "stderr" : "stdout"].write(`${line}\n`);
   };
 

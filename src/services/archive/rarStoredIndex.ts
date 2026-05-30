@@ -270,13 +270,19 @@ async function persistArchiveEntries(documentId: string, entries: ArchiveVirtual
   });
 }
 
-async function fetchArticleSlice(articleId: string, startOffset: number, length: number, servers: UsenetServer[], signal?: AbortSignal) {
+async function fetchArticleBody(articleId: string, servers: UsenetServer[], signal?: AbortSignal) {
   const errors: string[] = [];
   for (const server of servers) {
     const client = new NntpClient(server);
     try {
       await client.connect(signal);
-      return await client.bodySlice(articleId, startOffset, length, decodeYencBufferLine, signal);
+      const chunks: Buffer[] = [];
+      let total = 0;
+      for await (const chunk of client.decodedBodyBufferChunks(articleId, decodeYencBufferLine, signal)) {
+        chunks.push(chunk);
+        total += chunk.length;
+      }
+      return Buffer.concat(chunks, total);
     } catch (error) {
       errors.push(`${server.name}: ${error instanceof Error ? error.message : "unknown error"}`);
     } finally {
@@ -287,7 +293,7 @@ async function fetchArticleSlice(articleId: string, startOffset: number, length:
 }
 
 async function readDecodedRange(file: NzbFileWithSegments, start: number, length: number, servers: UsenetServer[], signal?: AbortSignal) {
-  const decoded = await buildDecodedYencSegments(file, servers, signal, { mode: "fast" });
+  const decoded = await buildDecodedYencSegments(file, servers, signal, { mode: "exact" });
   const segments = decoded?.segments ?? file.segments.map((segment, index) => {
     const bytes = Math.floor(segment.bytes);
     const segmentStart = file.segments.slice(0, index).reduce((sum, item) => sum + Math.floor(item.bytes), 0);
@@ -302,7 +308,9 @@ async function readDecodedRange(file: NzbFileWithSegments, start: number, length
     const sliceStart = Math.max(start, item.start);
     const take = Math.min(start + length - sliceStart, item.end - sliceStart + 1);
     if (take <= 0) continue;
-    const chunk = await fetchArticleSlice(item.segment.articleId, sliceStart - item.start, take, servers, signal);
+    const decoded = await fetchArticleBody(item.segment.articleId, servers, signal);
+    const segmentOffset = sliceStart - item.start;
+    const chunk = decoded.subarray(segmentOffset, segmentOffset + take);
     chunks.push(chunk);
     total += chunk.length;
     if (total >= length) break;
@@ -312,7 +320,7 @@ async function readDecodedRange(file: NzbFileWithSegments, start: number, length
 }
 
 async function buildVirtualSegments(file: NzbFileWithSegments, dataStart: number, byteCount: number, entryStart: number, servers: UsenetServer[]) {
-  const decoded = await buildDecodedYencSegments(file, servers, undefined, { mode: "fast" });
+  const decoded = await buildDecodedYencSegments(file, servers, undefined, { mode: "exact" });
   const segments = decoded?.segments ?? file.segments.map((segment, index) => {
     const bytes = Math.floor(segment.bytes);
     const segmentStart = file.segments.slice(0, index).reduce((sum, item) => sum + Math.floor(item.bytes), 0);

@@ -1,4 +1,4 @@
-import { access, mkdir, realpath } from "node:fs/promises";
+import { access, lstat, mkdir, readdir, realpath, rmdir, symlink } from "node:fs/promises";
 import { constants } from "node:fs";
 import { execFile } from "node:child_process";
 import { promisify } from "node:util";
@@ -27,6 +27,31 @@ async function unmountStaleFuse(mountPath: string, logger: FastifyBaseLogger) {
   }
 }
 
+async function ensureLegacyMountAlias(logger: FastifyBaseLogger) {
+  if (env.FUSE_MOUNT_ENABLED || env.FUSE_MOUNT_PATH === "/mnt/fuse") return;
+  const legacyPath = "/mnt/fuse";
+  try {
+    const existing = await lstat(legacyPath).catch(() => null);
+    if (!existing) {
+      await symlink(env.FUSE_MOUNT_PATH, legacyPath);
+      logger.info({ legacyPath, targetPath: env.FUSE_MOUNT_PATH }, "legacy mount alias ready");
+      return;
+    }
+    if (existing.isSymbolicLink()) return;
+    if (existing.isDirectory()) {
+      const entries = await readdir(legacyPath).catch(() => ["busy"]);
+      if (entries.length === 0) {
+        await rmdir(legacyPath);
+        await symlink(env.FUSE_MOUNT_PATH, legacyPath);
+        logger.info({ legacyPath, targetPath: env.FUSE_MOUNT_PATH }, "legacy mount alias ready");
+      }
+      return;
+    }
+  } catch (error) {
+    logger.debug({ err: error, legacyPath, targetPath: env.FUSE_MOUNT_PATH }, "legacy mount alias skipped");
+  }
+}
+
 export async function validateRequiredFolders(logger: FastifyBaseLogger): Promise<string[]> {
   const resolvedPaths: string[] = [];
 
@@ -47,6 +72,7 @@ export async function validateRequiredFolders(logger: FastifyBaseLogger): Promis
     resolvedPaths.push(await realpath(directory));
   }
 
-  logger.info({ directories: resolvedPaths }, "required folders are ready");
+  await ensureLegacyMountAlias(logger);
+  logger.info({ count: resolvedPaths.length }, "required folders are ready");
   return resolvedPaths;
 }

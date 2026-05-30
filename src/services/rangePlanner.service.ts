@@ -81,7 +81,7 @@ export async function planMountedFileRange(path: string, range?: string): Promis
     where: { enabled: true },
     orderBy: [{ isBackup: "asc" }, { priority: "asc" }]
   });
-  const decoded = await buildDecodedYencSegments(file, providers, undefined, { mode: "fast" });
+  const decoded = await buildDecodedYencSegments(file, providers, undefined, { mode: "exact" });
   const size = Math.max(0, Math.floor(decoded?.size ?? file.size));
   const { start, end } = normalizeRange(range, size);
   const ranges: PlannedArticleRange[] = [];

@@ -44,7 +44,7 @@ export async function getSetupStatus() {
       tvdbApiKey: settings.tvdbApiKey ?? "",
       plexServerUrl: settings.plexServerUrl ?? "",
       plexToken: settings.plexToken ?? "",
-      plexLibraryPath: settings.plexLibraryPath ?? "/mnt/media",
+      plexLibraryPath: settings.plexLibraryPath ?? "/mnt/drakkar/media",
       plexSectionId: settings.plexSectionId ?? "",
       usenet: firstUsenet ? {
         name: firstUsenet.name,

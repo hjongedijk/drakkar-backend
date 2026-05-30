@@ -6,16 +6,15 @@ import { redis } from "../repositories/db/redis.js";
 import { pipelineQueues } from "../workers/queues/downloadQueue.js";
 import { migrateImportsToCurrentNaming } from "../services/importService.js";
 import { validateRequiredFolders } from "../services/utils/folders.js";
-import { startRequestSyncSchedule, stopRequestSyncSchedule } from "../services/requests/sync/scheduler.js";
+import { runImportReconcileCycle, startRequestSyncSchedule, stopRequestSyncSchedule } from "../services/requests/sync/scheduler.js";
 import {
-  reconcileAvailableDownloadsWithoutImports,
   reconcileDownloadQueueState,
   recoverStaleActiveDownloadJobs,
   recoverInterruptedDownloads,
   startDownloadWorkers,
   stopDownloadWorkers
 } from "../workers/usenetWorkers.js";
-import { primeMountedStreamPool } from "../services/mountedStream.service.js";
+import { primeMountedStreamPool, reconcileStreamCacheDirectory } from "../services/mountedStream.service.js";
 import { startFuseMount, stopFuseMount } from "../services/fuseMountService.js";
 import { startBackgroundRepairSchedule, stopBackgroundRepairSchedule } from "../services/repairService.js";
 import { bootstrapDevelopmentTestConnectionData } from "../services/dev/testConnectionData.js";
@@ -32,8 +31,6 @@ import {
 } from "../workers/tasks/coreTasks.js";
 import { runTrackedTask } from "../workers/tasks/taskRegistry.js";
 
-const STARTUP_PLEX_REFRESH_DELAY_MS = 120_000;
-const STARTUP_CALENDAR_PREWARM_DELAY_MS = 45_000;
 const STARTUP_NAMING_MIGRATION_COOLDOWN_MS = 12 * 60 * 60 * 1000;
 const STARTUP_NAMING_MIGRATION_STAMP = `${env.CONFIG_DIR}/startup-naming-migration.json`;
 
@@ -72,21 +69,18 @@ async function markStartupNamingMigrationCompleted() {
   );
 }
 
-function scheduleDeferredStartupPlexRefresh(app: FastifyInstance, paths: string[]) {
+function refreshStartupPlexPaths(app: FastifyInstance, paths: string[]) {
   if (paths.length === 0) return;
-  app.log.info({ changedPaths: paths.length, delayMs: STARTUP_PLEX_REFRESH_DELAY_MS }, "startup plex refresh scheduled");
-  setTimeout(() => {
-    void (async () => {
-      for (const path of paths) {
-        try {
-          const result = await refreshPlexPath(path);
-          if (!result.skipped) app.log.info({ result }, "startup plex refresh triggered");
-        } catch (error) {
-          app.log.warn({ err: error, path }, "startup plex refresh failed");
-        }
+  void (async () => {
+    for (const path of paths) {
+      try {
+        const result = await refreshPlexPath(path);
+        if (!result.skipped) app.log.info({ result }, "startup plex refresh triggered");
+      } catch (error) {
+        app.log.warn({ err: error, path }, "startup plex refresh failed");
       }
-    })();
-  }, STARTUP_PLEX_REFRESH_DELAY_MS);
+    }
+  })();
 }
 
 function monthKeyFromOffset(offset: number) {
@@ -95,27 +89,27 @@ function monthKeyFromOffset(offset: number) {
   return `${target.getUTCFullYear()}-${String(target.getUTCMonth() + 1).padStart(2, "0")}`;
 }
 
-function scheduleCalendarPrewarm(app: FastifyInstance) {
+function prewarmCalendar(app: FastifyInstance) {
   const months = [monthKeyFromOffset(0), monthKeyFromOffset(1)];
-  app.log.info({ months, delayMs: STARTUP_CALENDAR_PREWARM_DELAY_MS }, "calendar prewarm scheduled");
-  setTimeout(() => {
-    void (async () => {
-      for (const month of months) {
-        try {
-          const startedAt = Date.now();
-          await fetchReleaseCalendar(month, { compact: false });
-          app.log.info({ month, durationMs: Date.now() - startedAt }, "calendar prewarm completed");
-        } catch (error) {
-          app.log.warn({ err: error, month }, "calendar prewarm failed");
-        }
+  void (async () => {
+    for (const month of months) {
+      try {
+        const startedAt = Date.now();
+        await fetchReleaseCalendar(month, { compact: false });
+        app.log.info({ month, durationMs: Date.now() - startedAt }, "calendar prewarm completed");
+      } catch (error) {
+        app.log.warn({ err: error, month }, "calendar prewarm failed");
       }
-    })();
-  }, STARTUP_CALENDAR_PREWARM_DELAY_MS);
+    }
+  })();
 }
 
 async function runStartupRecovery(app: FastifyInstance) {
   const startupPlexRefreshPaths = new Set<string>();
-  const runStartupNamingMigration = await shouldRunStartupNamingMigration();
+  const streamCacheState = await reconcileStreamCacheDirectory();
+  app.log.info({ streamCacheState }, "stream cache directory reconciled");
+  const runStartupNamingMigrationByCooldown = await shouldRunStartupNamingMigration();
+  const runStartupNamingMigration = false;
   const namingMigration = runStartupNamingMigration
     ? await runTrackedTask(
         NAMING_MIGRATION_TASK_ID,
@@ -137,7 +131,10 @@ async function runStartupRecovery(app: FastifyInstance) {
       app.log.warn({ err: error }, "failed to persist startup naming migration stamp");
     });
   } else {
-    app.log.info({ cooldownHours: STARTUP_NAMING_MIGRATION_COOLDOWN_MS / 3_600_000 }, "startup naming migration skipped due to recent successful run");
+    app.log.info({
+      cooldownHours: STARTUP_NAMING_MIGRATION_COOLDOWN_MS / 3_600_000,
+      shouldRun: runStartupNamingMigrationByCooldown
+    }, "startup naming migration skipped");
   }
   await pruneLibraryDirectories().catch(() => undefined);
   if (env.STARTUP_RECOVERY_ENABLED) {
@@ -145,7 +142,12 @@ async function runStartupRecovery(app: FastifyInstance) {
     await runTrackedTask(QUEUE_RECONCILE_TASK_ID, () => reconcileDownloadQueueState(app.log));
     if (env.DOWNLOAD_WORKERS_ENABLED) startDownloadWorkers(app.log);
     else app.log.warn("download workers disabled by config");
-    await runTrackedTask(IMPORT_RECONCILE_TASK_ID, () => reconcileAvailableDownloadsWithoutImports(app.log));
+    const importReconcile = await runImportReconcileCycle(app.log);
+    if (importReconcile?.started === false && importReconcile.reason === "playback_active") {
+      app.log.info(importReconcile, "startup import reconcile deferred because playback is active");
+    } else if (importReconcile?.started === false && importReconcile.reason === "conflicting_task_running") {
+      app.log.info(importReconcile, "startup import reconcile skipped because conflicting task is active");
+    }
     await runTrackedTask(INTERRUPTED_RECOVERY_TASK_ID, () => recoverInterruptedDownloads(app.log));
   } else {
     app.log.warn("startup recovery disabled by config");
@@ -179,7 +181,10 @@ const serverLifecycleMachine = setup({
     validateFolders: fromPromise(async ({ input }: { input: { app: FastifyInstance } }) => validateRequiredFolders(input.app.log)),
     bootstrapRuntimeConfig: fromPromise(async ({ input }: { input: { app: FastifyInstance } }) => bootstrapRuntimeConfiguredServices(input.app.log)),
     bootstrapDevData: fromPromise(async ({ input }: { input: { app: FastifyInstance } }) => bootstrapDevelopmentTestConnectionData(input.app.log)),
-    mountFuse: fromPromise(async ({ input }: { input: { app: FastifyInstance } }) => startFuseMount(input.app.log)),
+    mountFuse: fromPromise(async ({ input }: { input: { app: FastifyInstance } }) => {
+      if (!env.FUSE_MOUNT_ENABLED) return { enabled: false, mounted: false, path: env.FUSE_MOUNT_PATH };
+      return startFuseMount(input.app.log);
+    }),
     listen: fromPromise(async ({ input }: { input: { app: FastifyInstance } }) => input.app.listen({ port: env.PORT, host: "0.0.0.0" })),
     startupRecovery: fromPromise(async ({ input }: { input: { app: FastifyInstance } }) => runStartupRecovery(input.app)),
     shutdownRuntime: fromPromise(async ({ input }: { input: { app: FastifyInstance; signal: string } }) => shutdownRuntime(input.app, input.signal))
@@ -203,8 +208,9 @@ const serverLifecycleMachine = setup({
       return { signal: event.signal };
     }),
     startRuntimeServices: ({ context }) => {
-      scheduleDeferredStartupPlexRefresh(context.app, context.startupPlexRefreshPaths);
-      scheduleCalendarPrewarm(context.app);
+      refreshStartupPlexPaths(context.app, context.startupPlexRefreshPaths);
+      if (env.CALENDAR_PREWARM_ENABLED) prewarmCalendar(context.app);
+      else context.app.log.warn("calendar prewarm disabled by config");
       if (env.STREAM_POOL_PRIME_ENABLED) {
         void primeMountedStreamPool().catch((error) => {
           context.app.log.debug({ err: error }, "mounted stream pool prewarm skipped");

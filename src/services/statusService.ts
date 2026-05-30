@@ -78,7 +78,7 @@ export async function getSystemStatus() {
       return { ok: results.length > 0 && results.every((result) => result.ok) };
     }, requestProviders.length > 0)
   ]);
-  const [bandwidth, fuse, storage, nzbhydraSearch] = await Promise.all([
+  const [bandwidth, vfsMount, storage, nzbhydraSearch] = await Promise.all([
     getBandwidthStatus(),
     Promise.resolve(getFuseMountStatus()),
     storageUsage(),
@@ -99,7 +99,7 @@ export async function getSystemStatus() {
     queues: counts,
     nzbhydraSearch,
     bandwidth,
-    fuse
+    vfsMount
   };
 }
 

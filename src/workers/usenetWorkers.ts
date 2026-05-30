@@ -1,16 +1,13 @@
 import { Worker, type Job } from "bullmq";
-import { rm, stat } from "node:fs/promises";
-import { join } from "node:path";
 import type { FastifyBaseLogger } from "fastify";
 import { redis } from "../repositories/db/redis.js";
 import { prisma, Prisma } from "../repositories/db/prisma.js";
-import { importCompletedPath, makeMountedDownloadAvailable, reconcileRequestStatusAfterImport } from "../services/importService.js";
+import { makeMountedDownloadAvailable, reconcileRequestStatusAfterImport } from "../services/importService.js";
 import type { DownloadJobData } from "../workers/queues/downloadQueue.js";
 import { getNzbImportMode } from "../services/usenet/downloadEngine.js";
 import { nzbDownloadQueue, queueDownloadJob } from "../workers/queues/downloadQueue.js";
 import { recoverFailedDownloadForRequest } from "../services/requests/recovery/releaseRecoveryService.js";
 import { humanizeDownloadError } from "../services/downloads/presentation.js";
-import { env } from "../services/config/env.js";
 import { classifyQueueDecisionKey, getPolicySettings, getQueueDecisionAction } from "../services/policyService.js";
 import { getFuseMountStatus } from "../services/fuseMountService.js";
 import { runDownloadJobMachine } from "../state-machines/downloadJobMachine.js";
@@ -130,27 +127,6 @@ async function handleQueueDecisionFailure(input: {
   return { action, decisionKey, recovered: false, recoveryQueued: true };
 }
 
-async function finalizeMaterializedImport(input: { downloadId: string; requestId?: string }) {
-  const sourcePath = join(env.VFS_DOWNLOADS_DIR, input.downloadId);
-  const imported = await importCompletedPath({
-    sourcePath,
-    downloadId: input.downloadId,
-    requestId: input.requestId
-  });
-  if (imported.length === 0) throw new Error("materialized download produced no importable media files");
-  await safeUpdateDownload(input.downloadId, {
-    status: "available",
-    progress: 100,
-    speedBytesSec: 0,
-    etaSeconds: 0,
-    error: null,
-    completedAt: new Date()
-  });
-  await reconcileRequestStatusAfterImport(input.requestId, input.downloadId);
-  await rm(sourcePath, { recursive: true, force: true }).catch(() => undefined);
-  return imported;
-}
-
 async function requeueForStreamingPriority(input: {
   current: NonNullable<Awaited<ReturnType<typeof prisma.download.findUnique>>>;
   job: Job<DownloadJobData>;
@@ -193,7 +169,6 @@ export function startDownloadWorkers(logger: FastifyBaseLogger) {
           activeDownloadJobs,
           streamBackoffRetryMs: STREAMING_BACKOFF_RETRY_MS,
           queueDecisionFailure: handleQueueDecisionFailure,
-          finalizeMaterializedImport,
           requeueForStreamingPriority,
           safeUpdateDownload
         });
@@ -346,7 +321,7 @@ export async function recoverStaleActiveDownloadJobs(logger: FastifyBaseLogger) 
 }
 
 export async function reconcileAvailableDownloadsWithoutImports(logger: FastifyBaseLogger) {
-  const fuseStatus = getFuseMountStatus();
+  const fuseStatus = await getFuseMountStatus();
   const candidates = await prisma.download.findMany({
     where: {
       status: { in: ["available", "completed", "prepared"] },
@@ -359,7 +334,6 @@ export async function reconcileAvailableDownloadsWithoutImports(logger: FastifyB
   });
 
   let mountedFixed = 0;
-  let materializedImported = 0;
   let requeued = 0;
   let failed = 0;
 
@@ -400,54 +374,43 @@ export async function reconcileAvailableDownloadsWithoutImports(logger: FastifyB
 
     try {
       const importMode = await getNzbImportMode(download.nzbDocumentId);
-      if (importMode === "mounted") {
-        if (env.FUSE_MOUNT_ENABLED && !fuseStatus.mounted) {
-          logger.warn({ downloadId: download.id, fusePath: fuseStatus.path, fuseError: fuseStatus.error }, "skipping mounted import reconcile because FUSE mount is unavailable");
-          continue;
-        }
-        await makeMountedDownloadAvailable({
-          downloadId: download.id,
-          requestId: linkedRequest?.id
-        });
-        await reconcileRequestStatusAfterImport(linkedRequest?.id, download.id);
-        mountedFixed += 1;
+      if (importMode !== "mounted") {
+        await safeUpdateDownload(download.id, {
+          status: "failed",
+          error: "NZB is not streamable from mounted VFS. Replacement search required.",
+          speedBytesSec: 0,
+          etaSeconds: null
+        }).catch(() => undefined);
+        logger.warn({ downloadId: download.id, importMode }, "available download rejected because mounted import is required");
+        failed += 1;
         continue;
       }
 
-      const sourcePath = join(env.VFS_DOWNLOADS_DIR, download.id);
-      const sourceStats = await stat(sourcePath).catch(() => null);
-      if (sourceStats) {
-        await finalizeMaterializedImport({
-          downloadId: download.id,
-          requestId: linkedRequest?.id
-        });
-        materializedImported += 1;
-        continue;
-      }
-
+      await makeMountedDownloadAvailable({
+        downloadId: download.id,
+        requestId: linkedRequest?.id
+      });
+      await reconcileRequestStatusAfterImport(linkedRequest?.id, download.id);
+      mountedFixed += 1;
+    } catch (error) {
+      const rawMessage = error instanceof Error ? error.message : "import reconcile failed";
+      const message = humanizeDownloadError(rawMessage) ?? rawMessage;
       const existingJob = await existingQueueJobForDownload(download);
-      const job = existingJob ?? await queueDownloadJob(
-        download,
-        "startup-materialized-recovery",
-        {
-          downloadId: download.id,
-          nzbDocumentId: download.nzbDocumentId,
-          title: download.title,
-          requestId: linkedRequest?.id
-        }
-      );
+      const job = existingJob ?? await queueDownloadJob(download, "startup-mounted-recovery", {
+        downloadId: download.id,
+        nzbDocumentId: download.nzbDocumentId,
+        title: download.title,
+        requestId: linkedRequest?.id
+      });
       await safeUpdateDownload(download.id, {
         status: "queued",
         jobId: String(job.id),
-        error: sourceStats ? null : "Recovering stale available download without imports",
+        error: "Recovering stale available mounted download without imports",
         speedBytesSec: 0,
         etaSeconds: null
-      });
+      }).catch(() => undefined);
       requeued += 1;
-    } catch (error) {
       failed += 1;
-      const rawMessage = error instanceof Error ? error.message : "import reconcile failed";
-      const message = humanizeDownloadError(rawMessage) ?? rawMessage;
       await handleQueueDecisionFailure({
         downloadId: download.id,
         requestId: linkedRequest?.id,
@@ -460,11 +423,11 @@ export async function reconcileAvailableDownloadsWithoutImports(logger: FastifyB
     }
   }
 
-  if (mountedFixed > 0 || materializedImported > 0 || requeued > 0 || failed > 0) {
-    logger.warn({ mountedFixed, materializedImported, requeued, failed }, "reconciled stale available downloads without imports");
+  if (mountedFixed > 0 || requeued > 0 || failed > 0) {
+    logger.warn({ mountedFixed, requeued, failed }, "reconciled stale available downloads without imports");
   }
 
-  return { scanned: candidates.length, mountedFixed, materializedImported, requeued, failed };
+  return { scanned: candidates.length, mountedFixed, requeued, failed };
 }
 
 export async function recoverInterruptedDownloads(logger: FastifyBaseLogger) {

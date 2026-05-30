@@ -1,18 +1,23 @@
 [Unit]
-Description=Prepare Drakkar shared bind mount and Valkey host tuning
+Description=Prepare Drakkar host mount points and Valkey host tuning
 After=local-fs.target
 Before=docker.service
 
 [Service]
 Type=oneshot
 ExecStartPre=/usr/bin/mkdir -p /mnt/drakkar
+ExecStartPre=/usr/bin/mkdir -p /mnt/drakkar/downloads
+ExecStartPre=/usr/bin/mkdir -p /mnt/drakkar/completed
+ExecStartPre=/usr/bin/mkdir -p /mnt/drakkar/completed-symlinks
+ExecStartPre=/usr/bin/mkdir -p /mnt/drakkar/nzb
+ExecStartPre=/usr/bin/mkdir -p /mnt/drakkar/.tmp
+ExecStartPre=/usr/bin/mkdir -p /mnt/drakkar/.failed
 ExecStartPre=/usr/bin/mkdir -p /mnt/drakkar/media/movies
 ExecStartPre=/usr/bin/mkdir -p /mnt/drakkar/media/tv
-ExecStartPre=/usr/bin/mkdir -p /mnt/drakkar/fuse
-ExecStartPre=/usr/bin/sh -c 'printf "%s\n" "vm.overcommit_memory = 1" > /etc/sysctl.d/99-valkey.conf'
+ExecStartPre=/usr/bin/mkdir -p /mnt/drakkar/vfs
+ExecStartPre=/usr/bin/sh -c 'echo "vm.overcommit_memory = 1" > /etc/sysctl.d/99-valkey.conf'
 ExecStartPre=/usr/sbin/sysctl -p /etc/sysctl.d/99-valkey.conf
-ExecStart=/usr/bin/mount --bind /mnt/drakkar /mnt/drakkar
-ExecStart=/usr/bin/mount --make-rshared /mnt/drakkar
+ExecStart=/usr/bin/true
 RemainAfterExit=yes
 
 [Install]

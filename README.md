@@ -16,7 +16,7 @@ Drakkar coordinates request sync, NZB search, download queueing, FUSE-mounted me
 
 ## Version
 
-Current backend version: `0.3.4`
+Current backend version: `0.3.5`
 
 ## Runtime layout
 
@@ -59,6 +59,8 @@ Valkey host tuning:
 echo "vm.overcommit_memory = 1" | sudo tee /etc/sysctl.d/99-valkey.conf
 sudo sysctl -p /etc/sysctl.d/99-valkey.conf
 ```
+
+Valkey is cache/session state for Drakkar. Keep `appendonly` off and `save ""` unless you intentionally want cache snapshots on disk.
 
 ## Development
 

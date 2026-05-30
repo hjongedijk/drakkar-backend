@@ -12,6 +12,7 @@ import {
   searchLibraryItemReplacements
 } from "../services/libraryService.js";
 import { reprocessImport } from "../services/importService.js";
+import { deleteLibraryItemSubtitle, refreshLibraryItemSubtitle } from "../services/subtitleService.js";
 
 function idParam(request: { params: unknown }) {
   return (request.params as { id: string }).id;
@@ -20,9 +21,13 @@ function idParam(request: { params: unknown }) {
 const replaceReleaseSchema = z.object({
   release: z.any()
 });
+const subtitleActionSchema = z.object({
+  language: z.string().trim().min(1).optional()
+});
 
 export async function libraryRoutes(app: FastifyInstance): Promise<void> {
   app.get("/api/library", async () => listLibraryItems());
+  app.get("/api/library/items", async () => listLibraryItems());
   app.get("/api/library/stats", async () => libraryStats());
   app.post("/api/library/refresh", async () => refreshMediaLibrary({ includeItems: true }));
   app.get("/api/library/:id", async (request) => getLibraryItem(idParam(request)));
@@ -38,4 +43,8 @@ export async function libraryRoutes(app: FastifyInstance): Promise<void> {
     if (!item.sourceKey.startsWith("import:")) throw new Error("library item is not an imported item");
     return reprocessImport(item.sourceKey.replace("import:", ""));
   });
+  app.post("/api/library/:id/subtitles/refresh", async (request) =>
+    refreshLibraryItemSubtitle(idParam(request), subtitleActionSchema.parse(request.body ?? {}).language));
+  app.delete("/api/library/:id/subtitles/:language", async (request) =>
+    deleteLibraryItemSubtitle(idParam(request), (request.params as { language: string }).language));
 }

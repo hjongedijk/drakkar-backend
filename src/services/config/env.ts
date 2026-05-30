@@ -1,4 +1,4 @@
-import { join } from "node:path";
+import { dirname, join } from "node:path";
 import { z } from "zod";
 import { ensureRuntimeSettings, getDrakkarApiToken } from "./runtimeSettings.js";
 
@@ -14,6 +14,7 @@ const envBoolean = z.preprocess((value) => {
 }, z.boolean());
 
 const envSchema = z.object({
+  APP_ROLE: z.literal("backend").default("backend"),
   NODE_ENV: z.enum(["development", "test", "production"]).default("development"),
   LOG_LEVEL: z.enum(["trace", "debug", "info", "warn", "error", "fatal", "silent"]).default("info"),
   PORT: z.coerce.number().int().positive().default(3000),
@@ -21,18 +22,21 @@ const envSchema = z.object({
   REDIS_URL: z.string().url().default(runtimeSettings.infrastructure.valkey.url),
   APP_BASE_URL: z.string().url().default("http://localhost:3000"),
   CONFIG_DIR: z.string().default("/data/config"),
-  VFS_ROOT: z.string().default("/mnt"),
-  VFS_DOWNLOADS_DIR: z.string().default("/mnt/downloads"),
-  VFS_COMPLETED_DIR: z.string().default("/mnt/completed"),
-  VFS_NZB_DIR: z.string().default("/mnt/nzb"),
-  VFS_TMP_DIR: z.string().default("/mnt/.tmp"),
-  VFS_FAILED_DIR: z.string().default("/mnt/.failed"),
-  MEDIA_SYMLINKS_DIR: z.string().default("/mnt/media"),
+  VFS_ROOT: z.string().default("/mnt/.drakkar-vfs-store"),
+  VFS_DOWNLOADS_DIR: z.string().default("/mnt/.drakkar-vfs-store/downloads"),
+  VFS_COMPLETED_DIR: z.string().default("/mnt/.drakkar-vfs-store/content"),
+  VFS_COMPLETED_SYMLINKS_DIR: z.string().default("/mnt/.drakkar-vfs-store/completed-symlinks"),
+  VFS_NZB_DIR: z.string().default("/mnt/.drakkar-vfs-store/nzbs"),
+  VFS_TMP_DIR: z.string().default("/mnt/.drakkar-vfs-store/.tmp"),
+  VFS_FAILED_DIR: z.string().default("/mnt/.drakkar-vfs-store/.failed"),
+  MEDIA_SYMLINKS_DIR: z.string().default("/mnt/drakkar/media"),
   MEDIA_MOVIES_DIR: z.string().optional(),
   MEDIA_TV_DIR: z.string().optional(),
   NZB_BACKUPS_DIR: z.string().default("/data/nzb-backup"),
+  STREAM_CACHE_DIR: z.string().default(join(dirname(process.env.CONFIG_DIR || "/data/config"), "rclone", "cache", "stream-cache")),
+  RCLONE_RC_URL: z.string().url().default("http://drakkar_rclone:5572"),
   FUSE_MOUNT_ENABLED: envBoolean.default(runtimeSettings.infrastructure.runtime.fuseMountEnabled),
-  FUSE_MOUNT_PATH: z.string().default("/mnt/fuse"),
+  FUSE_MOUNT_PATH: z.string().default("/mnt/drakkar/vfs"),
   FUSE_ALLOW_OTHER: envBoolean.default(true),
   FUSE_FORCE_MOUNT: envBoolean.default(true),
   FUSE_DEBUG: envBoolean.default(false),
@@ -42,7 +46,8 @@ const envSchema = z.object({
   BACKGROUND_REPAIR_ENABLED: envBoolean.default(runtimeSettings.infrastructure.runtime.backgroundRepairEnabled),
   STARTUP_RECOVERY_ENABLED: envBoolean.default(runtimeSettings.infrastructure.runtime.startupRecoveryEnabled),
   DOWNLOAD_WORKERS_ENABLED: envBoolean.default(runtimeSettings.infrastructure.runtime.downloadWorkersEnabled),
-  STREAM_POOL_PRIME_ENABLED: envBoolean.default(runtimeSettings.infrastructure.runtime.streamPoolPrimeEnabled)
+  STREAM_POOL_PRIME_ENABLED: envBoolean.default(runtimeSettings.infrastructure.runtime.streamPoolPrimeEnabled),
+  CALENDAR_PREWARM_ENABLED: envBoolean.default(runtimeSettings.infrastructure.runtime.calendarPrewarmEnabled)
 });
 
 const parsedEnv = envSchema.parse(process.env);
@@ -59,6 +64,7 @@ export const requiredDirectories = [
   env.VFS_ROOT,
   env.VFS_DOWNLOADS_DIR,
   env.VFS_COMPLETED_DIR,
+  env.VFS_COMPLETED_SYMLINKS_DIR,
   env.VFS_NZB_DIR,
   env.MEDIA_SYMLINKS_DIR,
   env.MEDIA_MOVIES_DIR,

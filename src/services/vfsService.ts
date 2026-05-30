@@ -1,6 +1,6 @@
 import { createReadStream } from "node:fs";
 import { mkdir, open, readdir, stat, lstat, readlink, rename, rm, writeFile, readFile } from "node:fs/promises";
-import { dirname, extname, join, normalize, relative } from "node:path";
+import { dirname, extname, join, normalize, relative, resolve } from "node:path";
 import { env } from "../services/config/env.js";
 import { redis } from "../repositories/db/redis.js";
 import { getIgnoredPatterns, matchesIgnoredPattern } from "../services/policyService.js";
@@ -17,13 +17,13 @@ export type VfsNodeType =
   | "streamable-file";
 
 const hiddenSystemFolders = new Set([".failed", ".tmp"]);
+const VFS_LIST_CACHE_TTL_SECONDS = 30;
+const VFS_STAT_CACHE_TTL_SECONDS = 30;
 
 const rootFolders = [
-  { name: "downloads", path: "/downloads", target: env.VFS_DOWNLOADS_DIR },
-  { name: "completed", path: "/completed", target: env.VFS_COMPLETED_DIR },
-  { name: "nzb", path: "/nzb", target: env.VFS_NZB_DIR },
-  { name: "media", path: "/media", target: null },
-  { name: "releases", path: "/mounted/releases", target: null }
+  { name: "content", path: "/content", target: env.VFS_COMPLETED_DIR },
+  { name: "completed-symlinks", path: "/completed-symlinks", target: env.VFS_COMPLETED_SYMLINKS_DIR },
+  { name: "nzbs", path: "/nzbs", target: env.VFS_NZB_DIR }
 ] as const;
 
 const mediaFolders = [
@@ -55,8 +55,9 @@ function virtualPhysicalRoot(input = "/") {
   const path = normalize(`/${input}`).replace(/\/+$/, "") || "/";
   const parts = path.split("/").filter(Boolean);
   if (parts[0] === "downloads") return { root: env.VFS_DOWNLOADS_DIR, subPath: parts.slice(1).join("/"), virtualRoot: "/downloads" };
-  if (parts[0] === "completed") return { root: env.VFS_COMPLETED_DIR, subPath: parts.slice(1).join("/"), virtualRoot: "/completed" };
-  if (parts[0] === "nzb") return { root: env.VFS_NZB_DIR, subPath: parts.slice(1).join("/"), virtualRoot: "/nzb" };
+  if (parts[0] === "content" || parts[0] === "completed") return { root: env.VFS_COMPLETED_DIR, subPath: parts.slice(1).join("/"), virtualRoot: "/content" };
+  if (parts[0] === "completed-symlinks") return { root: env.VFS_COMPLETED_SYMLINKS_DIR, subPath: parts.slice(1).join("/"), virtualRoot: "/completed-symlinks" };
+  if (parts[0] === "nzbs" || parts[0] === "nzb") return { root: env.VFS_NZB_DIR, subPath: parts.slice(1).join("/"), virtualRoot: "/nzbs" };
   if (parts[0] === "media") {
     const media = mediaFolders.find((folder) => folder.name === parts[1] || (folder.name === "tv" && parts[1] === "tv shows"));
     if (!media) return null;
@@ -73,8 +74,12 @@ function resolveVirtualPhysicalPath(input = "/") {
 
 async function mountedTargetForSymlink(resolved: string) {
   const linkTarget = await readlink(resolved).catch(() => null);
-  if (!linkTarget?.startsWith(env.FUSE_MOUNT_PATH)) return null;
-  return normalize(`/${linkTarget.slice(env.FUSE_MOUNT_PATH.length)}`).replace(/\/+$/, "") || "/";
+  if (!linkTarget) return null;
+  const physicalTarget = linkTarget.startsWith("/")
+    ? normalize(linkTarget)
+    : normalize(resolve(dirname(resolved), linkTarget));
+  if (!physicalTarget.startsWith(env.FUSE_MOUNT_PATH)) return null;
+  return normalize(`/${physicalTarget.slice(env.FUSE_MOUNT_PATH.length)}`).replace(/\/+$/, "") || "/";
 }
 
 function virtualFolderNode(name: string, path: string) {
@@ -107,14 +112,12 @@ function sortNodes<T extends { name: string; type: string }>(nodes: T[]) {
 export async function listVfs(path = "/", showHidden = false) {
   const normalizedPath = normalize(`/${path}`).replace(/\/+$/, "") || "/";
   const cacheKey = `vfs:list:${showHidden ? "hidden" : "visible"}:${normalizedPath}`;
-  if (!showHidden) {
-    const cached = await redis.get(cacheKey);
-    if (cached) return JSON.parse(cached);
-  }
+  const cached = await redis.get(cacheKey);
+  if (cached) return JSON.parse(cached);
 
   if (normalizedPath === "/") return rootFolders.map((folder) => virtualFolderNode(folder.name, folder.path));
   if (normalizedPath === "/media") return mediaFolders.map((folder) => virtualFolderNode(folder.name, folder.path));
-  if (normalizedPath === "/mounted") return [virtualFolderNode("releases", "/mounted/releases")];
+  if (normalizedPath === "/mounted") return [];
   if (normalizedPath === "/mounted/releases") return listMounts("/mounted/releases");
   if (normalizedPath.startsWith("/mounted/releases/")) return listMountedFiles(normalizedPath);
   if (isMountedPath(normalizedPath)) return listMountedFiles(normalizedPath);
@@ -150,7 +153,7 @@ export async function listVfs(path = "/", showHidden = false) {
       })
   );
   const sorted = sortNodes(nodes);
-  await redis.set(cacheKey, JSON.stringify(sorted), "EX", 30);
+  await redis.set(cacheKey, JSON.stringify(sorted), "EX", VFS_LIST_CACHE_TTL_SECONDS);
   return sorted;
 }
 
@@ -178,58 +181,80 @@ export async function treeVfs(path = "/", maxDepth = 4, showHidden = false): Pro
 
 export async function statVfs(path = "/") {
   const normalizedPath = normalize(`/${path}`).replace(/\/+$/, "") || "/";
+  const cacheKey = `vfs:stat:${normalizedPath}`;
+  const cached = await redis.get(cacheKey);
+  if (cached) return JSON.parse(cached) as { path: string; type: VfsNodeType; size: number; modifiedAt: string; isDirectory: boolean };
   if (normalizedPath === "/" || normalizedPath === "/mounted" || normalizedPath === "/media") {
-    return { path: normalizedPath, type: "folder", size: 0, modifiedAt: new Date().toISOString(), isDirectory: true };
+    const value = { path: normalizedPath, type: "folder" as const, size: 0, modifiedAt: new Date().toISOString(), isDirectory: true };
+    await redis.set(cacheKey, JSON.stringify(value), "EX", VFS_STAT_CACHE_TTL_SECONDS);
+    return value;
   }
-  if (normalizedPath === "/mounted/releases" || normalizedPath.startsWith("/mounted/releases/") || isMountedPath(normalizedPath)) return statMountedPath(normalizedPath);
+  if (normalizedPath === "/mounted/releases" || normalizedPath.startsWith("/mounted/releases/") || isMountedPath(normalizedPath)) {
+    const mounted = await statMountedPath(normalizedPath);
+    await redis.set(cacheKey, JSON.stringify(mounted), "EX", VFS_STAT_CACHE_TTL_SECONDS);
+    return mounted;
+  }
 
   const virtual = resolveVirtualPhysicalPath(normalizedPath);
   const resolved = virtual?.resolved ?? resolveVfsPath(normalizedPath);
   const linkStats = await lstat(resolved);
   if (linkStats.isSymbolicLink()) {
     const mountedTarget = await mountedTargetForSymlink(resolved);
-    if (mountedTarget) return statMountedPath(mountedTarget);
+    if (mountedTarget) {
+      const mounted = await statMountedPath(mountedTarget);
+      await redis.set(cacheKey, JSON.stringify(mounted), "EX", VFS_STAT_CACHE_TTL_SECONDS);
+      return mounted;
+    }
   }
   const stats = linkStats.isSymbolicLink() ? await stat(resolved) : linkStats;
-  return {
+  const value = {
     path: normalizedPath,
     type: nodeType(normalizedPath, stats.isDirectory(), linkStats.isSymbolicLink()),
     size: stats.size,
     modifiedAt: stats.mtime.toISOString(),
     isDirectory: stats.isDirectory()
   };
+  await redis.set(cacheKey, JSON.stringify(value), "EX", VFS_STAT_CACHE_TTL_SECONDS);
+  return value;
 }
 
-export async function streamVfsFile(path: string, range?: string) {
+export async function streamVfsFile(path: string, range?: string, signal?: AbortSignal) {
   const normalizedPath = normalize(`/${path}`).replace(/\/+$/, "") || "/";
+  const playbackPath = await resolveVfsPlaybackPath(normalizedPath).catch(() => null);
+  if (playbackPath) {
+    const playbackStats = await stat(playbackPath).catch(() => null);
+    if (playbackStats && !playbackStats.isDirectory()) {
+      if (!range) {
+        return { stream: createReadStream(playbackPath), start: 0, end: playbackStats.size - 1, size: playbackStats.size, partial: false };
+      }
+
+      const match = range.match(/bytes=(\d*)-(\d*)/);
+      const start = match?.[1] ? Number(match[1]) : 0;
+      const end = match?.[2] ? Number(match[2]) : playbackStats.size - 1;
+      return {
+        stream: createReadStream(playbackPath, { start, end }),
+        start,
+        end,
+        size: playbackStats.size,
+        partial: true
+      };
+    }
+  }
+
   if (normalizedPath === "/mounted/releases" || normalizedPath.startsWith("/mounted/releases/") || isMountedPath(normalizedPath)) {
-    return streamMountedFile(normalizedPath, range, { source: "http" });
+    return streamMountedFile(normalizedPath, range, { source: "http", signal });
   }
 
   const virtual = resolveVirtualPhysicalPath(normalizedPath);
   const resolved = virtual?.resolved ?? resolveVfsPath(normalizedPath);
   const linkStats = await lstat(resolved);
-  if (linkStats.isSymbolicLink()) {
-    const mountedTarget = await mountedTargetForSymlink(resolved);
-    if (mountedTarget) return streamMountedFile(mountedTarget, range, { source: "http" });
-  }
   const stats = linkStats.isSymbolicLink() ? await stat(resolved) : linkStats;
   if (stats.isDirectory()) throw new Error("cannot stream a directory");
-
-  if (!range) {
-    return { stream: createReadStream(resolved), start: 0, end: stats.size - 1, size: stats.size, partial: false };
-  }
-
+  if (!range) return { stream: createReadStream(resolved), start: 0, end: stats.size - 1, size: stats.size, partial: false };
   const match = range.match(/bytes=(\d*)-(\d*)/);
   const start = match?.[1] ? Number(match[1]) : 0;
   const end = match?.[2] ? Number(match[2]) : stats.size - 1;
-  return {
-    stream: createReadStream(resolved, { start, end }),
-    start,
-    end,
-    size: stats.size,
-    partial: true
-  };
+  return { stream: createReadStream(resolved, { start, end }), start, end, size: stats.size, partial: true };
 }
 
 export async function resolveVfsPlaybackPath(path: string) {
@@ -251,6 +276,19 @@ export async function resolveVfsPlaybackPath(path: string) {
 export async function readVfsBytes(path: string, start: number, length: number, sessionId?: string) {
   const normalizedPath = normalize(`/${path}`).replace(/\/+$/, "") || "/";
   if (length <= 0) return Buffer.alloc(0);
+  const playbackPath = await resolveVfsPlaybackPath(normalizedPath).catch(() => null);
+  if (playbackPath) {
+    const playbackHandle = await open(playbackPath, "r").catch(() => null);
+    if (playbackHandle) {
+      try {
+        const buffer = Buffer.alloc(length);
+        const result = await playbackHandle.read(buffer, 0, length, start);
+        return buffer.subarray(0, result.bytesRead);
+      } finally {
+        await playbackHandle.close();
+      }
+    }
+  }
   if (normalizedPath === "/mounted/releases" || normalizedPath.startsWith("/mounted/releases/") || isMountedPath(normalizedPath)) {
     const chunks: Buffer[] = [];
     let total = 0;
@@ -271,27 +309,6 @@ export async function readVfsBytes(path: string, start: number, length: number, 
 
   const virtual = resolveVirtualPhysicalPath(normalizedPath);
   const resolved = virtual?.resolved ?? resolveVfsPath(normalizedPath);
-  const linkStats = await lstat(resolved);
-  if (linkStats.isSymbolicLink()) {
-    const mountedTarget = await mountedTargetForSymlink(resolved);
-    if (mountedTarget) {
-      const chunks: Buffer[] = [];
-      let total = 0;
-      while (total < length) {
-        const chunk = await readMountedFileRange({
-          path: mountedTarget,
-          start: start + total,
-          length: length - total,
-          sessionId,
-          source: "fuse"
-        });
-        if (!chunk.length) break;
-        chunks.push(chunk);
-        total += chunk.length;
-      }
-      return chunks.length === 1 ? chunks[0]! : Buffer.concat(chunks, total);
-    }
-  }
   const handle = await open(resolved, "r");
   try {
     const buffer = Buffer.alloc(length);

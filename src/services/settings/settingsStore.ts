@@ -1,7 +1,7 @@
 import { z } from "zod";
 import { prisma } from "../../repositories/db/prisma.js";
 import { updateRuntimeSettings } from "../config/runtimeSettings.js";
-import { registerCoreTasks } from "../../workers/tasks/coreTasks.js";
+import { registerCoreTasks, REQUEST_RECOVERY_TASK_ID } from "../../workers/tasks/coreTasks.js";
 
 const DEFAULT_NZBHYDRA_CATEGORIES = ["2030", "2040", "2045", "2050", "2060", "5030", "5040", "5045", "5080"];
 
@@ -20,10 +20,10 @@ export const settingsSchema = z.object({
   metadataCacheTtlHours: z.number().int().positive().default(168),
   defaultMovieProfile: z.string().default("Movie Standard"),
   defaultTvProfile: z.string().default("TV Standard"),
-  monitorQueueSeedTarget: z.number().int().positive().default(50),
+  monitorQueueSeedTarget: z.number().int().positive().default(12),
   plexServerUrl: z.string().url().optional().or(z.literal("")),
   plexToken: z.string().optional(),
-  plexLibraryPath: z.string().default("/mnt/media"),
+  plexLibraryPath: z.string().default("/mnt/drakkar/media"),
   plexSectionId: z.string().optional(),
   plexClientIdentifier: z.string().default("drakkar"),
   subtitlesEnabled: z.boolean().default(false),
@@ -65,10 +65,10 @@ const DEFAULT_SETTINGS: AppSettings = {
   metadataCacheTtlHours: 168,
   defaultMovieProfile: "Movie Standard",
   defaultTvProfile: "TV Standard",
-  monitorQueueSeedTarget: 50,
+  monitorQueueSeedTarget: 12,
   plexServerUrl: "",
   plexToken: "",
-  plexLibraryPath: "/mnt/media",
+  plexLibraryPath: "/mnt/drakkar/media",
   plexSectionId: "",
   plexClientIdentifier: "drakkar",
   subtitlesEnabled: false,
@@ -102,23 +102,46 @@ export async function getSettings(): Promise<AppSettings> {
   const row = await prisma.setting.findUnique({ where: { key: SETTINGS_KEY } });
   const stored = row?.value as Partial<AppSettings> | undefined;
   const migratedBase = stored?.nzbhydraTimeoutMs === 15000 ? { ...stored, nzbhydraTimeoutMs: DEFAULT_SETTINGS.nzbhydraTimeoutMs } : stored;
-  const migratedProviders = migrateDefaultProfiles(migrateSubtitleProviders({ ...DEFAULT_SETTINGS, ...(migratedBase as object) }));
+  const migratedProviders = sanitizeTaskIntervals(migrateLegacyPaths(migrateDefaultProfiles(migrateSubtitleProviders({ ...DEFAULT_SETTINGS, ...(migratedBase as object) }))));
   const value = !row ? DEFAULT_SETTINGS : settingsSchema.parse(migratedProviders);
   cachedSettings = { value, expiresAt: Date.now() + SETTINGS_CACHE_MS };
   return value;
 }
 
+function migrateLegacyPaths(input: Partial<AppSettings>): Partial<AppSettings> {
+  return {
+    ...input,
+    plexLibraryPath: !input.plexLibraryPath || input.plexLibraryPath === "/mnt/media"
+      ? DEFAULT_SETTINGS.plexLibraryPath
+      : input.plexLibraryPath
+  };
+}
+
 function migrateDefaultProfiles(input: Partial<AppSettings>): Partial<AppSettings> {
   const movie = input.defaultMovieProfile ?? "";
   const tv = input.defaultTvProfile ?? "";
-  if (movie === "Anime" && tv === "Anime") {
-    return {
-      ...input,
-      defaultMovieProfile: DEFAULT_SETTINGS.defaultMovieProfile,
-      defaultTvProfile: DEFAULT_SETTINGS.defaultTvProfile
-    };
-  }
-  return input;
+  const normalizeMovieProfile = movie && ["Any", "Anime", "Remux Preferred", "WEB-DL Preferred", "Small Size"].includes(movie)
+    ? DEFAULT_SETTINGS.defaultMovieProfile
+    : movie;
+  const normalizeTvProfile = tv && ["Any", "Anime", "Remux Preferred", "WEB-DL Preferred", "Small Size"].includes(tv)
+    ? DEFAULT_SETTINGS.defaultTvProfile
+    : tv;
+  return {
+    ...input,
+    defaultMovieProfile: normalizeMovieProfile || DEFAULT_SETTINGS.defaultMovieProfile,
+    defaultTvProfile: normalizeTvProfile || DEFAULT_SETTINGS.defaultTvProfile
+  };
+}
+
+function sanitizeTaskIntervals(input: Partial<AppSettings>): Partial<AppSettings> {
+  const taskIntervals = { ...(input.taskIntervals ?? {}) };
+  // This task is the monitored-download engine. Blank UI values should mean
+  // "use default interval", not "disable monitoring".
+  if (taskIntervals[REQUEST_RECOVERY_TASK_ID] === null) delete taskIntervals[REQUEST_RECOVERY_TASK_ID];
+  return {
+    ...input,
+    taskIntervals
+  };
 }
 
 function migrateSubtitleProviders(input: Partial<AppSettings>): Partial<AppSettings> {
@@ -225,14 +248,14 @@ export async function syncRuntimeSettingsFromDatabase(settingsOverride?: AppSett
 }
 
 export async function updateSettings(input: unknown): Promise<AppSettings> {
-  const settings = settingsSchema.parse(migrateSubtitleProviders(input as Partial<AppSettings>));
+  const settings = settingsSchema.parse(sanitizeTaskIntervals(migrateSubtitleProviders(input as Partial<AppSettings>)));
   await prisma.setting.upsert({
     where: { key: SETTINGS_KEY },
     update: { value: settings },
     create: { key: SETTINGS_KEY, value: settings }
   });
   cachedSettings = { value: settings, expiresAt: Date.now() + SETTINGS_CACHE_MS };
-  registerCoreTasks();
+  registerCoreTasks(settings);
   await syncRuntimeSettingsFromDatabase(settings);
   return settings;
 }

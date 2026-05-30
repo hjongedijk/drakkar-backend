@@ -7,16 +7,16 @@ import { z } from "zod";
 const runtimeSettingsSchema = z.object({
   drakkarApiToken: z.string().min(16),
   apiBaseUrl: z.string().default(""),
-  backendUrl: z.string().default("http://backend:3000"),
+  backendUrl: z.string().default("http://drakkar_backend:3000"),
   infrastructure: z.object({
     postgres: z.object({
       user: z.string().default("postgres"),
       password: z.string().default("postgres"),
       database: z.string().default("drakkar"),
-      url: z.string().default("postgresql://postgres:postgres@postgres:5432/drakkar")
+      url: z.string().default("postgresql://postgres:postgres@drakkar_postgres:5432/drakkar")
     }).default({}),
     valkey: z.object({
-      url: z.string().default("redis://valkey:6379")
+      url: z.string().default("redis://drakkar_valkey:6379")
     }).default({}),
     ports: z.object({
       frontend: z.number().int().positive().default(8080),
@@ -24,12 +24,13 @@ const runtimeSettingsSchema = z.object({
       valkeyInsight: z.number().int().positive().default(5540)
     }).default({}),
     runtime: z.object({
-      fuseMountEnabled: z.boolean().default(true),
+      fuseMountEnabled: z.boolean().default(false),
       requestSyncEnabled: z.boolean().default(true),
-      backgroundRepairEnabled: z.boolean().default(true),
+      backgroundRepairEnabled: z.boolean().default(false),
       startupRecoveryEnabled: z.boolean().default(true),
       downloadWorkersEnabled: z.boolean().default(true),
-      streamPoolPrimeEnabled: z.boolean().default(true)
+      streamPoolPrimeEnabled: z.boolean().default(false),
+      calendarPrewarmEnabled: z.boolean().default(false)
     }).default({})
   }).default({}),
   nzbhydra: z.object({
@@ -46,7 +47,7 @@ const runtimeSettingsSchema = z.object({
     enabled: z.boolean().default(false),
     serverUrl: z.string().default(""),
     token: z.string().default(""),
-    libraryPath: z.string().default("/mnt/media"),
+    libraryPath: z.string().default("/mnt/drakkar/media"),
     sectionId: z.string().default("")
   }).default({}),
   metadata: z.object({
@@ -104,16 +105,16 @@ function defaultRuntimeSettings(): RuntimeSettings {
   return {
     drakkarApiToken: `drakkar_${randomBytes(32).toString("base64url")}`,
     apiBaseUrl: "",
-    backendUrl: "http://backend:3000",
+    backendUrl: "http://drakkar_backend:3000",
     infrastructure: {
       postgres: {
         user: "postgres",
         password: "postgres",
         database: "drakkar",
-        url: "postgresql://postgres:postgres@postgres:5432/drakkar"
+        url: "postgresql://postgres:postgres@drakkar_postgres:5432/drakkar"
       },
       valkey: {
-        url: "redis://valkey:6379"
+        url: "redis://drakkar_valkey:6379"
       },
       ports: {
         frontend: 8080,
@@ -121,12 +122,13 @@ function defaultRuntimeSettings(): RuntimeSettings {
         valkeyInsight: 5540
       },
       runtime: {
-        fuseMountEnabled: true,
+        fuseMountEnabled: false,
         requestSyncEnabled: true,
-        backgroundRepairEnabled: true,
+        backgroundRepairEnabled: false,
         startupRecoveryEnabled: true,
         downloadWorkersEnabled: true,
-        streamPoolPrimeEnabled: true
+        streamPoolPrimeEnabled: false,
+        calendarPrewarmEnabled: false
       }
     },
     nzbhydra: {
@@ -143,7 +145,7 @@ function defaultRuntimeSettings(): RuntimeSettings {
       enabled: false,
       serverUrl: "",
       token: "",
-      libraryPath: "/mnt/media",
+      libraryPath: "/mnt/drakkar/media",
       sectionId: ""
     },
     metadata: {

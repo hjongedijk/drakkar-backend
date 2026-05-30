@@ -1,3 +1,5 @@
+import yencode from "yencode";
+
 export type YencInfo = {
   name?: string;
   size?: number;
@@ -25,81 +27,37 @@ export function parseYencInfo(body: string): YencInfo {
   };
 }
 
-export function decodeYenc(body: string): Buffer {
-  const ybeginIndex = body.search(/^=ybegin/m);
-  const payload = ybeginIndex >= 0 ? body.slice(ybeginIndex) : body;
-  const out = Buffer.allocUnsafe(payload.length);
-  let outIndex = 0;
-  let index = 0;
-  let lineStart = 0;
-  let skipLine = false;
+function nativeDecode(input: Buffer) {
+  return yencode.decode(input, false);
+}
 
-  while (index <= payload.length) {
-    const code = index < payload.length ? payload.charCodeAt(index) : 10;
-    const isLineEnd = index >= payload.length || code === 10 || code === 13;
-
-    if (index === lineStart) {
-      skipLine =
-        payload.startsWith("=ybegin", index) ||
-        payload.startsWith("=ypart", index) ||
-        payload.startsWith("=yend", index);
-    }
-
-    if (isLineEnd) {
-      index += code === 13 && payload.charCodeAt(index + 1) === 10 ? 2 : 1;
-      lineStart = index;
-      skipLine = false;
+function extractPayloadBuffers(body: string) {
+  const lines = body.split(/\r?\n/);
+  const payload: Buffer[] = [];
+  let inYenc = false;
+  for (const line of lines) {
+    if (line.startsWith("=ybegin")) {
+      inYenc = true;
       continue;
     }
-
-    if (!skipLine) {
-      let value = code & 0xff;
-      if (value === 61) {
-        index += 1;
-        value = ((payload.charCodeAt(index) & 0xff) - 64 + 256) % 256;
-      }
-      out[outIndex] = (value - 42 + 256) % 256;
-      outIndex += 1;
-    }
-
-    index += 1;
+    if (!inYenc) continue;
+    if (line.startsWith("=ypart") || line.startsWith("=yend")) continue;
+    payload.push(Buffer.from(line, "latin1"));
   }
+  return payload;
+}
 
-  return out.subarray(0, outIndex);
+export function decodeYenc(body: string): Buffer {
+  const payload = extractPayloadBuffers(body);
+  return nativeDecode(payload.length === 1 ? payload[0]! : Buffer.concat(payload));
 }
 
 export function decodeYencLine(line: string): Buffer {
-  const out = Buffer.allocUnsafe(line.length);
-  let outIndex = 0;
-
-  for (let index = 0; index < line.length; index += 1) {
-    let value = line.charCodeAt(index) & 0xff;
-    if (value === 61) {
-      index += 1;
-      value = ((line.charCodeAt(index) & 0xff) - 64 + 256) % 256;
-    }
-    out[outIndex] = (value - 42 + 256) % 256;
-    outIndex += 1;
-  }
-
-  return out.subarray(0, outIndex);
+  return nativeDecode(Buffer.from(line, "latin1"));
 }
 
 export function decodeYencBufferLine(line: Buffer): Buffer {
-  const out = Buffer.allocUnsafe(line.length);
-  let outIndex = 0;
-
-  for (let index = 0; index < line.length; index += 1) {
-    let value = line[index] ?? 0;
-    if (value === 61) {
-      index += 1;
-      value = (((line[index] ?? 0) & 0xff) - 64 + 256) % 256;
-    }
-    out[outIndex] = (value - 42 + 256) % 256;
-    outIndex += 1;
-  }
-
-  return out.subarray(0, outIndex);
+  return nativeDecode(line);
 }
 
 export function decodeArticleBody(body: string): Buffer {
